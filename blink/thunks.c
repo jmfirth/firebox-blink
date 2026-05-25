@@ -718,12 +718,35 @@ void FbxThunksRegisterFromElf(struct System *sys,
 
 #define FBX_FINGERPRINT_MAX_LEN 32
 
+struct ThunkFingerprint;
+
+/* Optional post-match disambiguation hook.
+ *
+ * Some pairs of musl primitives compile to identical wrapper prologues — the
+ * canonical example is strcpy/strncpy (both compile to "push %r12; mov %rdi,
+ * %r12; call __stp{n}cpy; mov %r12, %rax; pop %r12; ret").  We cannot tell
+ * which is which from the prologue alone; the only discriminator is the
+ * callee's prologue.
+ *
+ * `seg`/`seg_len`/`i` describe the match position (i is the offset within the
+ * segment).  Implementations may follow the prologue's `call` displacement
+ * forward and inspect callee bytes.  Return true to accept the match, false to
+ * reject. */
+typedef bool (*ThunkFingerprintVerifyFn)(const u8 *seg, size_t seg_len,
+                                         size_t i);
+
 struct ThunkFingerprint {
   const char *id;          /* diagnostic name, e.g. "memcpy_musl_x86_64" */
   const char *thunk_name;  /* registry key (must match kRegistry) */
   const u8 *pattern;       /* exact bytes to match (length = pattern_len) */
   const u8 *mask;          /* 0xFF = compare, 0x00 = wildcard */
   size_t pattern_len;
+  /* Optional — NULL means "accept any prologue match". */
+  ThunkFingerprintVerifyFn verify;
+  /* If `verify` follows a `call rel32` displacement, this is the byte offset
+   * within the matched pattern at which the `e8` opcode lives.  0 if unused.
+   * Used by the shared CallTargetMatches helper. */
+  size_t call_byte_offset;
 };
 
 /* musl x86_64 hand-asm memcpy — first 31 bytes through the `rep movsq` core.
@@ -818,13 +841,309 @@ static const u8 kStrlenMuslMask[] = {
     0xff, 0x00,              /* mask the jmp displacement */
 };
 
+/* ────────────────────────────────────────────────────────────────────────── */
+/* Phase 1.5 — fingerprint expansion for Phase-2 batch-2 primitives.          */
+/*                                                                            */
+/* memchr/strchr/strncmp/strcpy/strncpy.  Phase 2 batch-2 (#546) added the    */
+/* trampolines + .symtab path for these; this set adds machine-code           */
+/* fingerprints so stripped musl-static binaries (the dominant bench corpus   */
+/* shape — Alpine's musl-static busybox / jq) benefit too.  See               */
+/* work/tasks/549-elf-perf-phase-1.5-.../phase-1-report.md for the empirical  */
+/* match table against                                                        */
+/* Alpine's busybox 1.36.x build.                                             */
+/*                                                                            */
+/* All five primitives below are pure musl-C (no x86_64 hand-asm in           */
+/* libc-top-half/musl/src/string/x86_64), so the bytes come from gcc -Os      */
+/* compiling the published musl reference impl.  Discovery procedure mirrors  */
+/* Phase 1.4: search the busybox `.text` segment for the function's own       */
+/* characteristic constants/opcodes, then capture the prologue.               */
+/*                                                                            */
+/* IDENTICAL-PROLOGUE WRAPPERS:                                               */
+/*   strcpy and strncpy compile to the same 16-byte wrapper (push r12; mov    */
+/*   rdi, r12; call __stp{n}cpy; mov r12, rax; pop r12; ret) — the only      */
+/*   discriminator is which function gets called.  We use a per-fingerprint   */
+/*   `verify` callback that follows the `e8 rel32` displacement and inspects  */
+/*   the callee's prologue: __stpcpy starts with "48 89 fa 48 89 f8 48 31 f2  */
+/*   83 e2 07" (2-arg, no n-test), __stpncpy with "48 89 f8 41 54 49 89 fc   */
+/*   48 31 f0 a8 07" (3-arg, tests n early via test $0x7, %al).               */
+/* ────────────────────────────────────────────────────────────────────────── */
+
+/* musl C memchr compiled with gcc -Os/-O2.  Prologue is the alignment-loop
+ * entry:
+ *
+ *   40 0f b6 f6              movzbl %sil, %esi          (c = (uchar)c)
+ *   40 f6 c7 07              testb $0x7, %dil           (s & ALIGN)
+ *   75 1b                    jne   slow_byte_loop
+ *   eb 24                    jmp   word_loop_entry
+ *   0f 1f 40 00              4-byte NOP                 (next-function pad)
+ *
+ * The two short-jmp displacements (0x1b, 0x24) vary slightly between musl
+ * versions and gcc versions — we mask both displacement bytes.  Verified
+ * against Alpine's musl-1.2.5 busybox 1.36 build (exactly one match in
+ * .text, at the function entry). */
+static const u8 kMemchrMuslPattern[] = {
+    0x40, 0x0f, 0xb6, 0xf6,        /* movzbl %sil, %esi     */
+    0x40, 0xf6, 0xc7, 0x07,        /* testb $0x7, %dil      */
+    0x75, 0x1b,                    /* jne   +0x1b           */
+    0xeb, 0x24,                    /* jmp   +0x24           */
+    0x0f, 0x1f, 0x40, 0x00,        /* 4-byte NOP            */
+};
+static const u8 kMemchrMuslMask[] = {
+    0xff, 0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff, 0xff,
+    0xff, 0x00,                    /* mask jne displacement */
+    0xff, 0x00,                    /* mask jmp displacement */
+    0xff, 0xff, 0xff, 0xff,
+};
+
+/* musl C strchr wraps __strchrnul.  gcc -Os produces a distinctive tail
+ * sequence — call result + cmovne against immediate zero:
+ *
+ *   53                       push   %rbx
+ *   89 f3                    mov    %esi, %ebx           (save c)
+ *   e8 .. .. .. ..           call   __strchrnul
+ *   ba 00 00 00 00           mov    $0, %edx
+ *   38 18                    cmp    %bl, (%rax)
+ *   5b                       pop    %rbx
+ *   48 0f 45 c2              cmovne %rdx, %rax           (clear rax on miss)
+ *   c3                       ret
+ *
+ * Length 21 bytes including the masked 4-byte call displacement.  This is a
+ * very specific tail — `ba 00 00 00 00 38 18 5b 48 0f 45 c2 c3` is essentially
+ * unique to "strchr-after-strchrnul" across Alpine's full binary corpus. */
+static const u8 kStrchrMuslPattern[] = {
+    0x53,                          /* push %rbx                              */
+    0x89, 0xf3,                    /* mov %esi, %ebx                         */
+    0xe8, 0x00, 0x00, 0x00, 0x00,  /* call __strchrnul (masked)              */
+    0xba, 0x00, 0x00, 0x00, 0x00,  /* mov $0, %edx                           */
+    0x38, 0x18,                    /* cmp %bl, (%rax)                        */
+    0x5b,                          /* pop %rbx                               */
+    0x48, 0x0f, 0x45, 0xc2,        /* cmovne %rdx, %rax                      */
+    0xc3,                          /* ret                                    */
+};
+static const u8 kStrchrMuslMask[] = {
+    0xff,
+    0xff, 0xff,
+    0xff, 0x00, 0x00, 0x00, 0x00,  /* mask call displacement                 */
+    0xff, 0xff, 0xff, 0xff, 0xff,
+    0xff, 0xff,
+    0xff,
+    0xff, 0xff, 0xff, 0xff,
+    0xff,
+};
+
+/* musl C strncmp compiled with gcc -Os.  Has a distinctive register choreography
+ * around the n-- decrement and the dual byte loads:
+ *
+ *   31 c0                    xor   %eax, %eax            (eax = 0 default)
+ *   48 85 d2                 test  %rdx, %rdx            (n == 0?)
+ *   74 ..                    je    end_zero
+ *   0f b6 0f                 movzbl (%rdi), %ecx         (load *l)
+ *   44 0f b6 06              movzbl (%rsi), %r8d         (load *r)
+ *   84 c9                    test  %cl, %cl              (*l == 0?)
+ *   74 ..                    je    end
+ *   48 83 ea 01              sub   $1, %rdx              (n--)
+ *   49 89 d1                 mov   %rdx, %r9             (save n)
+ *   0f 95 c2                 setne %dl                   (dl = (n != 0))
+ *
+ * Length 28 bytes.  The two short-jump displacements (0x5c, 0x56) vary across
+ * musl/gcc versions — we mask them.  Highly specific: `setne %dl` directly
+ * after a `sub`/`mov` triplet is uncommon outside this kind of "two-things-
+ * still-valid" loop guard. */
+static const u8 kStrncmpMuslPattern[] = {
+    0x31, 0xc0,                    /* xor %eax, %eax                          */
+    0x48, 0x85, 0xd2,              /* test %rdx, %rdx                         */
+    0x74, 0x5c,                    /* je end_zero                             */
+    0x0f, 0xb6, 0x0f,              /* movzbl (%rdi), %ecx                     */
+    0x44, 0x0f, 0xb6, 0x06,        /* movzbl (%rsi), %r8d                     */
+    0x84, 0xc9,                    /* test %cl, %cl                           */
+    0x74, 0x56,                    /* je end                                  */
+    0x48, 0x83, 0xea, 0x01,        /* sub $1, %rdx                            */
+    0x49, 0x89, 0xd1,              /* mov %rdx, %r9                           */
+    0x0f, 0x95, 0xc2,              /* setne %dl                               */
+};
+static const u8 kStrncmpMuslMask[] = {
+    0xff, 0xff,
+    0xff, 0xff, 0xff,
+    0xff, 0x00,                    /* mask je displacement                    */
+    0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff, 0xff,
+    0xff, 0xff,
+    0xff, 0x00,                    /* mask je displacement                    */
+    0xff, 0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff,
+};
+
+/* musl strcpy compiles to a 16-byte trampoline that just calls __stpcpy and
+ * returns the original dst pointer.  IDENTICAL bytes to the strncpy wrapper —
+ * disambiguated by following the call to inspect the callee.  See the
+ * VerifyStrcpy / VerifyStrncpy callbacks below.
+ *
+ *   41 54                    push %r12
+ *   49 89 fc                 mov  %rdi, %r12
+ *   e8 .. .. .. ..           call __stpcpy        (or __stpncpy for strncpy)
+ *   4c 89 e0                 mov  %r12, %rax
+ *   41 5c                    pop  %r12
+ *   c3                       ret
+ *
+ * Length 16 bytes.  Highly specific.  */
+static const u8 kStrcpyMuslPattern[] = {
+    0x41, 0x54,                    /* push %r12                               */
+    0x49, 0x89, 0xfc,              /* mov %rdi, %r12                          */
+    0xe8, 0x00, 0x00, 0x00, 0x00,  /* call __stp(n)cpy (masked)               */
+    0x4c, 0x89, 0xe0,              /* mov %r12, %rax                          */
+    0x41, 0x5c,                    /* pop %r12                                */
+    0xc3,                          /* ret                                     */
+};
+static const u8 kStrcpyMuslMask[] = {
+    0xff, 0xff,
+    0xff, 0xff, 0xff,
+    0xff, 0x00, 0x00, 0x00, 0x00,  /* mask 4-byte call displacement           */
+    0xff, 0xff, 0xff,
+    0xff, 0xff,
+    0xff,
+};
+
+/* strncpy uses the SAME pattern as strcpy — see comment above.  Stored as a
+ * separate fingerprint so the verifier callback can route to the strncpy
+ * trampoline.  We share the underlying pattern/mask arrays. */
+#define kStrncpyMuslPattern kStrcpyMuslPattern
+#define kStrncpyMuslMask    kStrcpyMuslMask
+
+/* Bounds-checked little-endian 32-bit signed read at byte offset `off`. */
+static bool ReadRel32(const u8 *seg, size_t seg_len, size_t off, int32_t *out) {
+  if (off + 4 > seg_len) return false;
+  *out = (int32_t)((u32)seg[off] | ((u32)seg[off + 1] << 8) |
+                   ((u32)seg[off + 2] << 16) | ((u32)seg[off + 3] << 24));
+  return true;
+}
+
+/* Bounds-checked match: returns true iff seg[at..at+pat_len) equals `pat`
+ * (under `mask`). */
+static bool MatchAt(const u8 *seg, size_t seg_len, size_t at, const u8 *pat,
+                    const u8 *mask, size_t pat_len) {
+  size_t k;
+  if (at + pat_len > seg_len) return false;
+  for (k = 0; k < pat_len; ++k) {
+    if ((seg[at + k] & mask[k]) != (pat[k] & mask[k])) return false;
+  }
+  return true;
+}
+
+/* __stpcpy prologue — gcc -Os emission of musl's stpcpy.c:
+ *
+ *   48 89 fa                 mov %rdi, %rdx       (save dst)
+ *   48 89 f8                 mov %rdi, %rax       (return-value tracker)
+ *   48 31 f2                 xor %rsi, %rdx       (low bits = src ^ dst)
+ *   83 e2 07                 and $0x7, %edx       (test ALIGN equality)
+ *
+ * 12 bytes, no register variation, no early `test rdx, rdx` (2-arg function). */
+static const u8 kStpcpyPrologue[] = {
+    0x48, 0x89, 0xfa,
+    0x48, 0x89, 0xf8,
+    0x48, 0x31, 0xf2,
+    0x83, 0xe2, 0x07,
+};
+static const u8 kStpcpyPrologueMask[] = {
+    0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff,
+};
+
+/* __stpncpy prologue — gcc -Os emission of musl's stpncpy.c:
+ *
+ *   48 89 f8                 mov %rdi, %rax       (return-value tracker)
+ *   41 54                    push %r12            (3-arg: callee-saved use)
+ *   49 89 fc                 mov %rdi, %r12       (save dst)
+ *   48 31 f0                 xor %rsi, %rax       (low bits = src ^ dst)
+ *   a8 07                    test $0x7, %al       (ALIGN equality test)
+ *
+ * 13 bytes.  The early `push %r12` is the discriminator — __stpcpy doesn't
+ * touch %r12, but __stpncpy needs it (3-arg version saves dst across the
+ * pad-with-zero call to memset at the end). */
+static const u8 kStpncpyPrologue[] = {
+    0x48, 0x89, 0xf8,
+    0x41, 0x54,
+    0x49, 0x89, 0xfc,
+    0x48, 0x31, 0xf0,
+    0xa8, 0x07,
+};
+static const u8 kStpncpyPrologueMask[] = {
+    0xff, 0xff, 0xff,
+    0xff, 0xff,
+    0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff,
+    0xff, 0xff,
+};
+
+/* Shared callee-following helper.  `i` is the strcpy/strncpy prologue offset
+ * within `seg`.  The call opcode lives at seg[i + 5]; the rel32 immediate at
+ * seg[i + 6..i + 10].  Returns true iff the callee at the computed offset
+ * matches `expected_prologue`. */
+static bool CalleePrologueMatches(const u8 *seg, size_t seg_len, size_t i,
+                                  const u8 *prologue, const u8 *mask,
+                                  size_t prologue_len) {
+  int32_t disp;
+  size_t call_end;
+  intptr_t target;
+  if (!ReadRel32(seg, seg_len, i + 6, &disp)) return false;
+  call_end = i + 10;  /* byte AFTER the rel32 immediate                       */
+  /* Compute target = call_end + disp, defending against signed overflow into
+   * negative seg-offsets (which can happen for legitimately-short backward
+   * jumps to libc functions earlier in the segment). */
+  if (disp < 0) {
+    /* Backward — call_end + disp must remain >= 0 and within seg. */
+    if ((intptr_t)call_end + disp < 0) return false;
+    target = (intptr_t)call_end + disp;
+  } else {
+    if (call_end > seg_len - (size_t)disp) return false;
+    target = (intptr_t)call_end + disp;
+  }
+  if ((size_t)target >= seg_len) return false;
+  return MatchAt(seg, seg_len, (size_t)target, prologue, mask, prologue_len);
+}
+
+static bool VerifyStrcpy(const u8 *seg, size_t seg_len, size_t i) {
+  return CalleePrologueMatches(seg, seg_len, i, kStpcpyPrologue,
+                               kStpcpyPrologueMask, sizeof(kStpcpyPrologue));
+}
+
+static bool VerifyStrncpy(const u8 *seg, size_t seg_len, size_t i) {
+  return CalleePrologueMatches(seg, seg_len, i, kStpncpyPrologue,
+                               kStpncpyPrologueMask, sizeof(kStpncpyPrologue));
+}
+
 static const struct ThunkFingerprint kFingerprints[] = {
     {"memcpy_musl_x86_64", "memcpy",
-     kMemcpyMuslPattern, kMemcpyMuslMask, sizeof(kMemcpyMuslPattern)},
+     kMemcpyMuslPattern, kMemcpyMuslMask, sizeof(kMemcpyMuslPattern),
+     NULL, 0},
     {"memset_musl_x86_64", "memset",
-     kMemsetMuslPattern, kMemsetMuslMask, sizeof(kMemsetMuslPattern)},
+     kMemsetMuslPattern, kMemsetMuslMask, sizeof(kMemsetMuslPattern),
+     NULL, 0},
     {"strlen_musl_x86_64", "strlen",
-     kStrlenMuslPattern, kStrlenMuslMask, sizeof(kStrlenMuslPattern)},
+     kStrlenMuslPattern, kStrlenMuslMask, sizeof(kStrlenMuslPattern),
+     NULL, 0},
+    /* Phase 1.5 expansion (firebox-elf-v2-phase1.5-fingerprint-expansion-batch-2). */
+    {"memchr_musl_x86_64", "memchr",
+     kMemchrMuslPattern, kMemchrMuslMask, sizeof(kMemchrMuslPattern),
+     NULL, 0},
+    {"strchr_musl_x86_64", "strchr",
+     kStrchrMuslPattern, kStrchrMuslMask, sizeof(kStrchrMuslPattern),
+     NULL, 0},
+    {"strncmp_musl_x86_64", "strncmp",
+     kStrncmpMuslPattern, kStrncmpMuslMask, sizeof(kStrncmpMuslPattern),
+     NULL, 0},
+    /* strcpy + strncpy share an identical 16-byte prologue and are
+     * disambiguated ONLY by following the `call` displacement and
+     * inspecting the callee's first ~13 bytes. */
+    {"strcpy_musl_x86_64", "strcpy",
+     kStrcpyMuslPattern, kStrcpyMuslMask, sizeof(kStrcpyMuslPattern),
+     VerifyStrcpy, 5},
+    {"strncpy_musl_x86_64", "strncpy",
+     kStrncpyMuslPattern, kStrncpyMuslMask, sizeof(kStrncpyMuslPattern),
+     VerifyStrncpy, 5},
 };
 
 #define FBX_NUM_FINGERPRINTS                                                 \
@@ -882,6 +1201,12 @@ static int ScanSegment(struct System *sys, const u8 *seg, size_t seg_len,
        * OR be 16-byte aligned. */
       if (fp->pattern_len < FBX_FP_BOUNDARY_CHECK_BELOW && i > 0 &&
           !IsFunctionBoundaryByte(seg[i - 1]) && (i & 15) != 0) {
+        continue;
+      }
+      /* Per-fingerprint disambiguation.  Used by strcpy/strncpy (which share
+       * an identical 16-byte prologue) to follow the embedded `call rel32`
+       * and inspect the callee's prologue.  See VerifyStrcpy/VerifyStrncpy. */
+      if (fp->verify && !fp->verify(seg, seg_len, i)) {
         continue;
       }
       /* Already registered (e.g. a longer-pattern match earlier) — skip. */

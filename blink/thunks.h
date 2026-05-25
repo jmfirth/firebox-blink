@@ -25,11 +25,16 @@
  * Coverage caveat: the symbol-table path requires .symtab or .dynsym to
  * be present.  Stripped statically-linked binaries (Alpine's musl-static
  * busybox / jq, the dominant bench-corpus shape) fall through to the
- * Phase 1.4 fingerprint path; the fingerprint table only covers the
- * Phase 1 set (memcpy/memset/strlen as of 2026-05-25).  Phase 2 batch-2
- * primitives benefit ONLY non-stripped binaries until fingerprints are
- * added — protoc, debug builds, dynamically-linked binaries.  See
- * work/tracks/elf-performance/phase-1-thunking/phase-1.4-report.md.
+ * Phase 1.4 + Phase 1.5 fingerprint path.  Fingerprint coverage:
+ *   Phase 1.4 (firebox-elf-v2-phase1.4-fingerprinting):
+ *     memcpy / memset / strlen
+ *   Phase 1.5 (firebox-elf-v2-phase1.5-fingerprint-expansion-batch-2):
+ *     memchr / strchr / strncmp / strcpy / strncpy
+ * memcmp/strcmp remain symbol-only (per-build register-allocator
+ * variation defeats a single-fingerprint match — see notes in thunks.c
+ * below the Phase 1.4 block).  See
+ * work/tasks/549-elf-perf-phase-1.5-fingerprint-expansion-batch-2/
+ * phase-1-report.md for the Phase 1.5 empirical match table.
  *
  * The scan is one-shot, performed once at ELF load.  The dispatch path is
  * a min/max range bound followed by a tiny linear scan over <= MAX_THUNKS
@@ -77,12 +82,24 @@ bool FbxThunksRegisterByName(struct System *sys, const char *name, u64 pc);
  * symbol-table path — overwrites any prior entries when re-invoked.
  *
  * Coverage today (see work/tracks/elf-performance/phase-1-thunking/
- * phase-1.4-report.md for the empirical match table):
- *   - memcpy_musl_x86_64  (musl x86_64 hand-asm; extremely stable)
- *   - memset_musl_x86_64  (musl x86_64 hand-asm; extremely stable)
- *   - strlen_musl_x86_64  (musl C compiled by gcc with the published HASZERO
- *                          word-loop; matches the gcc 11+/14 / Alpine musl
- *                          combination used by upstream Alpine releases)
+ * phase-1.4-report.md for the Phase 1.4 empirical match table, and
+ * work/tasks/549-elf-perf-phase-1.5-fingerprint-expansion-batch-2/
+ * phase-1-report.md for Phase 1.5):
+ *   Phase 1.4 (extremely stable — hand-asm or canonical HASZERO codegen):
+ *     - memcpy_musl_x86_64
+ *     - memset_musl_x86_64
+ *     - strlen_musl_x86_64
+ *   Phase 1.5 (musl-C compiled by gcc -Os; per-version short-jump
+ *   displacements masked):
+ *     - memchr_musl_x86_64   (alignment-prologue, 16-byte pattern)
+ *     - strchr_musl_x86_64   (wrapper around __strchrnul; tail-distinctive
+ *                             cmovne + immediate-0 pattern)
+ *     - strncmp_musl_x86_64  (xor/test/dual-movzbl/setne sequence; 28 bytes)
+ *     - strcpy_musl_x86_64   (wrapper around __stpcpy; disambiguated from
+ *                             strncpy by following the embedded call
+ *                             displacement)
+ *     - strncpy_musl_x86_64  (wrapper around __stpncpy; same shape as
+ *                             strcpy_musl_x86_64, distinct callee)
  *
  * Best-effort additions (may not match all builds — flagged via the
  * trace output when missing):
