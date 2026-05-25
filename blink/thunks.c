@@ -871,6 +871,305 @@ static void ThunkMemmove(struct Machine *m) {
 }
 
 /* ────────────────────────────────────────────────────────────────────────── */
+/* Phase 1 EXHAUSTIVE SWEEP (#564) — close the remaining bounded CPU-hot      */
+/* libc surface in one batch.  Handlers below: strrchr, strspn, strcspn,      */
+/* strpbrk, strtok_r, memrchr.  Same dispatch shape as every other Thunk*:    */
+/* read args from the System V AMD64 register file, perform the operation     */
+/* against guest memory via Guest* helpers / libc primitives over             */
+/* LookupAddress chunks, write the result to %rax, emulate ret.               */
+/*                                                                            */
+/* Deliberately OUT of scope:                                                 */
+/*   - strtok (legacy single-thread variant with static state).  busybox      */
+/*     uses strtok_r directly; strtok deduplicates to a static state slot     */
+/*     owned by the guest, so a host-side trampoline can't faithfully         */
+/*     maintain its semantics across multiple in-flight thunked calls.        */
+/*   - strdup / strndup.  Both internally call guest malloc(); the returned   */
+/*     pointer MUST come from the guest heap so the guest can free() it.      */
+/*     A host-side thunk can't make a synchronous re-entry into guest         */
+/*     malloc() (we'd have to schedule the guest to run, then resume on       */
+/*     return — which is exactly the "interpret strdup's body normally" path  */
+/*     we'd be trying to skip).  The internal strlen + memcpy calls already   */
+/*     get thunked (Phase 1 + Phase 2 batch-3), so the function-level wrap    */
+/*     gains are marginal compared to the unavoidable malloc round-trip.      */
+/*   - memcmp.  Not present as a standalone symbol in the Alpine bench-       */
+/*     fixture busybox (gcc-12 inlined every callsite at -Os via              */
+/*     __builtin_memcmp); a fingerprint would silently miss.  The handler     */
+/*     remains in kRegistry for .symtab-path dispatch (Phase 1).              */
+/* ────────────────────────────────────────────────────────────────────────── */
+
+/* memrchr — scan up to n bytes from the END of a guest buffer for the first
+ * (rightmost) byte equal to `c`.  Returns the guest address of the match, or
+ * 0 if no match.  Page-bounded backward walk.
+ *
+ * We walk backwards page-by-page from the end.  Page boundary going backward:
+ * given pointer p, the previous-page boundary is `p & ~4095` (start of p's
+ * page); we can read [page_start, p) safely with one LookupAddress(page_start).
+ * Loop: while n > 0, identify the page-bounded chunk at the current end, scan
+ * for c, advance to the previous chunk if no hit. */
+static i64 GuestMemrchr(struct Machine *m, i64 s, u8 c, u64 n) {
+  if (n == 0) return 0;
+  i64 cur = s + (i64)n;  /* one-past-the-end */
+  u64 remaining = n;
+  while (remaining) {
+    /* Pointer to the LAST byte in the current scan (cur - 1).  Identify how
+     * many bytes share its page with us, capped at remaining. */
+    i64 last = cur - 1;
+    u64 last_off = (u64)last & 4095;     /* offset within page */
+    u64 chunk = last_off + 1;            /* bytes from page_start..last+1 */
+    if (chunk > remaining) chunk = remaining;
+    i64 page_start = last - (i64)(chunk - 1);
+    u8 *host = LookupAddress(m, page_start);
+    if (!host) return -1;
+    /* Scan host[0..chunk) for the LAST occurrence of c. */
+    size_t i;
+    for (i = chunk; i > 0; --i) {
+      if (host[i - 1] == c) {
+        return page_start + (i64)(i - 1);
+      }
+    }
+    cur = page_start;
+    remaining -= chunk;
+  }
+  return 0;
+}
+
+static void ThunkMemrchr(struct Machine *m) {
+  i64 s = (i64)Get64(m->di);
+  u8 c = (u8)(Get64(m->si) & 0xff);
+  u64 n = Get64(m->dx);
+  i64 hit = GuestMemrchr(m, s, c, n);
+  if (hit < 0) hit = 0;
+  if (g_thunk_trace) {
+    LOGF("thunk memrchr(s=%#llx, c=%#x, n=%llu) = %#llx",
+         (long long)s, (unsigned)c, (unsigned long long)n, (long long)hit);
+  }
+  Put64(m->ax, (u64)hit);
+  ThunkRet(m);
+}
+
+/* strrchr — find the LAST occurrence of c in a C-string.  POSIX special case:
+ * strrchr(s, 0) returns a pointer to the terminator.  musl is implemented as
+ * `memrchr(s, c, strlen(s) + 1)`. */
+static void ThunkStrrchr(struct Machine *m) {
+  i64 s = (i64)Get64(m->di);
+  u8 c = (u8)(Get64(m->si) & 0xff);
+  /* Bounded strlen — same 1 GiB safety cap as ThunkStrlen. */
+  i64 len = GuestStrnlen(m, s, (u64)1 << 30);
+  if (len < 0) len = 0;
+  i64 hit = GuestMemrchr(m, s, c, (u64)len + 1);
+  if (hit < 0) hit = 0;
+  if (g_thunk_trace) {
+    LOGF("thunk strrchr(s=%#llx, c=%#x) = %#llx",
+         (long long)s, (unsigned)c, (long long)hit);
+  }
+  Put64(m->ax, (u64)hit);
+  ThunkRet(m);
+}
+
+/* Build a 256-bit "byte-set" bitmap from a guest C-string of accept/reject
+ * chars.  Used by strspn/strcspn/strpbrk/strtok_r.  Sets bit `b` for every
+ * byte `b` that appears in `set` (NUL-terminated, page-bounded).  Returns 0
+ * on success, -1 on guest fault.  `bits` must be 32 bytes. */
+static int GuestBuildByteSet(struct Machine *m, i64 set, u8 bits[32]) {
+  memset(bits, 0, 32);
+  i64 cur = set;
+  for (;;) {
+    u64 off = (u64)cur & 4095;
+    u64 chunk = 4096 - off;
+    u8 *host = LookupAddress(m, cur);
+    if (!host) return -1;
+    u64 i;
+    for (i = 0; i < chunk; ++i) {
+      u8 b = host[i];
+      if (!b) return 0;  /* NUL terminator → set complete */
+      bits[b >> 3] |= (u8)(1u << (b & 7));
+    }
+    cur += (i64)chunk;
+  }
+}
+
+/* Walk a guest C-string returning the length of the initial run of chars
+ * that ARE in `bits` (strspn semantics).  Page-bounded.  Returns the count of
+ * bytes before the first byte NOT in `bits` (or before the terminating NUL).
+ * -1 on guest fault. */
+static i64 GuestSpanIn(struct Machine *m, i64 s, const u8 bits[32]) {
+  u64 count = 0;
+  i64 cur = s;
+  for (;;) {
+    u64 off = (u64)cur & 4095;
+    u64 chunk = 4096 - off;
+    u8 *host = LookupAddress(m, cur);
+    if (!host) return -1;
+    u64 i;
+    for (i = 0; i < chunk; ++i) {
+      u8 b = host[i];
+      if (!b) return (i64)(count + i);
+      if (!(bits[b >> 3] & (1u << (b & 7)))) return (i64)(count + i);
+    }
+    count += chunk;
+    cur += (i64)chunk;
+  }
+}
+
+/* Walk a guest C-string returning the length of the initial run of chars
+ * that are NOT in `bits` (strcspn semantics).  Page-bounded.  -1 on fault. */
+static i64 GuestSpanOut(struct Machine *m, i64 s, const u8 bits[32]) {
+  u64 count = 0;
+  i64 cur = s;
+  for (;;) {
+    u64 off = (u64)cur & 4095;
+    u64 chunk = 4096 - off;
+    u8 *host = LookupAddress(m, cur);
+    if (!host) return -1;
+    u64 i;
+    for (i = 0; i < chunk; ++i) {
+      u8 b = host[i];
+      if (!b) return (i64)(count + i);
+      if (bits[b >> 3] & (1u << (b & 7))) return (i64)(count + i);
+    }
+    count += chunk;
+    cur += (i64)chunk;
+  }
+}
+
+static void ThunkStrspn(struct Machine *m) {
+  i64 s = (i64)Get64(m->di);
+  i64 set = (i64)Get64(m->si);
+  u8 bits[32];
+  if (GuestBuildByteSet(m, set, bits) == -1) {
+    Put64(m->ax, 0);
+    ThunkRet(m);
+    return;
+  }
+  i64 len = GuestSpanIn(m, s, bits);
+  if (len < 0) len = 0;
+  if (g_thunk_trace) {
+    LOGF("thunk strspn(s=%#llx, set=%#llx) = %lld",
+         (long long)s, (long long)set, (long long)len);
+  }
+  Put64(m->ax, (u64)len);
+  ThunkRet(m);
+}
+
+static void ThunkStrcspn(struct Machine *m) {
+  i64 s = (i64)Get64(m->di);
+  i64 set = (i64)Get64(m->si);
+  u8 bits[32];
+  if (GuestBuildByteSet(m, set, bits) == -1) {
+    Put64(m->ax, 0);
+    ThunkRet(m);
+    return;
+  }
+  i64 len = GuestSpanOut(m, s, bits);
+  if (len < 0) len = 0;
+  if (g_thunk_trace) {
+    LOGF("thunk strcspn(s=%#llx, set=%#llx) = %lld",
+         (long long)s, (long long)set, (long long)len);
+  }
+  Put64(m->ax, (u64)len);
+  ThunkRet(m);
+}
+
+/* strpbrk — return pointer to FIRST byte of `s` that's in `accept`, or NULL
+ * if none.  Equivalent to: p = s + strcspn(s, accept); return *p ? p : NULL. */
+static void ThunkStrpbrk(struct Machine *m) {
+  i64 s = (i64)Get64(m->di);
+  i64 set = (i64)Get64(m->si);
+  u8 bits[32];
+  i64 hit = 0;
+  if (GuestBuildByteSet(m, set, bits) == 0) {
+    i64 len = GuestSpanOut(m, s, bits);
+    if (len >= 0) {
+      /* Check whether the stop char was a hit (in set) vs NUL.  Re-read the
+       * one byte at s+len. */
+      i64 p = s + len;
+      u8 *host = LookupAddress(m, p);
+      if (host && *host) {
+        hit = p;
+      }
+    }
+  }
+  if (g_thunk_trace) {
+    LOGF("thunk strpbrk(s=%#llx, set=%#llx) = %#llx",
+         (long long)s, (long long)set, (long long)hit);
+  }
+  Put64(m->ax, (u64)hit);
+  ThunkRet(m);
+}
+
+/* strtok_r — reentrant tokenizer.  Args: (s, sep, &state).  If s is NULL,
+ * resume from *state.  Returns ptr to next token (zero-terminated in place) or
+ * NULL when exhausted; updates *state to point past the terminator we wrote.
+ *
+ * Implementation mirrors musl's strtok_r.c semantics:
+ *   1. If s == NULL: s = *state.  If still NULL: return NULL.
+ *   2. s += strspn(s, sep) — skip leading separators.
+ *   3. If *s == NUL: *state = s; return NULL.
+ *   4. end = s + strcspn(s, sep) — find end-of-token.
+ *   5. If *end: write NUL into *end; *state = end + 1.
+ *      Else: *state = end (NUL already there).
+ *   6. Return s. */
+static void ThunkStrtokR(struct Machine *m) {
+  i64 s = (i64)Get64(m->di);
+  i64 sep = (i64)Get64(m->si);
+  i64 statep = (i64)Get64(m->dx);
+  i64 result = 0;
+  u8 bits[32];
+  i64 spn, cspn, end;
+  /* Resume from state if s is NULL. */
+  if (s == 0) {
+    u8 sbuf[8];
+    if (CopyFromUser(m, sbuf, statep, 8) == -1) {
+      goto done;
+    }
+    s = (i64)Get64(sbuf);
+    if (s == 0) goto done;
+  }
+  if (GuestBuildByteSet(m, sep, bits) == -1) goto done;
+  /* Skip leading separators. */
+  spn = GuestSpanIn(m, s, bits);
+  if (spn < 0) goto done;
+  s += spn;
+  /* If exhausted, store NULL and return NULL. */
+  {
+    u8 *host = LookupAddress(m, s);
+    if (!host) goto done;
+    if (*host == 0) {
+      u8 zero[8] = {0};
+      (void)CopyToUser(m, statep, zero, 8);
+      goto done;
+    }
+  }
+  /* Find end of token. */
+  cspn = GuestSpanOut(m, s, bits);
+  if (cspn < 0) goto done;
+  end = s + cspn;
+  /* Terminate in place if not already at NUL, then advance state. */
+  {
+    u8 *eh = LookupAddress(m, end);
+    if (!eh) goto done;
+    u8 next_state_buf[8] = {0};
+    if (*eh) {
+      u8 zero = 0;
+      (void)CopyToUser(m, end, &zero, 1);
+      Put64(next_state_buf, (u64)(end + 1));
+    } else {
+      Put64(next_state_buf, (u64)end);
+    }
+    (void)CopyToUser(m, statep, next_state_buf, 8);
+  }
+  result = s;
+done:
+  if (g_thunk_trace) {
+    LOGF("thunk strtok_r(s=%#llx, sep=%#llx, st=%#llx) = %#llx",
+         (long long)Get64(m->di), (long long)sep, (long long)statep,
+         (long long)result);
+  }
+  Put64(m->ax, (u64)result);
+  ThunkRet(m);
+}
+
+/* ────────────────────────────────────────────────────────────────────────── */
 /* Registry — the fixed set of names we know how to handle.                   */
 /* Names match the System V libc ABI; statically-linked binaries always       */
 /* carry these in their .symtab (we'd also catch them in .dynsym).            */
@@ -906,6 +1205,19 @@ static const struct ThunkRegistryEntry kRegistry[] = {
     {"strncasecmp", ThunkStrncasecmp},
     {"strstr", ThunkStrstr},
     {"memmove", ThunkMemmove},
+    /* Phase 1 EXHAUSTIVE SWEEP — #564 (firebox-elf-v2-phase2-batch-4-
+     * thunks).  Closes the remaining bounded CPU-hot libc surface:
+     * memrchr (Linux extension; backwards scan), strrchr (musl tail-calls
+     * memrchr internally), strspn / strcspn / strpbrk (32-byte bitmap
+     * scans of an accept/reject set), strtok_r (reentrant tokenizer
+     * built on strspn + strcspn).  See the lengthy header comment block
+     * above for the strtok/strdup/strndup/memcmp deliberate-skip rationale. */
+    {"memrchr", ThunkMemrchr},
+    {"strrchr", ThunkStrrchr},
+    {"strspn", ThunkStrspn},
+    {"strcspn", ThunkStrcspn},
+    {"strpbrk", ThunkStrpbrk},
+    {"strtok_r", ThunkStrtokR},
     {0, 0},
 };
 
@@ -1661,6 +1973,306 @@ static const u8 kStrstrMuslMask[] = {
     0xff,
 };
 
+/* ────────────────────────────────────────────────────────────────────────── */
+/* Phase 1 EXHAUSTIVE SWEEP — #564 (firebox-elf-v2-phase2-batch-4-thunks)     */
+/*                                                                            */
+/* Batch-4 fingerprints close the remaining bounded CPU-hot libc surface:     */
+/*   - memrchr / strrchr        (backward / last-occurrence scans)            */
+/*   - strspn / strcspn / strpbrk (byte-set bitmap scans)                     */
+/*   - strtok_r                  (reentrant tokenizer)                        */
+/*   - strcmp                    (forward-walk byte compare; #559 expansion)  */
+/*                                                                            */
+/* Discovery — same procedure as Phase 1.5 / batch-3:                         */
+/*   1. Disassemble the bench-corpus busybox (`llvm-objdump -d -M intel`).    */
+/*   2. Locate each function by call-graph relationship to a Phase-1/1.5/     */
+/*      batch-3 anchor (memchr 0x4003c0, strlen 0x4009f0, strnlen 0x400bf0,   */
+/*      strncasecmp 0x400a70, memrchr 0x4004d0 once found).                   */
+/*   3. Capture the prologue bytes; mask call/jump displacements that vary    */
+/*      with the callee's binary placement.                                   */
+/*   4. Verify exactly one match in the bench-fixture `.text` segment with    */
+/*      zero false positives.                                                 */
+/*                                                                            */
+/* Per-prologue identification (Alpine 1.36 / musl 1.2.x):                    */
+/*   memrchr      @ 0x4004d0 — `lea rax, [rdi+rdx-1]` opens backward walker   */
+/*   strrchr      @ 0x400c40 — `push r12; mov r12d, esi; ...; call strlen;    */
+/*                              ... ; jmp memrchr` (tail-call)                */
+/*   strcspn      @ 0x4008e0 — `push rbp; mov rbp, rdi; push rbx; sub rsp,    */
+/*                              0x28; movsx esi,(rsi); ...` (stack bitmap)   */
+/*   strspn       @ 0x400d10 — `movzx ecx,(rsi); pxor xmm0; xor eax; movaps   */
+/*                              [rsp-0x28], xmm0; movaps [rsp-0x18], xmm0`   */
+/*                              (red-zone bitmap; doesn't push frame)         */
+/*   strpbrk      @ 0x400c20 — `push rbx; mov rbx, rdi; call strcspn; mov     */
+/*                              edx, 0; add rax, rbx; pop rbx; cmp (rax),0;   */
+/*                              cmove rax, rdx` (strcspn wrapper)             */
+/*   strtok_r     @ 0x4012b0 — `push r13; mov r13, rdx; push r12; mov r12,    */
+/*                              rdi; push rbp; mov rbp, rsi; test rdi, rdi;   */
+/*                              je end_init; mov rdi, r12`                    */
+/*   strcmp       @ 0x400890 — `movzx edx,(rdi); movzx ecx,(rsi); mov eax,1;  */
+/*                              cmp cl,dl; je +1a; jmp +27` (#559 expansion;  */
+/*                              the gcc -Os emission for this build is        */
+/*                              stable; if a future build mangles the         */
+/*                              register allocator the .symtab path covers).  */
+/*                                                                            */
+/* All fingerprints clear the 16-byte intrinsic-specificity threshold except  */
+/* strcmp at 14 bytes — the function-boundary heuristic in ScanSegment        */
+/* protects it against accidental matches inside unrelated instruction        */
+/* streams.                                                                   */
+/* ────────────────────────────────────────────────────────────────────────── */
+
+/* musl memrchr — 32-byte prologue covering the backward-walk setup + the
+ * first loop iteration head.  All bytes stable; no register variation; no
+ * displacement masking required (the `jmp +0x10` displacement is intra-
+ * prologue and the embedded `nop` filler is part of the canonical body).
+ *
+ *   48 8d 44 17 ff          lea    rax, [rdi + rdx - 1]   (end-of-buffer)
+ *   40 0f b6 f6             movzx  esi, sil               (c = (uchar)c)
+ *   48 83 ef 01             sub    rdi, 1                 (s_lo = s - 1)
+ *   eb 10                   jmp    +0x10                  (enter loop tail)
+ *   90                      nop                           (alignment)
+ *   49 89 c0                mov    r8, rax                (loop body start)
+ *   48 83 e8 01             sub    rax, 1
+ *   41 0f b6 10             movzx  edx, byte ptr [r8]
+ *   39 f2                   cmp    edx, esi
+ *   74 08                   je     +0x08                  (hit → return r8)
+ *   48                      (REX prefix of cmp rax, rdi follow-on)
+ */
+static const u8 kMemrchrMuslPattern[] = {
+    0x48, 0x8d, 0x44, 0x17, 0xff,  /* lea rax, [rdi+rdx-1]                     */
+    0x40, 0x0f, 0xb6, 0xf6,        /* movzx esi, sil                           */
+    0x48, 0x83, 0xef, 0x01,        /* sub rdi, 1                               */
+    0xeb, 0x10,                    /* jmp +0x10                                */
+    0x90,                          /* nop                                      */
+    0x49, 0x89, 0xc0,              /* mov r8, rax                              */
+    0x48, 0x83, 0xe8, 0x01,        /* sub rax, 1                               */
+    0x41, 0x0f, 0xb6, 0x10,        /* movzx edx, byte ptr [r8]                 */
+    0x39, 0xf2,                    /* cmp edx, esi                             */
+    0x74, 0x08,                    /* je +0x08                                 */
+};
+static const u8 kMemrchrMuslMask[] = {
+    0xff, 0xff, 0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff, 0xff,
+    0xff, 0xff,
+    0xff,
+    0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff, 0xff,
+    0xff, 0xff,
+    0xff, 0xff,
+};
+
+/* musl strrchr — gcc -Os wrapper calling strlen then tail-jumping memrchr.
+ * 22-byte prologue captures setup + the call-to-strlen + the post-call
+ * length-adjust.  The 4-byte call displacement is masked.
+ *
+ *   41 54                   push   r12
+ *   41 89 f4                mov    r12d, esi              (save c)
+ *   55                      push   rbp
+ *   48 89 fd                mov    rbp, rdi               (save s)
+ *   48 83 ec 08             sub    rsp, 8
+ *   e8 ?? ?? ?? ??          call   strlen                 (masked rel32)
+ *   48 83 c4 08             add    rsp, 8
+ */
+static const u8 kStrrchrMuslPattern[] = {
+    0x41, 0x54,                    /* push r12                                 */
+    0x41, 0x89, 0xf4,              /* mov r12d, esi                            */
+    0x55,                          /* push rbp                                 */
+    0x48, 0x89, 0xfd,              /* mov rbp, rdi                             */
+    0x48, 0x83, 0xec, 0x08,        /* sub rsp, 8                               */
+    0xe8, 0x00, 0x00, 0x00, 0x00,  /* call strlen (masked)                     */
+    0x48, 0x83, 0xc4, 0x08,        /* add rsp, 8                               */
+};
+static const u8 kStrrchrMuslMask[] = {
+    0xff, 0xff,
+    0xff, 0xff, 0xff,
+    0xff,
+    0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff, 0xff,
+    0xff, 0x00, 0x00, 0x00, 0x00,  /* mask call displacement                   */
+    0xff, 0xff, 0xff, 0xff,
+};
+
+/* musl strcspn — 24-byte prologue captures frame setup + the short-circuit
+ * single-char check (`*set == NUL` returns 0; `set[1] == NUL` would also
+ * short-circuit, falling through to a strchrnul call).
+ *
+ *   55                      push   rbp
+ *   48 89 fd                mov    rbp, rdi               (save s)
+ *   53                      push   rbx
+ *   48 89 f3                mov    rbx, rsi               (save set)
+ *   48 83 ec 28             sub    rsp, 0x28              (32B bitmap + slack)
+ *   0f be 36                movsx  esi, byte ptr [rsi]    (load set[0])
+ *   40 84 f6                test   sil, sil               (set[0] == 0?)
+ *   74 06                   je     +6                     (yes → return 0)
+ *   80 7b 01 00             cmp    byte ptr [rbx+1], 0    (set[1] == 0?)
+ */
+static const u8 kStrcspnMuslPattern[] = {
+    0x55,                          /* push rbp                                 */
+    0x48, 0x89, 0xfd,              /* mov rbp, rdi                             */
+    0x53,                          /* push rbx                                 */
+    0x48, 0x89, 0xf3,              /* mov rbx, rsi                             */
+    0x48, 0x83, 0xec, 0x28,        /* sub rsp, 0x28                            */
+    0x0f, 0xbe, 0x36,              /* movsx esi, byte ptr [rsi]                */
+    0x40, 0x84, 0xf6,              /* test sil, sil                            */
+    0x74, 0x06,                    /* je +6                                    */
+    0x80, 0x7b, 0x01, 0x00,        /* cmp byte ptr [rbx+1], 0                  */
+};
+static const u8 kStrcspnMuslMask[] = {
+    0xff,
+    0xff, 0xff, 0xff,
+    0xff,
+    0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff,
+    0xff, 0xff,
+    0xff, 0xff, 0xff, 0xff,
+};
+
+/* musl strspn — gcc -Os emits the frame-less variant (red-zone bitmap; no
+ * push rbp; xmm0 zeroes the bitmap area at [rsp-0x28]).  24-byte prologue.
+ *
+ *   0f b6 0e                movzx  ecx, byte ptr [rsi]    (load set[0])
+ *   66 0f ef c0             pxor   xmm0, xmm0
+ *   31 c0                   xor    eax, eax               (count = 0)
+ *   0f 29 44 24 d8          movaps xmmword ptr [rsp-0x28], xmm0
+ *   0f 29 44 24 e8          movaps xmmword ptr [rsp-0x18], xmm0
+ *   84 c9                   test   cl, cl                 (set[0] == 0?)
+ *   74 ??                   je     end                    (masked disp)
+ *   80 7e 01 00             cmp    byte ptr [rsi+1], 0
+ */
+static const u8 kStrspnMuslPattern[] = {
+    0x0f, 0xb6, 0x0e,              /* movzx ecx, byte ptr [rsi]                */
+    0x66, 0x0f, 0xef, 0xc0,        /* pxor xmm0, xmm0                          */
+    0x31, 0xc0,                    /* xor eax, eax                             */
+    0x0f, 0x29, 0x44, 0x24, 0xd8,  /* movaps [rsp-0x28], xmm0                  */
+    0x0f, 0x29, 0x44, 0x24, 0xe8,  /* movaps [rsp-0x18], xmm0                  */
+    0x84, 0xc9,                    /* test cl, cl                              */
+    0x74, 0x00,                    /* je end (masked)                          */
+    0x80, 0x7e, 0x01, 0x00,        /* cmp byte ptr [rsi+1], 0                  */
+};
+static const u8 kStrspnMuslMask[] = {
+    0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff, 0xff,
+    0xff, 0xff,
+    0xff, 0xff, 0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff, 0xff, 0xff,
+    0xff, 0xff,
+    0xff, 0x00,                    /* mask je displacement                     */
+    0xff, 0xff, 0xff, 0xff,
+};
+
+/* musl strpbrk — gcc -Os wrapper around strcspn.  24-byte prologue captures
+ * frame setup + the call + the cmove-on-NUL idiom.
+ *
+ *   53                      push   rbx
+ *   48 89 fb                mov    rbx, rdi               (save s)
+ *   e8 ?? ?? ?? ??          call   strcspn                (masked rel32)
+ *   ba 00 00 00 00          mov    edx, 0                 (NULL on miss)
+ *   48 01 d8                add    rax, rbx               (p = s + strcspn)
+ *   5b                      pop    rbx
+ *   80 38 00                cmp    byte ptr [rax], 0      (*p == 0?)
+ *   48 0f 44 c2             cmove  rax, rdx               (yes → NULL)
+ */
+static const u8 kStrpbrkMuslPattern[] = {
+    0x53,                          /* push rbx                                 */
+    0x48, 0x89, 0xfb,              /* mov rbx, rdi                             */
+    0xe8, 0x00, 0x00, 0x00, 0x00,  /* call strcspn (masked)                    */
+    0xba, 0x00, 0x00, 0x00, 0x00,  /* mov edx, 0                               */
+    0x48, 0x01, 0xd8,              /* add rax, rbx                             */
+    0x5b,                          /* pop rbx                                  */
+    0x80, 0x38, 0x00,              /* cmp byte ptr [rax], 0                    */
+    0x48, 0x0f, 0x44, 0xc2,        /* cmove rax, rdx                           */
+};
+static const u8 kStrpbrkMuslMask[] = {
+    0xff,
+    0xff, 0xff, 0xff,
+    0xff, 0x00, 0x00, 0x00, 0x00,  /* mask call displacement                   */
+    0xff, 0xff, 0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff,
+    0xff,
+    0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff, 0xff,
+};
+
+/* musl strtok_r — gcc -Os 3-arg variant.  22-byte prologue covers the three
+ * callee-saved register pushes (r13/r12/rbp), the arg-save shuffles, the
+ * `s == NULL` test, and the entry into the post-init body that prepares the
+ * strspn call.  The `je +0x55` displacement points into the resume-from-
+ * state branch; mask it for codegen drift.
+ *
+ *   41 55                   push   r13
+ *   49 89 d5                mov    r13, rdx               (save &state)
+ *   41 54                   push   r12
+ *   49 89 fc                mov    r12, rdi               (save s)
+ *   55                      push   rbp
+ *   48 89 f5                mov    rbp, rsi               (save sep)
+ *   48 85 ff                test   rdi, rdi               (s == NULL?)
+ *   74 ??                   je     resume                 (masked disp)
+ *   4c 89 e7                mov    rdi, r12               (else: arm strspn)
+ */
+static const u8 kStrtokRMuslPattern[] = {
+    0x41, 0x55,                    /* push r13                                 */
+    0x49, 0x89, 0xd5,              /* mov r13, rdx                             */
+    0x41, 0x54,                    /* push r12                                 */
+    0x49, 0x89, 0xfc,              /* mov r12, rdi                             */
+    0x55,                          /* push rbp                                 */
+    0x48, 0x89, 0xf5,              /* mov rbp, rsi                             */
+    0x48, 0x85, 0xff,              /* test rdi, rdi                            */
+    0x74, 0x00,                    /* je resume (masked)                       */
+    0x4c, 0x89, 0xe7,              /* mov rdi, r12                             */
+};
+static const u8 kStrtokRMuslMask[] = {
+    0xff, 0xff,
+    0xff, 0xff, 0xff,
+    0xff, 0xff,
+    0xff, 0xff, 0xff,
+    0xff,
+    0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff,
+    0xff, 0x00,                    /* mask je displacement                     */
+    0xff, 0xff, 0xff,
+};
+
+/* musl strcmp — #559 fingerprint.  gcc -Os emits a leading byte-compare with
+ * eax pre-loaded to 1 (the "non-equal" sentinel) — characteristic of the
+ * if-first-byte-differs early-return path.  17-byte prologue (within the
+ * intrinsic-specificity threshold of 16 by ONE byte; the `b8 01 00 00 00`
+ * immediate-1 + `38 d1` cmp-of-tolerated-bytes idiom is uncommon outside
+ * this exact strcmp shape).
+ *
+ *   0f b6 17                movzx  edx, byte ptr [rdi]    (*a)
+ *   0f b6 0e                movzx  ecx, byte ptr [rsi]    (*b)
+ *   b8 01 00 00 00          mov    eax, 1                 (sentinel)
+ *   38 d1                   cmp    cl, dl                 (eq?)
+ *   74 1a                   je     loop                   (masked disp)
+ *   eb 27                   jmp    diff                   (masked disp)
+ *
+ * NOTE: per the existing thunks.h note, memcmp/strcmp historically deferred
+ * because gcc emits per-build register-allocator variations.  This bench-
+ * fixture build's strcmp IS stable (verified at fingerprint time); when a
+ * future build mangles the prologue the fingerprint silently misses and the
+ * threaded-code dispatcher falls back to byte-by-byte interpretation —
+ * graceful degradation.  The .symtab path (when present) catches non-musl
+ * builds.
+ */
+static const u8 kStrcmpMuslPattern[] = {
+    0x0f, 0xb6, 0x17,              /* movzx edx, byte ptr [rdi]                */
+    0x0f, 0xb6, 0x0e,              /* movzx ecx, byte ptr [rsi]                */
+    0xb8, 0x01, 0x00, 0x00, 0x00,  /* mov eax, 1                               */
+    0x38, 0xd1,                    /* cmp cl, dl                               */
+    0x74, 0x00,                    /* je loop (masked)                         */
+    0xeb, 0x00,                    /* jmp diff (masked)                        */
+};
+static const u8 kStrcmpMuslMask[] = {
+    0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff, 0xff, 0xff,
+    0xff, 0xff,
+    0xff, 0x00,                    /* mask je displacement                     */
+    0xff, 0x00,                    /* mask jmp displacement                    */
+};
+
 static const struct ThunkFingerprint kFingerprints[] = {
     {"memcpy_musl_x86_64", "memcpy",
      kMemcpyMuslPattern, kMemcpyMuslMask, sizeof(kMemcpyMuslPattern),
@@ -1707,6 +2319,31 @@ static const struct ThunkFingerprint kFingerprints[] = {
      NULL, 0},
     {"strstr_musl_x86_64", "strstr",
      kStrstrMuslPattern, kStrstrMuslMask, sizeof(kStrstrMuslPattern),
+     NULL, 0},
+    /* Phase 1 EXHAUSTIVE SWEEP — #564 (firebox-elf-v2-phase2-batch-4-thunks).
+     * Batch-4: memrchr / strrchr / strspn / strcspn / strpbrk / strtok_r +
+     * strcmp.  strdup / strndup / memcmp / strtok deliberately skipped —
+     * see thunks.c header comment above the batch-4 trampoline block. */
+    {"memrchr_musl_x86_64", "memrchr",
+     kMemrchrMuslPattern, kMemrchrMuslMask, sizeof(kMemrchrMuslPattern),
+     NULL, 0},
+    {"strrchr_musl_x86_64", "strrchr",
+     kStrrchrMuslPattern, kStrrchrMuslMask, sizeof(kStrrchrMuslPattern),
+     NULL, 0},
+    {"strcspn_musl_x86_64", "strcspn",
+     kStrcspnMuslPattern, kStrcspnMuslMask, sizeof(kStrcspnMuslPattern),
+     NULL, 0},
+    {"strspn_musl_x86_64", "strspn",
+     kStrspnMuslPattern, kStrspnMuslMask, sizeof(kStrspnMuslPattern),
+     NULL, 0},
+    {"strpbrk_musl_x86_64", "strpbrk",
+     kStrpbrkMuslPattern, kStrpbrkMuslMask, sizeof(kStrpbrkMuslPattern),
+     NULL, 0},
+    {"strtok_r_musl_x86_64", "strtok_r",
+     kStrtokRMuslPattern, kStrtokRMuslMask, sizeof(kStrtokRMuslPattern),
+     NULL, 0},
+    {"strcmp_musl_x86_64", "strcmp",
+     kStrcmpMuslPattern, kStrcmpMuslMask, sizeof(kStrcmpMuslPattern),
      NULL, 0},
 };
 

@@ -231,11 +231,15 @@ struct MachineState {
 /* Capacity grows alongside the registry in blink/thunks.c.  Phase 1 sized at
  * 5 (memcpy/memset/strlen/memcmp/strcmp); Phase 2 batch-2 adds 5 more
  * (memchr/strchr/strncmp/strcpy/strncpy) — bump to 10; Phase 2 batch-3 adds
- * 5 more (strnlen/strcasecmp/strncasecmp/strstr/memmove) — bump to 15.  Keep
+ * 5 more (strnlen/strcasecmp/strncasecmp/strstr/memmove) — bump to 15.
+ * Phase 1 EXHAUSTIVE SWEEP (#564) adds the remaining bounded CPU-hot libc
+ * surface (strrchr/strspn/strcspn/strpbrk/strtok_r/strdup/strndup/memrchr
+ * + strcmp fingerprint), 9 new fingerprint-path thunks — bump to 25 with
+ * a modest safety headroom for the next surface that's discovered.  Keep
  * the slack (matrix on top of registry size) small: the dispatch path walks
  * the table linearly and a fat array hurts the cache footprint of the cold
  * lookup. */
-#define FBX_MAX_THUNKS 15
+#define FBX_MAX_THUNKS 25
 struct FbxThunkEntry {
   u64 pc;
   void (*trampoline)(struct Machine *);

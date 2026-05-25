@@ -19,27 +19,37 @@
  * happens.  See blink/threadedcode.c::LookupThunkAt + CompileBlock.
  *
  * Currently routed primitives:
- *   Phase 1:         memcpy memset strlen memcmp strcmp
- *   Phase 2 batch 2: memchr strchr strncmp strcpy strncpy
- *   Phase 2 batch 3: strnlen strcasecmp strncasecmp strstr memmove
+ *   Phase 1:                memcpy memset strlen memcmp strcmp
+ *   Phase 2 batch 2:        memchr strchr strncmp strcpy strncpy
+ *   Phase 2 batch 3:        strnlen strcasecmp strncasecmp strstr memmove
+ *   Phase 1 EXHAUSTIVE (#564):
+ *                           memrchr strrchr strspn strcspn strpbrk strtok_r
  *
  * Coverage caveat: the symbol-table path requires .symtab or .dynsym to
  * be present.  Stripped statically-linked binaries (Alpine's musl-static
  * busybox / jq, the dominant bench-corpus shape) fall through to the
- * Phase 1.4 + Phase 1.5 + Phase 2 batch-3 fingerprint path.  Fingerprint
- * coverage:
+ * Phase 1.4 + Phase 1.5 + Phase 2 batch-3 + Phase 1 exhaustive fingerprint
+ * path.  Fingerprint coverage:
  *   Phase 1.4 (firebox-elf-v2-phase1.4-fingerprinting):
  *     memcpy / memset / strlen
  *   Phase 1.5 (firebox-elf-v2-phase1.5-fingerprint-expansion-batch-2):
  *     memchr / strchr / strncmp / strcpy / strncpy
  *   Phase 2 batch-3 (firebox-elf-v2-phase2-batch-3-thunks):
  *     strnlen / strcasecmp / strncasecmp / strstr / memmove
- * memcmp/strcmp remain symbol-only (per-build register-allocator
- * variation defeats a single-fingerprint match — see notes in thunks.c
- * below the Phase 1.4 block).  See
- * work/tasks/555-elf-perf-phase-2-batch-3-thunks-strnlen-strcasecmp-
- * strncasecmp-strstr-memmove/phase-1-report.md for the batch-3
- * empirical match table.
+ *   Phase 1 EXHAUSTIVE — #564 (firebox-elf-v2-phase2-batch-4-thunks):
+ *     memrchr / strrchr / strspn / strcspn / strpbrk / strtok_r + strcmp
+ * Deliberately NOT shipped at the fingerprint layer:
+ *   - memcmp: not present as a standalone symbol in the bench-fixture
+ *     busybox (gcc-12 inlines via __builtin_memcmp at -Os).  Symtab-path
+ *     dispatch only.
+ *   - strdup / strndup: must allocate via guest malloc; a host-side thunk
+ *     can't synchronously re-enter the guest heap.  The internal strlen +
+ *     memcpy calls inside both are already thunked.
+ *   - strtok: legacy single-thread variant; static state ownership makes a
+ *     host trampoline incoherent across overlapping calls.  busybox uses
+ *     strtok_r directly anyway.
+ * See work/tasks/564-elf-perf-phase-1-exhaustive-sweep/phase-1-report.md for
+ * the batch-4 empirical match table.
  *
  * The scan is one-shot, performed once at ELF load.  The dispatch path is
  * a min/max range bound followed by a tiny linear scan over <= MAX_THUNKS
@@ -89,9 +99,11 @@ bool FbxThunksRegisterByName(struct System *sys, const char *name, u64 pc);
  * Coverage today (see work/tracks/elf-performance/phase-1-thunking/
  * phase-1.4-report.md for the Phase 1.4 empirical match table,
  * work/tasks/549-elf-perf-phase-1.5-fingerprint-expansion-batch-2/
- * phase-1-report.md for Phase 1.5, and
+ * phase-1-report.md for Phase 1.5,
  * work/tasks/555-elf-perf-phase-2-batch-3-thunks-strnlen-strcasecmp-
- * strncasecmp-strstr-memmove/phase-1-report.md for Phase 2 batch-3):
+ * strncasecmp-strstr-memmove/phase-1-report.md for Phase 2 batch-3, and
+ * work/tasks/564-elf-perf-phase-1-exhaustive-sweep/phase-1-report.md for
+ * Phase 1 exhaustive batch-4):
  *   Phase 1.4 (extremely stable — hand-asm or canonical HASZERO codegen):
  *     - memcpy_musl_x86_64
  *     - memset_musl_x86_64
@@ -122,12 +134,39 @@ bool FbxThunksRegisterByName(struct System *sys, const char *name, u64 pc);
  *     - strstr_musl_x86_64        (17-byte prologue with `movsx (%rsi),
  *                                   %esi` early-return-on-empty-needle
  *                                   idiom — uncommon outside musl)
+ *   Phase 1 EXHAUSTIVE — #564 (firebox-elf-v2-phase2-batch-4-thunks):
+ *     - memrchr_musl_x86_64       (`lea rax, [rdi+rdx-1]` opens backward
+ *                                   walker; 32-byte prologue, no masked
+ *                                   bytes — all fixed-immediate)
+ *     - strrchr_musl_x86_64       (gcc -Os strlen-then-tail-call-memrchr
+ *                                   wrapper; 22-byte prologue; call
+ *                                   displacement masked)
+ *     - strcspn_musl_x86_64       (24-byte prologue: frame setup +
+ *                                   single-char short-circuit; no masked
+ *                                   bytes — all fixed-offset memory ops)
+ *     - strspn_musl_x86_64        (24-byte prologue: red-zone bitmap
+ *                                   `movaps [rsp-0x28]`; single je
+ *                                   displacement masked)
+ *     - strpbrk_musl_x86_64       (24-byte prologue: strcspn wrapper +
+ *                                   `cmove rax, rdx` NULL-on-miss; call
+ *                                   displacement masked)
+ *     - strtok_r_musl_x86_64      (22-byte prologue: r13/r12/rbp pushes +
+ *                                   `test rdi; je resume` resume-from-
+ *                                   state branch; je displacement masked)
+ *     - strcmp_musl_x86_64        (#559 fingerprint expansion; 17-byte
+ *                                   prologue: byte-load + `mov eax, 1`
+ *                                   sentinel + cmp; both short-jump
+ *                                   displacements masked)
  *
- * Best-effort additions (may not match all builds — flagged via the
- * trace output when missing):
- *   - memcmp/strcmp deferred: gcc emits per-build register-allocator
- *     variations that defeat a single-fingerprint match; the call rate
- *     against grep/wc/sort doesn't justify a multi-fingerprint table yet.
+ * Best-effort additions / known gaps:
+ *   - memcmp: not present as a standalone symbol in the bench-fixture
+ *     busybox (gcc-12 inlines via __builtin_memcmp at -Os).  Handler stays
+ *     in kRegistry for .symtab-path dispatch when .symtab is present.
+ *   - strdup / strndup: must go through guest malloc; a host-side thunk
+ *     can't synchronously re-enter the guest heap.  The internal strlen +
+ *     memcpy calls inside both already get thunked.
+ *   - strtok: legacy single-thread variant; static state ownership defeats
+ *     a host-side trampoline across overlapping calls.
  */
 int FbxThunksScanFromText(struct System *sys,
                           Elf64_Ehdr_ *ehdr,
