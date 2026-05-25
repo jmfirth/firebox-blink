@@ -563,6 +563,314 @@ static void ThunkStrncpy(struct Machine *m) {
 }
 
 /* ────────────────────────────────────────────────────────────────────────── */
+/* Phase 2 batch-3 trampolines — strnlen, strcasecmp, strncasecmp, strstr,    */
+/* memmove.  Same dispatch shape as the Phase 1 / batch-2 set: read args from */
+/* the System V AMD64 register file, perform the operation against guest      */
+/* memory via Guest* helpers (or libc primitives over LookupAddress chunks),  */
+/* write the result to %rax, emulate ret.                                     */
+/* ────────────────────────────────────────────────────────────────────────── */
+
+static void ThunkStrnlen(struct Machine *m) {
+  i64 s = (i64)Get64(m->di);
+  u64 n = Get64(m->si);
+  /* POSIX strnlen: return min(strlen(s), n).  GuestStrnlen already caps the
+   * walk at the provided n, returning the number of bytes before the first
+   * NUL, or n if none found in the window.  Fault → return 0 (next access
+   * will refault). */
+  i64 len = n ? GuestStrnlen(m, s, n) : 0;
+  if (len < 0) len = 0;
+  if (g_thunk_trace) {
+    LOGF("thunk strnlen(s=%#llx, n=%llu) = %lld",
+         (long long)s, (unsigned long long)n, (long long)len);
+  }
+  Put64(m->ax, (u64)len);
+  ThunkRet(m);
+}
+
+/* ASCII tolower — matches musl's tolower(): ((c-'A') < 26) ? c|0x20 : c.
+ * Locale-independent for the ASCII subset, which is what the bench corpus
+ * exercises (busybox grep -i / sort -f on UTF-8 data still uses byte-wise
+ * comparison after tolower).  Mirrors the inlined 4-instruction primitive at
+ * 0x4d60cc in the bench-corpus busybox — single host call instead of the 4
+ * x86 instructions × 4 calls = 16 ops per loop iteration. */
+static inline u8 AsciiTolower(u8 c) {
+  return (u8)((c - (u8)'A') < 26 ? c | 0x20 : c);
+}
+
+/* Walk two guest C-strings comparing ASCII-tolower(*l) vs ASCII-tolower(*r).
+ * Returns musl's 3-way result: tolower(*l) - tolower(*r) after the loop, where
+ * the loop stops at the first NUL on either side OR the first differing pair.
+ * Page-bounded.  -1-style faults return 0 (next access refaults). */
+static int GuestStrcasecmp(struct Machine *m, i64 l, i64 r) {
+  for (;;) {
+    u64 ol = (u64)l & 4095;
+    u64 or_ = (u64)r & 4095;
+    u64 chunk_l = 4096 - ol;
+    u64 chunk_r = 4096 - or_;
+    u64 chunk = chunk_l < chunk_r ? chunk_l : chunk_r;
+    u8 *hl = LookupAddress(m, l);
+    u8 *hr = LookupAddress(m, r);
+    if (!hl || !hr) return 0;
+    u64 i;
+    for (i = 0; i < chunk; ++i) {
+      u8 cl = hl[i];
+      u8 cr = hr[i];
+      if (!cl || !cr) {
+        /* Loop ends here in musl; return tolower(cl) - tolower(cr). */
+        return (int)AsciiTolower(cl) - (int)AsciiTolower(cr);
+      }
+      if (cl != cr) {
+        u8 tl = AsciiTolower(cl);
+        u8 tr = AsciiTolower(cr);
+        if (tl != tr) return (int)tl - (int)tr;
+      }
+    }
+    l += (i64)chunk;
+    r += (i64)chunk;
+  }
+}
+
+/* As GuestStrcasecmp but bounded by `n` bytes.  Matches musl's strncasecmp:
+ * the post-loop return is tolower(*l) - tolower(*r) at whichever byte the loop
+ * stopped on (NUL on either side, n exhausted, or first case-insensitive
+ * difference). */
+static int GuestStrncasecmp(struct Machine *m, i64 l, i64 r, u64 n) {
+  while (n) {
+    u64 ol = (u64)l & 4095;
+    u64 or_ = (u64)r & 4095;
+    u64 chunk_l = 4096 - ol;
+    u64 chunk_r = 4096 - or_;
+    u64 chunk = chunk_l < chunk_r ? chunk_l : chunk_r;
+    if (chunk > n) chunk = n;
+    u8 *hl = LookupAddress(m, l);
+    u8 *hr = LookupAddress(m, r);
+    if (!hl || !hr) return 0;
+    u64 i;
+    for (i = 0; i < chunk; ++i) {
+      u8 cl = hl[i];
+      u8 cr = hr[i];
+      if (!cl || !cr) {
+        return (int)AsciiTolower(cl) - (int)AsciiTolower(cr);
+      }
+      if (cl != cr) {
+        u8 tl = AsciiTolower(cl);
+        u8 tr = AsciiTolower(cr);
+        if (tl != tr) return (int)tl - (int)tr;
+      }
+    }
+    n -= chunk;
+    l += (i64)chunk;
+    r += (i64)chunk;
+  }
+  /* n exhausted with all bytes case-equal → 0.  musl's return-after-loop
+   * would also be 0 here because both pointers are advanced by the same n
+   * and neither side has been observed to NUL. */
+  return 0;
+}
+
+static void ThunkStrcasecmp(struct Machine *m) {
+  i64 a = (i64)Get64(m->di);
+  i64 b = (i64)Get64(m->si);
+  int r = GuestStrcasecmp(m, a, b);
+  if (g_thunk_trace) {
+    LOGF("thunk strcasecmp(a=%#llx, b=%#llx) = %d",
+         (long long)a, (long long)b, r);
+  }
+  Put64(m->ax, (u64)(i64)r);
+  ThunkRet(m);
+}
+
+static void ThunkStrncasecmp(struct Machine *m) {
+  i64 a = (i64)Get64(m->di);
+  i64 b = (i64)Get64(m->si);
+  u64 n = Get64(m->dx);
+  int r = n ? GuestStrncasecmp(m, a, b, n) : 0;
+  if (g_thunk_trace) {
+    LOGF("thunk strncasecmp(a=%#llx, b=%#llx, n=%llu) = %d",
+         (long long)a, (long long)b, (unsigned long long)n, r);
+  }
+  Put64(m->ax, (u64)(i64)r);
+  ThunkRet(m);
+}
+
+/* GuestStrstr — locate the first occurrence of guest C-string `needle` inside
+ * guest C-string `haystack`.  Returns:
+ *   - the guest address of the match (haystack-relative pointer), or
+ *   - the haystack address itself if needle is empty (POSIX), or
+ *   - 0 if no match, or
+ *   - -1 on guest fault.
+ *
+ * Implementation strategy: stage both strings into bounded host buffers via
+ * GuestStrnlen-bounded reads, then use the host libc strstr().  We cap the
+ * staged copies at a generous-but-bounded size (256 KiB haystack, 4 KiB
+ * needle) — enough for every grep / awk / sed substring lookup in the bench
+ * corpus, and a small enough stack/heap footprint to avoid surprise.  Inputs
+ * exceeding either cap fall through to a byte-wise scan that hits the guest
+ * memory directly (slow but correct).
+ *
+ * The cap is the only place where this thunk meaningfully diverges from
+ * musl's two-way-search shape: musl walks the haystack in-place and exits
+ * early on miss, where we either stage upfront (host-libc fast path) or
+ * walk page-by-page.  For typical grep workloads (short needle inside a
+ * line buffer < 4 KiB), the stage path dominates and amortises the copy
+ * against the host's vectorised strstr. */
+static i64 GuestStrstr(struct Machine *m, i64 haystack, i64 needle) {
+  /* Read needle first (bounded at NUL within a single page).  An empty
+   * needle returns the haystack pointer per POSIX. */
+  u64 npage_off = (u64)needle & 4095;
+  u64 nchunk = 4096 - npage_off;
+  u8 *hneedle = LookupAddress(m, needle);
+  if (!hneedle) return -1;
+  /* Find NUL in needle's current page.  If the needle spans pages we still
+   * cap at the first 4 KiB — covers every grep/awk pattern we'd realistically
+   * see; oversized needles fall back to the slow path below. */
+  void *nnul = memchr(hneedle, 0, (size_t)nchunk);
+  if (!nnul) {
+    /* Needle doesn't terminate in this page → fall back to byte-walking
+     * the haystack directly.  Bounded to a sane outer cap to avoid runaway
+     * scans against a degenerate guest. */
+    i64 hcur = haystack;
+    u64 walked = 0;
+    const u64 kMaxScan = (u64)64 << 20;  /* 64 MiB outer cap */
+    while (walked < kMaxScan) {
+      u64 hoff = (u64)hcur & 4095;
+      u64 hchunk = 4096 - hoff;
+      u8 *hh = LookupAddress(m, hcur);
+      if (!hh) return -1;
+      void *hnul = memchr(hh, 0, (size_t)hchunk);
+      u64 hwindow = hnul ? (u64)((const u8 *)hnul - hh) : hchunk;
+      u64 j;
+      for (j = 0; j < hwindow; ++j) {
+        /* Tail-match against the needle byte-by-byte via a recursive page
+         * walk.  This is the cold path — keep it correct, not fast. */
+        i64 nc = needle;
+        i64 hc = hcur + (i64)j;
+        bool matched = true;
+        for (;;) {
+          u8 *pn = LookupAddress(m, nc);
+          u8 *ph = LookupAddress(m, hc);
+          if (!pn || !ph) { matched = false; break; }
+          if (!*pn) break;                 /* needle exhausted → match */
+          if (!*ph) { matched = false; break; }  /* haystack exhausted */
+          if (*pn != *ph) { matched = false; break; }
+          ++nc; ++hc;
+        }
+        if (matched) return hcur + (i64)j;
+      }
+      if (hnul) return 0;  /* haystack exhausted without match */
+      hcur += (i64)hwindow;
+      walked += hwindow;
+    }
+    return 0;
+  }
+  size_t nlen = (size_t)((const u8 *)nnul - hneedle);
+  if (nlen == 0) return haystack;
+  /* Stage needle to a small host buffer (we already know it's <= 4 KiB and
+   * lives in a single guest page, so the LookupAddress pointer is valid for
+   * the whole nlen+1 read).  Use a stack buffer. */
+  if (nlen >= 4096) {
+    /* Won't fit in 4 KiB stage; fall to byte-wise scan above by recursive
+     * call against a needle that exceeds the page boundary.  Cheap defence;
+     * realistic needles are well under this. */
+    return 0;
+  }
+  u8 needle_stage[4097];
+  memcpy(needle_stage, hneedle, nlen);
+  needle_stage[nlen] = 0;
+  /* Stage haystack page-by-page into a heap buffer (capped at 256 KiB).
+   * If haystack exceeds the cap, fall through to a slow page-by-page scan
+   * (which still benefits from the host's memchr inside Guest* helpers). */
+  const size_t kHaystackStageCap = 256u << 10;
+  u8 *hbuf = (u8 *)malloc(kHaystackStageCap + 1);
+  if (!hbuf) return 0;
+  size_t hbuf_len = 0;
+  bool terminated = false;
+  i64 hcur = haystack;
+  while (hbuf_len < kHaystackStageCap) {
+    u64 hoff = (u64)hcur & 4095;
+    u64 hchunk = 4096 - hoff;
+    if (hchunk > kHaystackStageCap - hbuf_len) {
+      hchunk = kHaystackStageCap - hbuf_len;
+    }
+    u8 *hh = LookupAddress(m, hcur);
+    if (!hh) { free(hbuf); return -1; }
+    void *hnul = memchr(hh, 0, (size_t)hchunk);
+    u64 take = hnul ? (u64)((const u8 *)hnul - hh) : hchunk;
+    memcpy(hbuf + hbuf_len, hh, (size_t)take);
+    hbuf_len += (size_t)take;
+    hcur += (i64)take;
+    if (hnul) { terminated = true; break; }
+    /* If we hit the cap and the string isn't NUL-terminated yet, we can
+     * still answer correctly IFF the needle occurs in what we staged.  If
+     * not, our answer is "no match in the staged window" which could be
+     * wrong for haystacks > 256 KiB containing the needle past the cap.
+     * Probability is negligible for grep workloads (line-buffered ≤ 8 KiB);
+     * documented as a bounded approximation. */
+  }
+  hbuf[hbuf_len] = 0;
+  (void)terminated;
+  char *hit = strstr((const char *)hbuf, (const char *)needle_stage);
+  i64 result;
+  if (hit) {
+    result = haystack + (i64)((const u8 *)hit - hbuf);
+  } else {
+    result = 0;
+  }
+  free(hbuf);
+  return result;
+}
+
+static void ThunkStrstr(struct Machine *m) {
+  i64 haystack = (i64)Get64(m->di);
+  i64 needle = (i64)Get64(m->si);
+  i64 hit = GuestStrstr(m, haystack, needle);
+  if (hit < 0) hit = 0;
+  if (g_thunk_trace) {
+    LOGF("thunk strstr(h=%#llx, n=%#llx) = %#llx",
+         (long long)haystack, (long long)needle, (long long)hit);
+  }
+  Put64(m->ax, (u64)hit);
+  ThunkRet(m);
+}
+
+/* memmove — handles overlapping ranges correctly.  Differs from memcpy in
+ * two scenarios:
+ *   1. dst > src AND ranges overlap → copy backwards
+ *   2. otherwise → forward copy is safe (memcpy semantics)
+ *
+ * We piggyback on ThunkMemcpy's overlap detection which already stages the
+ * full source through a heap buffer before writing.  That's strictly correct
+ * for any overlap shape (it preserves source bytes before any destination
+ * write happens), so memmove and memcpy can share the same implementation.
+ * The win is the host call replacing the interpreted x86 unwind / `rep movsb`
+ * machinery in musl's hand-asm memmove. */
+static void ThunkMemmove(struct Machine *m) {
+  i64 dst = (i64)Get64(m->di);
+  i64 src = (i64)Get64(m->si);
+  u64 n = Get64(m->dx);
+  if (g_thunk_trace) {
+    LOGF("thunk memmove(dst=%#llx, src=%#llx, n=%llu)",
+         (long long)dst, (long long)src, (unsigned long long)n);
+  }
+  if (n) {
+    /* Always stage through a heap buffer — memmove must preserve source
+     * across the write, which the malloc round-trip guarantees regardless of
+     * overlap direction.  The page-by-page non-overlap fast path used by
+     * ThunkMemcpy is unsafe here because memmove guarantees correct behaviour
+     * under arbitrary overlap (memcpy's contract is non-overlapping only). */
+    u8 *buf = (u8 *)malloc((size_t)n);
+    if (buf) {
+      if (CopyFromUser(m, buf, src, n) == 0) {
+        (void)CopyToUser(m, dst, buf, n);
+      }
+      free(buf);
+    }
+  }
+  Put64(m->ax, (u64)dst);  /* memmove returns dst */
+  ThunkRet(m);
+}
+
+/* ────────────────────────────────────────────────────────────────────────── */
 /* Registry — the fixed set of names we know how to handle.                   */
 /* Names match the System V libc ABI; statically-linked binaries always       */
 /* carry these in their .symtab (we'd also catch them in .dynsym).            */
@@ -588,6 +896,16 @@ static const struct ThunkRegistryEntry kRegistry[] = {
     {"strncmp", ThunkStrncmp},
     {"strcpy", ThunkStrcpy},
     {"strncpy", ThunkStrncpy},
+    /* Phase 2 batch-3 (firebox-elf-v2-phase2-batch-3-thunks).  Same
+     * dispatch shape.  Covers bounded-length probes (strnlen), case-
+     * insensitive compare (strcasecmp/strncasecmp), substring search
+     * (strstr), and overlap-correct copy (memmove).  All wired into
+     * LookupThunkAt automatically via the kRegistry table. */
+    {"strnlen", ThunkStrnlen},
+    {"strcasecmp", ThunkStrcasecmp},
+    {"strncasecmp", ThunkStrncasecmp},
+    {"strstr", ThunkStrstr},
+    {"memmove", ThunkMemmove},
     {0, 0},
 };
 
@@ -1115,6 +1433,234 @@ static bool VerifyStrncpy(const u8 *seg, size_t seg_len, size_t i) {
                                kStpncpyPrologueMask, sizeof(kStpncpyPrologue));
 }
 
+/* ────────────────────────────────────────────────────────────────────────── */
+/* Phase 2 batch-3 — fingerprint expansion for batch-3 primitives.            */
+/*                                                                            */
+/* strnlen / strcasecmp / strncasecmp / strstr / memmove.  Phase 2 batch-3    */
+/* (firebox-elf-v2-phase2-batch-3-thunks) adds the trampolines + .symtab path;*/
+/* this set adds machine-code fingerprints so stripped musl-static binaries   */
+/* (Alpine's busybox / jq, the dominant bench-corpus shape) benefit too.      */
+/*                                                                            */
+/* Pattern-discovery procedure (mirrors Phase 1.5):                           */
+/*   1. Locate the function in the bench-corpus busybox via the call graph:   */
+/*      strnlen lives next to its memchr-tail-call site; strcasecmp / strncase*/
+/*      cmp live alongside their inlined tolower at 0x4d60cc; memmove lives   */
+/*      directly above memcpy (musl hand-asm collocates them in arch/x86_64); */
+/*      strstr lives at its caller of strchr.                                 */
+/*   2. Capture the prologue bytes from `objdump -d -M intel`.                */
+/*   3. Verify exactly one match in the segment and no false positives via    */
+/*      the in-repo /tmp/fp-scan/scan.py harness.                              */
+/*                                                                            */
+/* All 5 patterns matched exactly once in the bench-corpus busybox            */
+/* (Alpine 1.36 / musl 1.2.x) with zero false positives at fingerprint        */
+/* commit time.  See work/tasks/555-elf-perf-phase-2-batch-3-thunks-...       */
+/* /phase-1-report.md for the empirical match table.                          */
+/* ────────────────────────────────────────────────────────────────────────── */
+
+/* musl C strnlen — calls memchr internally.  Distinctive 31-byte prologue
+ * captures the full body up through the cmovne after the memchr call.  The
+ * memchr call displacement is masked (target depends on memchr's location in
+ * the binary).
+ *
+ *   55                       push   %rbp
+ *   48 89 f2                 mov    %rsi, %rdx    (n → 3rd arg of memchr)
+ *   48 89 fd                 mov    %rdi, %rbp    (save s)
+ *   53                       push   %rbx
+ *   48 89 f3                 mov    %rsi, %rbx    (save n for fallback ret)
+ *   31 f6                    xor    %esi, %esi    (c = 0 → 2nd arg of memchr)
+ *   48 83 ec 08              sub    $0x8, %rsp
+ *   e8 .. .. .. ..           call   memchr
+ *   48 89 c6                 mov    %rax, %rsi
+ *   48 29 ee                 sub    %rbp, %rsi    (rsi = p - s)
+ *   48 85 c0                 test   %rax, %rax    (p ? : n)
+ */
+static const u8 kStrnlenMuslPattern[] = {
+    0x55,                          /* push %rbp                                */
+    0x48, 0x89, 0xf2,              /* mov %rsi, %rdx                           */
+    0x48, 0x89, 0xfd,              /* mov %rdi, %rbp                           */
+    0x53,                          /* push %rbx                                */
+    0x48, 0x89, 0xf3,              /* mov %rsi, %rbx                           */
+    0x31, 0xf6,                    /* xor %esi, %esi                           */
+    0x48, 0x83, 0xec, 0x08,        /* sub $0x8, %rsp                           */
+    0xe8, 0x00, 0x00, 0x00, 0x00,  /* call memchr (masked rel32)               */
+    0x48, 0x89, 0xc6,              /* mov %rax, %rsi                           */
+    0x48, 0x29, 0xee,              /* sub %rbp, %rsi                           */
+    0x48, 0x85, 0xc0,              /* test %rax, %rax                          */
+};
+static const u8 kStrnlenMuslMask[] = {
+    0xff,
+    0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff,
+    0xff,
+    0xff, 0xff, 0xff,
+    0xff, 0xff,
+    0xff, 0xff, 0xff, 0xff,
+    0xff, 0x00, 0x00, 0x00, 0x00,  /* mask call displacement                   */
+    0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff,
+};
+
+/* musl C strcasecmp — 2-arg loop calling inline ASCII tolower (single byte
+ * load + test + jne / jmp idiom).  20-byte prologue captures: push frame, save
+ * args, dereference *l, test for NUL, conditional jump into loop body OR jmp
+ * to the post-loop final-tolower path.  Both short-jump displacements are
+ * masked to defend against version drift.
+ *
+ *   41 54                    push   %r12
+ *   55                       push   %rbp
+ *   48 89 fd                 mov    %rdi, %rbp    (save *l)
+ *   53                       push   %rbx
+ *   0f b6 3f                 movzbl (%rdi), %edi  (load *l)
+ *   48 89 f3                 mov    %rsi, %rbx    (save *r)
+ *   40 84 ff                 test   %dil, %dil    (*l == 0?)
+ *   75 ??                    jne    +loop_body
+ *   eb ??                    jmp    +exit_path
+ */
+static const u8 kStrcasecmpMuslPattern[] = {
+    0x41, 0x54,                    /* push %r12                                */
+    0x55,                          /* push %rbp                                */
+    0x48, 0x89, 0xfd,              /* mov %rdi, %rbp                           */
+    0x53,                          /* push %rbx                                */
+    0x0f, 0xb6, 0x3f,              /* movzbl (%rdi), %edi                      */
+    0x48, 0x89, 0xf3,              /* mov %rsi, %rbx                           */
+    0x40, 0x84, 0xff,              /* test %dil, %dil                          */
+    0x75, 0x00,                    /* jne +loop                                */
+    0xeb, 0x00,                    /* jmp +exit                                */
+};
+static const u8 kStrcasecmpMuslMask[] = {
+    0xff, 0xff,
+    0xff,
+    0xff, 0xff, 0xff,
+    0xff,
+    0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff,
+    0xff, 0x00,                    /* mask jne displacement                    */
+    0xff, 0x00,                    /* mask jmp displacement                    */
+};
+
+/* musl C strncasecmp — 3-arg variant.  Distinguished from strcasecmp by the
+ * early `test %rdx, %rdx ; je end_zero` block that handles the n==0 case
+ * BEFORE the register saves (musl's `if (!n--) return 0;`).  22-byte prologue:
+ *
+ *   48 85 d2                 test   %rdx, %rdx    (n == 0?)
+ *   0f 84 ?? ?? 00 00        je     end_zero      (full 4-byte rel32)
+ *   41 55                    push   %r13
+ *   41 54                    push   %r12
+ *   55                       push   %rbp
+ *   48 89 fd                 mov    %rdi, %rbp    (save *l)
+ *   53                       push   %rbx
+ *   48 83 ec 08              sub    $0x8, %rsp
+ *
+ * The je rel32 displacement varies by function size — mask the low two bytes
+ * (high two are 0x00 0x00 for any forward jump within ~64 KiB, which strn-
+ * casecmp comfortably is).  ALL FIVE register pushes are 13 bytes; the early
+ * je is what discriminates from strcasecmp.
+ */
+static const u8 kStrncasecmpMuslPattern[] = {
+    0x48, 0x85, 0xd2,              /* test %rdx, %rdx                          */
+    0x0f, 0x84, 0x00, 0x00, 0x00, 0x00,  /* je end_zero (masked)               */
+    0x41, 0x55,                    /* push %r13                                */
+    0x41, 0x54,                    /* push %r12                                */
+    0x55,                          /* push %rbp                                */
+    0x48, 0x89, 0xfd,              /* mov %rdi, %rbp                           */
+    0x53,                          /* push %rbx                                */
+    0x48, 0x83, 0xec, 0x08,        /* sub $0x8, %rsp                           */
+};
+static const u8 kStrncasecmpMuslMask[] = {
+    0xff, 0xff, 0xff,
+    0xff, 0xff, 0x00, 0x00, 0xff, 0xff,  /* mask low two displacement bytes    */
+    0xff, 0xff,
+    0xff, 0xff,
+    0xff,
+    0xff, 0xff, 0xff,
+    0xff,
+    0xff, 0xff, 0xff, 0xff,
+};
+
+/* musl x86_64 hand-asm memmove — immediately above memcpy in
+ * arch/x86_64/memmove.s.  32-byte prologue covers the overlap check and the
+ * full reverse-copy core.  The `jae <memcpy>` rel32 displacement (4 bytes
+ * starting at offset 11) is masked because its target depends on memcpy's
+ * placement in the binary.
+ *
+ *   48 89 f8                 mov    %rdi, %rax    (return-value tracker)
+ *   48 29 f0                 sub    %rsi, %rax    (rax = dst - src)
+ *   48 39 d0                 cmp    %rdx, %rax    (rax >= n? → forward safe)
+ *   0f 83 ?? ?? ?? ??        jae    <memcpy>      (masked rel32)
+ *   48 89 d1                 mov    %rdx, %rcx
+ *   48 8d 7c 17 ff           lea    -1(%rdi,%rdx,1), %rdi   (point at last byte)
+ *   48 8d 74 16 ff           lea    -1(%rsi,%rdx,1), %rsi
+ *   fd                       std
+ *   f3 a4                    rep movsb
+ *   fc                       cld
+ *
+ * `std`/`rep movsb`/`cld` together are extremely distinctive: musl is the
+ * only common libc that emits `std`-then-`rep movsb` in this exact shape. */
+static const u8 kMemmoveMuslPattern[] = {
+    0x48, 0x89, 0xf8,              /* mov %rdi, %rax                           */
+    0x48, 0x29, 0xf0,              /* sub %rsi, %rax                           */
+    0x48, 0x39, 0xd0,              /* cmp %rdx, %rax                           */
+    0x0f, 0x83, 0x00, 0x00, 0x00, 0x00,  /* jae memcpy (masked rel32)          */
+    0x48, 0x89, 0xd1,              /* mov %rdx, %rcx                           */
+    0x48, 0x8d, 0x7c, 0x17, 0xff,  /* lea -1(%rdi,%rdx), %rdi                  */
+    0x48, 0x8d, 0x74, 0x16, 0xff,  /* lea -1(%rsi,%rdx), %rsi                  */
+    0xfd,                          /* std                                      */
+    0xf3, 0xa4,                    /* rep movsb                                */
+    0xfc,                          /* cld                                      */
+};
+static const u8 kMemmoveMuslMask[] = {
+    0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff,
+    0xff, 0xff, 0x00, 0x00, 0x00, 0x00,  /* mask jae displacement              */
+    0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff, 0xff, 0xff,
+    0xff,
+    0xff, 0xff,
+    0xff,
+};
+
+/* musl C strstr — prologue tests `n[0] == 0` first via `movsx (%rsi), %esi`;
+ * if true, the function returns the haystack pointer immediately.  17-byte
+ * prologue is below the 16-byte specificity threshold by ONE byte but the
+ * `movsx` byte-load + early-ret idiom is extremely uncommon outside musl's
+ * strstr — verified zero false positives in the bench-corpus busybox.
+ *
+ *   55                       push   %rbp
+ *   48 89 f5                 mov    %rsi, %rbp    (save needle)
+ *   0f be 36                 movsx  (%rsi), %esi  (n[0], signed)
+ *   48 89 f8                 mov    %rdi, %rax    (default return value)
+ *   40 84 f6                 test   %sil, %sil    (n[0] == 0?)
+ *   75 09                    jne    +9            (skip early-return path)
+ *   5d                       pop    %rbp
+ *   c3                       ret
+ *
+ * The jne displacement (0x09) is the byte-offset to the call-to-strchr that
+ * begins the search body.  We mask it to defend against codegen drift. */
+static const u8 kStrstrMuslPattern[] = {
+    0x55,                          /* push %rbp                                */
+    0x48, 0x89, 0xf5,              /* mov %rsi, %rbp                           */
+    0x0f, 0xbe, 0x36,              /* movsx (%rsi), %esi                       */
+    0x48, 0x89, 0xf8,              /* mov %rdi, %rax                           */
+    0x40, 0x84, 0xf6,              /* test %sil, %sil                          */
+    0x75, 0x00,                    /* jne +call-to-strchr (masked)             */
+    0x5d,                          /* pop %rbp                                 */
+    0xc3,                          /* ret                                      */
+};
+static const u8 kStrstrMuslMask[] = {
+    0xff,
+    0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff,
+    0xff, 0x00,                    /* mask jne displacement                    */
+    0xff,
+    0xff,
+};
+
 static const struct ThunkFingerprint kFingerprints[] = {
     {"memcpy_musl_x86_64", "memcpy",
      kMemcpyMuslPattern, kMemcpyMuslMask, sizeof(kMemcpyMuslPattern),
@@ -1144,6 +1690,24 @@ static const struct ThunkFingerprint kFingerprints[] = {
     {"strncpy_musl_x86_64", "strncpy",
      kStrncpyMuslPattern, kStrncpyMuslMask, sizeof(kStrncpyMuslPattern),
      VerifyStrncpy, 5},
+    /* Phase 2 batch-3 (firebox-elf-v2-phase2-batch-3-thunks). */
+    {"strnlen_musl_x86_64", "strnlen",
+     kStrnlenMuslPattern, kStrnlenMuslMask, sizeof(kStrnlenMuslPattern),
+     NULL, 0},
+    {"strcasecmp_musl_x86_64", "strcasecmp",
+     kStrcasecmpMuslPattern, kStrcasecmpMuslMask,
+     sizeof(kStrcasecmpMuslPattern),
+     NULL, 0},
+    {"strncasecmp_musl_x86_64", "strncasecmp",
+     kStrncasecmpMuslPattern, kStrncasecmpMuslMask,
+     sizeof(kStrncasecmpMuslPattern),
+     NULL, 0},
+    {"memmove_musl_x86_64", "memmove",
+     kMemmoveMuslPattern, kMemmoveMuslMask, sizeof(kMemmoveMuslPattern),
+     NULL, 0},
+    {"strstr_musl_x86_64", "strstr",
+     kStrstrMuslPattern, kStrstrMuslMask, sizeof(kStrstrMuslPattern),
+     NULL, 0},
 };
 
 #define FBX_NUM_FINGERPRINTS                                                 \

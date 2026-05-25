@@ -19,22 +19,27 @@
  * happens.  See blink/threadedcode.c::LookupThunkAt + CompileBlock.
  *
  * Currently routed primitives:
- *   Phase 1:        memcpy memset strlen memcmp strcmp
+ *   Phase 1:         memcpy memset strlen memcmp strcmp
  *   Phase 2 batch 2: memchr strchr strncmp strcpy strncpy
+ *   Phase 2 batch 3: strnlen strcasecmp strncasecmp strstr memmove
  *
  * Coverage caveat: the symbol-table path requires .symtab or .dynsym to
  * be present.  Stripped statically-linked binaries (Alpine's musl-static
  * busybox / jq, the dominant bench-corpus shape) fall through to the
- * Phase 1.4 + Phase 1.5 fingerprint path.  Fingerprint coverage:
+ * Phase 1.4 + Phase 1.5 + Phase 2 batch-3 fingerprint path.  Fingerprint
+ * coverage:
  *   Phase 1.4 (firebox-elf-v2-phase1.4-fingerprinting):
  *     memcpy / memset / strlen
  *   Phase 1.5 (firebox-elf-v2-phase1.5-fingerprint-expansion-batch-2):
  *     memchr / strchr / strncmp / strcpy / strncpy
+ *   Phase 2 batch-3 (firebox-elf-v2-phase2-batch-3-thunks):
+ *     strnlen / strcasecmp / strncasecmp / strstr / memmove
  * memcmp/strcmp remain symbol-only (per-build register-allocator
  * variation defeats a single-fingerprint match — see notes in thunks.c
  * below the Phase 1.4 block).  See
- * work/tasks/549-elf-perf-phase-1.5-fingerprint-expansion-batch-2/
- * phase-1-report.md for the Phase 1.5 empirical match table.
+ * work/tasks/555-elf-perf-phase-2-batch-3-thunks-strnlen-strcasecmp-
+ * strncasecmp-strstr-memmove/phase-1-report.md for the batch-3
+ * empirical match table.
  *
  * The scan is one-shot, performed once at ELF load.  The dispatch path is
  * a min/max range bound followed by a tiny linear scan over <= MAX_THUNKS
@@ -82,9 +87,11 @@ bool FbxThunksRegisterByName(struct System *sys, const char *name, u64 pc);
  * symbol-table path — overwrites any prior entries when re-invoked.
  *
  * Coverage today (see work/tracks/elf-performance/phase-1-thunking/
- * phase-1.4-report.md for the Phase 1.4 empirical match table, and
+ * phase-1.4-report.md for the Phase 1.4 empirical match table,
  * work/tasks/549-elf-perf-phase-1.5-fingerprint-expansion-batch-2/
- * phase-1-report.md for Phase 1.5):
+ * phase-1-report.md for Phase 1.5, and
+ * work/tasks/555-elf-perf-phase-2-batch-3-thunks-strnlen-strcasecmp-
+ * strncasecmp-strstr-memmove/phase-1-report.md for Phase 2 batch-3):
  *   Phase 1.4 (extremely stable — hand-asm or canonical HASZERO codegen):
  *     - memcpy_musl_x86_64
  *     - memset_musl_x86_64
@@ -100,6 +107,21 @@ bool FbxThunksRegisterByName(struct System *sys, const char *name, u64 pc);
  *                             displacement)
  *     - strncpy_musl_x86_64  (wrapper around __stpncpy; same shape as
  *                             strcpy_musl_x86_64, distinct callee)
+ *   Phase 2 batch-3:
+ *     - strnlen_musl_x86_64       (calls memchr; 31-byte prologue captures
+ *                                   the full body through the post-call
+ *                                   cmovne; call displacement masked)
+ *     - strcasecmp_musl_x86_64    (2-arg loop; 20-byte prologue; two short-
+ *                                   jump displacements masked)
+ *     - strncasecmp_musl_x86_64   (3-arg variant; discriminated from
+ *                                   strcasecmp by an early `test rdx, rdx;
+ *                                   je end_zero` block)
+ *     - memmove_musl_x86_64       (musl hand-asm; 32-byte prologue ending in
+ *                                   std; rep movsb; cld — extremely
+ *                                   distinctive; jae displacement masked)
+ *     - strstr_musl_x86_64        (17-byte prologue with `movsx (%rsi),
+ *                                   %esi` early-return-on-empty-needle
+ *                                   idiom — uncommon outside musl)
  *
  * Best-effort additions (may not match all builds — flagged via the
  * trace output when missing):
