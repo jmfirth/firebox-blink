@@ -476,9 +476,16 @@ static bool LoadElf(struct Machine *m,  //
   /* Firebox Phase-1 ELF-perf thunk routing — walk the just-loaded ELF's
    * symbol table; record entry-PCs for recognised libc primitives so
    * ExecuteInstruction can short-circuit them.  Statically-linked binaries
-   * (the only kind Blink runs today) always carry .symtab or .dynsym.  No
-   * effect for binaries that don't expose the names. */
+   * may carry .symtab/.dynsym (non-stripped: e.g. protoc) or may not
+   * (stripped: Alpine's musl-static busybox / jq, the dominant bench
+   * corpus per work/tracks/elf-performance/phase-1-thunking/phase-1-report.md).
+   * When the symbol-table path returns 0 entries, fall back to Phase 1.4
+   * machine-code fingerprinting — see thunks.h for the rationale and the
+   * per-fingerprint coverage table. */
   FbxThunksRegisterFromElf(m->system, ehdr, esize, elf->aslr);
+  if (m->system->thunks.count == 0) {
+    FbxThunksScanFromText(m->system, ehdr, esize, elf->aslr);
+  }
   return execstack;
 }
 
