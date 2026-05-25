@@ -2,16 +2,34 @@
 #define BLINK_THUNKS_H_
 
 /*
- * Firebox ELF-perf Phase 1 — libc thunk routing.
+ * Firebox ELF-perf Phase 1 + Phase 2 batch-2 — libc thunk routing.
  *
  * At ELF load time, scan the binary's symbol table; when a known-hot libc
- * primitive (memcpy / memset / strlen / memcmp / strcmp) is found we record
- * its entry PC.  Then, on every interpreted instruction, ExecuteInstruction
- * front-checks the current %rip against those PCs; if it matches, we run a
- * wasm-native trampoline that performs the operation in C against the host
- * page and emulates `ret` (pop guest return address, branch to it).  This
- * replaces "interpret hundreds of x86 instructions per call" with "1 host C
- * call" for these primitives.
+ * primitive is found we record its entry PC.  Then, on every interpreted
+ * instruction, ExecuteInstruction front-checks the current %rip against
+ * those PCs; if it matches, we run a wasm-native trampoline that performs
+ * the operation in C against the host page and emulates `ret` (pop guest
+ * return address, branch to it).  This replaces "interpret hundreds of
+ * x86 instructions per call" with "1 host C call" for these primitives.
+ *
+ * Phase 2 Tier 1 update: thunks now compose into the threaded-code
+ * dispatcher at COMPILE TIME — a matched PC produces a single
+ * FBX_TC_KIND_THUNK block entry instead of a per-instruction check; the
+ * dispatch tax is fully amortised against the block lookup that already
+ * happens.  See blink/threadedcode.c::LookupThunkAt + CompileBlock.
+ *
+ * Currently routed primitives:
+ *   Phase 1:        memcpy memset strlen memcmp strcmp
+ *   Phase 2 batch 2: memchr strchr strncmp strcpy strncpy
+ *
+ * Coverage caveat: the symbol-table path requires .symtab or .dynsym to
+ * be present.  Stripped statically-linked binaries (Alpine's musl-static
+ * busybox / jq, the dominant bench-corpus shape) fall through to the
+ * Phase 1.4 fingerprint path; the fingerprint table only covers the
+ * Phase 1 set (memcpy/memset/strlen as of 2026-05-25).  Phase 2 batch-2
+ * primitives benefit ONLY non-stripped binaries until fingerprints are
+ * added — protoc, debug builds, dynamically-linked binaries.  See
+ * work/tracks/elf-performance/phase-1-thunking/phase-1.4-report.md.
  *
  * The scan is one-shot, performed once at ELF load.  The dispatch path is
  * a min/max range bound followed by a tiny linear scan over <= MAX_THUNKS

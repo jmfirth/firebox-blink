@@ -3,12 +3,25 @@
 ╞══════════════════════════════════════════════════════════════════════════════╡
 │ Copyright 2026 Justin Firth (Firebox)                                        │
 │                                                                              │
-│ Phase 1 of the ELF-performance track — libc thunk routing.  Replaces five    │
-│ hot libc primitives (memcpy, memset, strlen, memcmp, strcmp) inside the      │
-│ Blink interpreter with direct wasm-native C calls when the guest ELF's       │
-│ symbol table exposes them.                                                   │
+│ Phase 1 of the ELF-performance track — libc thunk routing.  Replaces hot     │
+│ libc primitives inside the Blink interpreter with direct wasm-native C       │
+│ calls when the guest ELF's symbol table (or fingerprint-scan fallback)       │
+│ exposes them.                                                                │
 │                                                                              │
-│ Design + acceptance gates: work/tracks/elf-performance/phase-1-thunking/.   │
+│ Phase 1   (firebox-elf-v2-phase1-thunks):                                    │
+│   memcpy / memset / strlen / memcmp / strcmp                                 │
+│                                                                              │
+│ Phase 2 batch-2  (firebox-elf-v2-phase2-thunks-batch-2) — adds:              │
+│   memchr / strchr / strncmp / strcpy / strncpy                               │
+│                                                                              │
+│ All thunks compose at COMPILE TIME into the Tier-1 threaded-code             │
+│ dispatcher (see blink/threadedcode.c::LookupThunkAt + CompileBlock); a       │
+│ matched PC becomes a single FBX_TC_KIND_THUNK block-entry — no per-          │
+│ instruction dispatch tax.                                                    │
+│                                                                              │
+│ Design + acceptance gates: work/tracks/elf-performance/phase-1-thunking/    │
+│ (Phase 1) and work/tracks/elf-performance/phase-2-hot-path-caching/         │
+│ (Phase 2 dispatcher + batch-2 thunks).                                       │
 │                                                                              │
 │ ┌─────────────────────────────────────────────────────────────────────────┐  │
 │ │ Calling convention — System V AMD64                                     │  │
@@ -133,6 +146,192 @@ static int GuestMemcmp(struct Machine *m, i64 a, i64 b, u64 n) {
     n -= chunk;
     a += (i64)chunk;
     b += (i64)chunk;
+  }
+  return 0;
+}
+
+/* Scan up to n bytes of guest memory at address `s` for the first byte
+ * equal to `c` (low 8 bits).  Returns the absolute guest address of the
+ * match, or 0 if no match in the first n bytes.  -1 on guest fault.
+ *
+ * Matches Linux memchr(3) semantics: comparison is unsigned-char-wise. */
+static i64 GuestMemchr(struct Machine *m, i64 s, u8 c, u64 n) {
+  u64 walked = 0;
+  i64 cur = s;
+  while (walked < n) {
+    u64 off = (u64)cur & 4095;
+    u64 chunk = 4096 - off;
+    u64 want = n - walked;
+    u64 limit = chunk < want ? chunk : want;
+    u8 *host = LookupAddress(m, cur);
+    if (!host) return -1;
+    /* memchr returns pointer-into-buffer; use the libc primitive for the
+     * inner page-bounded scan — vectorised on the host. */
+    void *hit = memchr(host, (int)c, (size_t)limit);
+    if (hit) {
+      return cur + (i64)((const u8 *)hit - host);
+    }
+    walked += limit;
+    cur += (i64)limit;
+  }
+  return 0;
+}
+
+/* Walk a guest C-string from `s` until either:
+ *   - a byte equal to `c` is seen → return its guest address
+ *   - a NUL is seen → if c == 0, return its address (POSIX: strchr matches
+ *     NUL); otherwise return 0
+ *   - a guest fault → return -1
+ *
+ * Page-bounded, like the rest of the helpers. */
+static i64 GuestStrchr(struct Machine *m, i64 s, u8 c) {
+  i64 cur = s;
+  for (;;) {
+    u64 off = (u64)cur & 4095;
+    u64 limit = 4096 - off;
+    u8 *host = LookupAddress(m, cur);
+    if (!host) return -1;
+    u64 i;
+    for (i = 0; i < limit; ++i) {
+      u8 b = host[i];
+      if (b == c) return cur + (i64)i;
+      if (!b) {
+        /* End-of-string.  POSIX: strchr(s, 0) returns pointer to the
+         * terminator — but that's caught by the `b == c` branch above
+         * when c == 0, so reaching here means c != 0 and we miss. */
+        return 0;
+      }
+    }
+    cur += (i64)limit;
+  }
+}
+
+/* Compare up to n bytes of two guest C-strings, page-bounded.  Returns
+ * memcmp-style 3-way result.  Stops at the first NUL on either side
+ * (POSIX strncmp semantics) OR after n bytes. */
+static int GuestStrncmp(struct Machine *m, i64 a, i64 b, u64 n) {
+  while (n) {
+    u64 oa = (u64)a & 4095;
+    u64 ob = (u64)b & 4095;
+    u64 chunk_a = 4096 - oa;
+    u64 chunk_b = 4096 - ob;
+    u64 chunk = chunk_a < chunk_b ? chunk_a : chunk_b;
+    if (chunk > n) chunk = n;
+    u8 *ha = LookupAddress(m, a);
+    u8 *hb = LookupAddress(m, b);
+    if (!ha || !hb) return 0;
+    u64 i;
+    for (i = 0; i < chunk; ++i) {
+      u8 ca = ha[i];
+      u8 cb = hb[i];
+      if (ca != cb) return (int)ca - (int)cb;
+      if (!ca) return 0;  /* both reached NUL — equal */
+    }
+    n -= chunk;
+    a += (i64)chunk;
+    b += (i64)chunk;
+  }
+  return 0;
+}
+
+/* Copy a guest C-string from `src` to `dst` including the terminating NUL.
+ * Returns the number of bytes written (string length including NUL), -1
+ * on fault.  Page-bounded; uses a small stack stage buffer so we never
+ * hold two page lookups live across a CopyToUser call. */
+static i64 GuestStrcpy(struct Machine *m, i64 dst, i64 src) {
+  i64 s = src, d = dst;
+  u64 written = 0;
+  for (;;) {
+    u8 stage[4096];
+    u64 off_s = (u64)s & 4095;
+    u64 chunk_s = 4096 - off_s;
+    u8 *hs = LookupAddress(m, s);
+    if (!hs) return -1;
+    /* Find NUL inside this source page (or chunk-end if none). */
+    void *nul = memchr(hs, 0, (size_t)chunk_s);
+    u64 want;
+    bool terminate;
+    if (nul) {
+      want = (u64)((const u8 *)nul - hs) + 1;  /* include the NUL byte */
+      terminate = true;
+    } else {
+      want = chunk_s;
+      terminate = false;
+    }
+    /* Stage out — must not hold the source page mapping while CopyToUser
+     * may invalidate the page table.  4 KiB stage buffer is bounded. */
+    memcpy(stage, hs, (size_t)want);
+    /* Write into the dst, respecting page boundaries on the destination. */
+    {
+      u64 remaining = want;
+      u64 staged_off = 0;
+      i64 dcur = d;
+      while (remaining) {
+        u64 off_d = (u64)dcur & 4095;
+        u64 chunk_d = 4096 - off_d;
+        u64 to_write = chunk_d < remaining ? chunk_d : remaining;
+        if (CopyToUser(m, dcur, stage + staged_off, to_write) == -1) {
+          return -1;
+        }
+        dcur += (i64)to_write;
+        staged_off += to_write;
+        remaining -= to_write;
+      }
+      d = dcur;
+    }
+    written += want;
+    s += (i64)want;
+    if (terminate) return (i64)written;
+  }
+}
+
+/* Copy up to n bytes of a guest C-string from `src` to `dst`, NUL-padding
+ * any remainder if `src` is shorter than n.  Returns 0 on success, -1 on
+ * fault.  Page-bounded.
+ *
+ * Matches POSIX strncpy:
+ *   - If strlen(src) >= n: copy exactly n bytes, NO NUL terminator added.
+ *   - If strlen(src) < n:  copy strlen(src) bytes then NUL-pad to n. */
+static int GuestStrncpy(struct Machine *m, i64 dst, i64 src, u64 n) {
+  i64 s = src, d = dst;
+  bool src_exhausted = false;  /* once true, we're in the NUL-pad phase */
+  while (n) {
+    u8 stage[4096];
+    u64 chunk;
+    if (src_exhausted) {
+      /* Pad with NUL — limit to dst page boundary OR remaining n. */
+      u64 off_d = (u64)d & 4095;
+      u64 chunk_d = 4096 - off_d;
+      chunk = chunk_d < n ? chunk_d : n;
+      memset(stage, 0, (size_t)chunk);
+    } else {
+      u64 off_s = (u64)s & 4095;
+      u64 off_d = (u64)d & 4095;
+      u64 chunk_s = 4096 - off_s;
+      u64 chunk_d = 4096 - off_d;
+      chunk = chunk_s < chunk_d ? chunk_s : chunk_d;
+      if (chunk > n) chunk = n;
+      u8 *hs = LookupAddress(m, s);
+      if (!hs) return -1;
+      /* Look for NUL inside this source chunk. */
+      void *nul = memchr(hs, 0, (size_t)chunk);
+      if (nul) {
+        u64 strlen_in_chunk = (u64)((const u8 *)nul - hs);
+        /* Copy strlen_in_chunk bytes of real source, then the NUL, then
+         * fall through to NUL-pad the rest of the chunk if any. */
+        memcpy(stage, hs, (size_t)strlen_in_chunk);
+        /* Pad the rest of `chunk` with NULs. */
+        memset(stage + strlen_in_chunk, 0,
+               (size_t)(chunk - strlen_in_chunk));
+        src_exhausted = true;
+      } else {
+        memcpy(stage, hs, (size_t)chunk);
+      }
+    }
+    if (CopyToUser(m, d, stage, chunk) == -1) return -1;
+    d += (i64)chunk;
+    s += (i64)chunk;
+    n -= chunk;
   }
   return 0;
 }
@@ -286,6 +485,84 @@ static void ThunkStrcmp(struct Machine *m) {
 }
 
 /* ────────────────────────────────────────────────────────────────────────── */
+/* Phase 2 batch-2 trampolines.  Same shape as the Phase 1 set: read args     */
+/* from the System V AMD64 register file, perform the operation against      */
+/* guest memory via Guest* helpers, write the result to %rax, emulate ret.   */
+/* ────────────────────────────────────────────────────────────────────────── */
+
+static void ThunkMemchr(struct Machine *m) {
+  i64 s = (i64)Get64(m->di);
+  u8 c = (u8)(Get64(m->si) & 0xff);
+  u64 n = Get64(m->dx);
+  /* memchr returns NULL when n == 0, regardless of buffer contents. */
+  i64 hit = n ? GuestMemchr(m, s, c, n) : 0;
+  if (hit < 0) hit = 0;  /* fault → NULL; next access will refault */
+  if (g_thunk_trace) {
+    LOGF("thunk memchr(s=%#llx, c=%#x, n=%llu) = %#llx",
+         (long long)s, (unsigned)c, (unsigned long long)n,
+         (long long)hit);
+  }
+  Put64(m->ax, (u64)hit);
+  ThunkRet(m);
+}
+
+static void ThunkStrchr(struct Machine *m) {
+  i64 s = (i64)Get64(m->di);
+  u8 c = (u8)(Get64(m->si) & 0xff);
+  i64 hit = GuestStrchr(m, s, c);
+  if (hit < 0) hit = 0;
+  if (g_thunk_trace) {
+    LOGF("thunk strchr(s=%#llx, c=%#x) = %#llx",
+         (long long)s, (unsigned)c, (long long)hit);
+  }
+  Put64(m->ax, (u64)hit);
+  ThunkRet(m);
+}
+
+static void ThunkStrncmp(struct Machine *m) {
+  i64 a = (i64)Get64(m->di);
+  i64 b = (i64)Get64(m->si);
+  u64 n = Get64(m->dx);
+  int r = n ? GuestStrncmp(m, a, b, n) : 0;
+  if (g_thunk_trace) {
+    LOGF("thunk strncmp(a=%#llx, b=%#llx, n=%llu) = %d",
+         (long long)a, (long long)b, (unsigned long long)n, r);
+  }
+  Put64(m->ax, (u64)(i64)r);
+  ThunkRet(m);
+}
+
+static void ThunkStrcpy(struct Machine *m) {
+  i64 dst = (i64)Get64(m->di);
+  i64 src = (i64)Get64(m->si);
+  /* strcpy semantics: undefined on overlap — but real-world libcs still
+   * produce a sane forward copy.  GuestStrcpy walks the source and writes
+   * via 4KiB-staged CopyToUser, which is forward-direction-safe even on
+   * overlap as long as dst <= src.  Don't try to defend against UB beyond
+   * what the libc primitive itself defends against. */
+  (void)GuestStrcpy(m, dst, src);
+  if (g_thunk_trace) {
+    LOGF("thunk strcpy(dst=%#llx, src=%#llx)",
+         (long long)dst, (long long)src);
+  }
+  Put64(m->ax, (u64)dst);
+  ThunkRet(m);
+}
+
+static void ThunkStrncpy(struct Machine *m) {
+  i64 dst = (i64)Get64(m->di);
+  i64 src = (i64)Get64(m->si);
+  u64 n = Get64(m->dx);
+  if (n) (void)GuestStrncpy(m, dst, src, n);
+  if (g_thunk_trace) {
+    LOGF("thunk strncpy(dst=%#llx, src=%#llx, n=%llu)",
+         (long long)dst, (long long)src, (unsigned long long)n);
+  }
+  Put64(m->ax, (u64)dst);
+  ThunkRet(m);
+}
+
+/* ────────────────────────────────────────────────────────────────────────── */
 /* Registry — the fixed set of names we know how to handle.                   */
 /* Names match the System V libc ABI; statically-linked binaries always       */
 /* carry these in their .symtab (we'd also catch them in .dynsym).            */
@@ -297,11 +574,20 @@ struct ThunkRegistryEntry {
 };
 
 static const struct ThunkRegistryEntry kRegistry[] = {
+    /* Phase 1 (firebox-elf-v2-phase1-thunks @ cc58fbc). */
     {"memcpy", ThunkMemcpy},
     {"memset", ThunkMemset},
     {"strlen", ThunkStrlen},
     {"memcmp", ThunkMemcmp},
     {"strcmp", ThunkStrcmp},
+    /* Phase 2 batch-2 (firebox-elf-v2-phase2-thunks-batch-2).  Same
+     * dispatch shape; all compose at compile time into the threaded-code
+     * dispatcher via LookupThunkAt in blink/threadedcode.c. */
+    {"memchr", ThunkMemchr},
+    {"strchr", ThunkStrchr},
+    {"strncmp", ThunkStrncmp},
+    {"strcpy", ThunkStrcpy},
+    {"strncpy", ThunkStrncpy},
     {0, 0},
 };
 

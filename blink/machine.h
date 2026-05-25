@@ -228,7 +228,12 @@ struct MachineState {
  * consulted by ExecuteInstruction/JitlessDispatch via FbxThunksMaybeDispatch.
  * Definitions live in blink/thunks.h (which depends on this header);
  * machine.h forward-declares struct FbxThunks so System can embed it. */
-#define FBX_MAX_THUNKS 5
+/* Capacity grows alongside the registry in blink/thunks.c.  Phase 1 sized at
+ * 5 (memcpy/memset/strlen/memcmp/strcmp); Phase 2 batch-2 adds 5 more
+ * (memchr/strchr/strncmp/strcpy/strncpy) — bump to 10.  Keep the slack
+ * (matrix on top of registry size) small: the dispatch path walks the table
+ * linearly and a fat array hurts the cache footprint of the cold lookup. */
+#define FBX_MAX_THUNKS 10
 struct FbxThunkEntry {
   u64 pc;
   void (*trampoline)(struct Machine *);
