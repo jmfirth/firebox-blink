@@ -38,6 +38,7 @@
 #include "blink/pml4t.h"
 #include "blink/random.h"
 #include "blink/thread.h"
+#include "blink/threadedcode.h"
 #include "blink/timespec.h"
 #include "blink/types.h"
 #include "blink/util.h"
@@ -351,6 +352,15 @@ void FreeSystem(struct System *s) {
 #ifdef HAVE_JIT
   DestroyJit(&s->jit);
 #endif
+  /* Firebox Phase 2 Tier 1: release the threaded-code cache bucket
+   * array + every cached block before freeing the System.  No-op if
+   * the cache was never initialised. */
+  FbxTcReset(s);
+  if (s->tc.buckets) {
+    free(s->tc.buckets);
+    s->tc.buckets = NULL;
+    s->tc.nbuckets = 0;
+  }
   free(s);
 }
 

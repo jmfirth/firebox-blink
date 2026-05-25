@@ -51,6 +51,7 @@
 #include "blink/swap.h"
 #include "blink/syscall.h"
 #include "blink/thread.h"
+#include "blink/threadedcode.h"
 #include "blink/thunks.h"
 #include "blink/time.h"
 #include "blink/util.h"
@@ -2096,12 +2097,28 @@ static bool CanJit(struct Machine *m) {
 }
 
 void JitlessDispatch(P) {
-  /* Firebox Phase-1 ELF-perf thunk routing: intercept hot libc primitives
-   * at their guest entry-PC and dispatch a wasm-native trampoline that
-   * performs the operation + emulates `ret`.  The check is range-gated
-   * (min_pc..max_pc) and tiny (<= FBX_MAX_THUNKS entries), so the cost
-   * on every instruction is one load + two compares + one early-out for
-   * workloads where no thunks were registered (count == 0). */
+  /* Firebox Phase-2 Tier-1 ELF-perf threaded-code dispatcher.  When
+   * enabled (default; gated off via FIREBOX_TC=0), the cache compiles
+   * basic blocks on first execution and replays them via a tight loop
+   * — one decode round-trip per BLOCK instead of one per instruction.
+   *
+   * Composes with Phase 1 thunks: the block compiler checks each PC
+   * against the thunk table at compile time and emits a synthesised
+   * thunk-handler entry that short-circuits and ends the block.  This
+   * retires the per-instruction FbxThunksMaybeDispatch check that
+   * Phase 1.4's report (#532 et al.) identified as the +14.8% busybox-
+   * awk-10k dispatch-tax wedge.
+   *
+   * Falls through to the legacy per-instruction path when:
+   *   - FIREBOX_TC=0 disables the cache
+   *   - The block compiler hit an unrecoverable edge (zero-length op,
+   *     malloc failure)
+   *   - Lazy init hasn't run yet (first call seeds the cache + retries) */
+  if (FbxTcMaybeDispatch(m)) return;
+  /* Legacy fallback path.  Preserves Phase 1 thunk dispatch for the
+   * case where TC is disabled — the thunk check here is range-gated
+   * and zero-thunk early-outs in 1 load + 1 branch (the original
+   * Phase 1 cost). */
   if (FbxThunksMaybeDispatch(m)) return;
   ASM_LOGF("decoding [%s] at address %" PRIx64, DescribeOp(m, GetPc(m)),
            GetPc(m));
@@ -2193,10 +2210,14 @@ void ExecuteInstruction(struct Machine *m) {
 #if LOG_CPU
   LogCpu(m);
 #endif
-  /* Firebox Phase-1 thunk routing.  Always-on (independent of JIT) — the
-   * check is cheap (one cmp+early-out when no thunks are registered),
-   * and the trampolines need to take priority over any JIT cache because
-   * they replace the entire function body, not just one instruction. */
+  /* Firebox Phase-2 Tier-1 ELF-perf threaded-code dispatcher.  See the
+   * JitlessDispatch comment block above for the design rationale.  In
+   * the wasm build HAVE_JIT is undefined so this function always falls
+   * through to JitlessDispatch, but native builds may have both paths
+   * active — TC takes priority because compiled blocks are strictly
+   * cheaper than even cached native JIT entries (no register marshall). */
+  if (FbxTcMaybeDispatch(m)) return;
+  /* Legacy fallback — Phase 1 thunks still dispatched when TC is off. */
   if (FbxThunksMaybeDispatch(m)) return;
 #ifdef HAVE_JIT
   u8 *dst;

@@ -1,0 +1,433 @@
+/*-*- mode:c;indent-tabs-mode:nil;c-basic-offset:2;tab-width:8;coding:utf-8 -*-│
+│ vi: set et ft=c ts=2 sts=2 sw=2 fenc=utf-8                               :vi │
+╞══════════════════════════════════════════════════════════════════════════════╡
+│ Copyright 2026 Justin Firth (Firebox)                                        │
+│                                                                              │
+│ Phase 2 — Tier 1 of the ELF-performance track: threaded-code dispatcher.     │
+│                                                                              │
+│ Motivated by Phase 1.4's load-bearing falsification: per-instruction         │
+│ FbxThunksMaybeDispatch in JitlessDispatch cost +14.8% on busybox-awk-10k     │
+│ (pure-ALU workload, no thunks fired).  Fix: move dispatch out of the         │
+│ per-instruction path.  Compile basic blocks to flat (Op_fn_ptr, args)        │
+│ arrays cached by start-PC; replay via a tight loop.  Decode happens once     │
+│ per block.                                                                   │
+│                                                                              │
+│ See blink/threadedcode.h for the design header + Q1-Q6 verdicts.             │
+╚─────────────────────────────────────────────────────────────────────────────*/
+#include "blink/threadedcode.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+#include "blink/assert.h"
+#include "blink/builtin.h"
+#include "blink/endian.h"
+#include "blink/log.h"
+#include "blink/machine.h"
+#include "blink/rde.h"
+#include "blink/thunks.h"
+#include "blink/x86.h"
+
+#include <stdarg.h>
+
+/* ────────────────────────────────────────────────────────────────────────── */
+/* Trace flag — lit when FIREBOX_TC_TRACE=1 in the environment.               */
+/* ────────────────────────────────────────────────────────────────────────── */
+
+static int g_tc_trace = -1;  /* -1 = uninit; 0/1 once set */
+
+static void EnsureTcTraceFlag(void) {
+  if (g_tc_trace == -1) {
+    const char *e = getenv("FIREBOX_TC_TRACE");
+    g_tc_trace = (e && *e && *e != '0') ? 1 : 0;
+  }
+}
+
+static void TcTraceLine(const char *fmt, ...) {
+  char buf[160];
+  va_list ap;
+  int n;
+  if (!g_tc_trace) return;
+  va_start(ap, fmt);
+  n = vsnprintf(buf, sizeof(buf), fmt, ap);
+  va_end(ap);
+  if (n > 0) (void)write(2, buf, (size_t)n);
+}
+
+/* ────────────────────────────────────────────────────────────────────────── */
+/* Tuning knobs.  Single-source-of-truth at the top of the file so a future   */
+/* perf retune doesn't have to grep across files.                             */
+/* ────────────────────────────────────────────────────────────────────────── */
+
+/* Initial bucket count — power of 2 for cheap masking.  Sized so that a
+ * typical busybox grep run (estimated 5000-15000 unique blocks) fits with
+ * load factor ~1.0.  Grow handled by the load-factor check below. */
+#define FBX_TC_INIT_BUCKETS 16384
+
+/* Maximum instructions per cached block.  Higher = more savings amortising
+ * the dispatch overhead; lower = less wasted work on never-re-executed
+ * blocks.  Picked to comfortably exceed musl's longest known basic block
+ * (~80 ops in memchr's word-loop) while bounding pathological cases. */
+#define FBX_TC_MAX_BLOCK_ENTRIES 128
+
+/* Total cap on live entries before we trigger a global flush.  Sized to
+ * keep cache memory under ~50 MB (FBX_TC_MAX_BLOCK_ENTRIES bound means
+ * each entry is sizeof(FbxTcEntry) ~ 80 bytes → ~50 MB at 640k entries).
+ * Set to 0 to disable the cap entirely (test-only — production guests
+ * could blow up RAM without this). */
+#define FBX_TC_DEFAULT_ENTRY_CAP 640000
+
+/* Bucket-array growth trigger: when block_count / nbuckets > 4, double
+ * the bucket array.  Keeps lookups O(1) amortised. */
+#define FBX_TC_LOAD_FACTOR_NUMERATOR 4
+
+/* ────────────────────────────────────────────────────────────────────────── */
+/* External symbols imported from machine.c — the opcode dispatch table and   */
+/* its accessor.  We use GetOp() so we benefit from the existing fall-through */
+/* paths (XLAT switch for opcodes >= ARRAYLEN(kNexgen32e)).                   */
+/* ────────────────────────────────────────────────────────────────────────── */
+
+extern nexgen32e_f GetOp(long op);
+
+/* ────────────────────────────────────────────────────────────────────────── */
+/* Hash function — just the high bits of the PC mixed with the low.  Guest    */
+/* code is 16-byte aligned on most function entries; we mix the high half to  */
+/* avoid clustering everything in the same bucket.                            */
+/* ────────────────────────────────────────────────────────────────────────── */
+
+static inline u32 HashPc(u64 pc, u32 mask) {
+  /* Splittable64 mix — cheap, scrambles low bits well. */
+  pc ^= pc >> 33;
+  pc *= 0xff51afd7ed558ccdULL;
+  pc ^= pc >> 33;
+  return (u32)pc & mask;
+}
+
+/* ────────────────────────────────────────────────────────────────────────── */
+/* Init / teardown.                                                           */
+/* ────────────────────────────────────────────────────────────────────────── */
+
+static bool TcParseEnabled(void) {
+  const char *e = getenv("FIREBOX_TC");
+  if (!e || !*e) return true;            /* default ON */
+  if (!strcmp(e, "0") || !strcmp(e, "off") ||
+      !strcmp(e, "false") || !strcmp(e, "no")) {
+    return false;
+  }
+  return true;
+}
+
+void FbxTcInit(struct System *sys) {
+  EnsureTcTraceFlag();
+  if (sys->tc.initialised) return;
+  sys->tc.enabled = TcParseEnabled() ? 1 : 0;
+  sys->tc.entry_cap = FBX_TC_DEFAULT_ENTRY_CAP;
+  if (sys->tc.enabled) {
+    sys->tc.nbuckets = FBX_TC_INIT_BUCKETS;
+    sys->tc.buckets = (struct FbxTcBlock **)calloc(
+        sys->tc.nbuckets, sizeof(struct FbxTcBlock *));
+    if (!sys->tc.buckets) {
+      /* OOM — degrade gracefully to legacy dispatch.  Not fatal. */
+      sys->tc.enabled = 0;
+      sys->tc.nbuckets = 0;
+    }
+  }
+  sys->tc.block_count = 0;
+  sys->tc.entry_count = 0;
+  sys->tc.initialised = 1;
+  if (g_tc_trace) {
+    TcTraceLine("[tc] init: enabled=%d nbuckets=%u entry_cap=%u\n",
+                sys->tc.enabled, sys->tc.nbuckets, sys->tc.entry_cap);
+  }
+}
+
+static void FreeBlockChain(struct FbxTcBlock *b) {
+  while (b) {
+    struct FbxTcBlock *next = b->next;
+    free(b->entries);
+    free(b);
+    b = next;
+  }
+}
+
+void FbxTcReset(struct System *sys) {
+  u32 i;
+  if (!sys->tc.initialised) return;
+  if (sys->tc.buckets) {
+    for (i = 0; i < sys->tc.nbuckets; ++i) {
+      FreeBlockChain(sys->tc.buckets[i]);
+      sys->tc.buckets[i] = NULL;
+    }
+  }
+  sys->tc.block_count = 0;
+  sys->tc.entry_count = 0;
+}
+
+void FbxTcInvalidate(struct System *sys) {
+  if (!sys->tc.initialised) return;
+  if (g_tc_trace) {
+    TcTraceLine("[tc] invalidate: %u blocks / %u entries dropped\n",
+                sys->tc.block_count, sys->tc.entry_count);
+  }
+  /* TODO(v0.2): RCU-style deferred reclamation for the multi-thread case.
+   * Today's eager free is safe only when no other Machine in this System
+   * is mid-ExecuteBlock — true for the v0.1 invalidate paths (LoadElf
+   * runs on a fresh exec with no peer machines; SMC is rare on real
+   * workloads).  If multi-threaded guests start triggering SMC under
+   * load, ExecuteBlock could read freed memory.  Mitigation v0.2:
+   * stamp a per-System epoch counter; ExecuteBlock captures epoch on
+   * entry; FbxTcInvalidate bumps the epoch + parks free() in an RCU
+   * grace queue. */
+  FbxTcReset(sys);
+}
+
+/* ────────────────────────────────────────────────────────────────────────── */
+/* Lookup + insertion.                                                        */
+/* ────────────────────────────────────────────────────────────────────────── */
+
+struct FbxTcBlock *FbxTcLookup(struct System *sys, u64 pc) {
+  u32 idx;
+  struct FbxTcBlock *b;
+  if (!sys->tc.initialised || !sys->tc.buckets) return NULL;
+  idx = HashPc(pc, sys->tc.nbuckets - 1);
+  for (b = sys->tc.buckets[idx]; b; b = b->next) {
+    if (b->start_pc == pc) return b;
+  }
+  return NULL;
+}
+
+static void InsertBlock(struct System *sys, struct FbxTcBlock *b) {
+  u32 idx = HashPc(b->start_pc, sys->tc.nbuckets - 1);
+  b->next = sys->tc.buckets[idx];
+  sys->tc.buckets[idx] = b;
+  ++sys->tc.block_count;
+  sys->tc.entry_count += b->nentries;
+}
+
+void FbxTcGetStats(struct System *sys, u32 *blocks, u32 *entries) {
+  if (blocks) *blocks = sys->tc.initialised ? sys->tc.block_count : 0;
+  if (entries) *entries = sys->tc.initialised ? sys->tc.entry_count : 0;
+}
+
+/* ────────────────────────────────────────────────────────────────────────── */
+/* Thunk lookup helper — finds a registered thunk at the given guest PC.      */
+/* Returns the trampoline pointer or NULL.  Linear scan; the thunk table is   */
+/* tiny (<= 5 entries) and only consulted at compile time, not on the hot    */
+/* loop, so the cost is fully amortised.                                      */
+/* ────────────────────────────────────────────────────────────────────────── */
+
+static void (*LookupThunkAt(struct System *sys, u64 pc))(struct Machine *) {
+  const struct FbxThunks *t = &sys->thunks;
+  int i;
+  if (!t->count) return NULL;
+  if (pc < t->min_pc || pc > t->max_pc) return NULL;
+  for (i = 0; i < t->count; ++i) {
+    if (t->entries[i].pc == pc) return t->entries[i].trampoline;
+  }
+  return NULL;
+}
+
+/* ────────────────────────────────────────────────────────────────────────── */
+/* Block compilation — decode forward from `start_pc` until we hit a          */
+/* branch/precious/serializing op (block-end) OR a registered thunk PC       */
+/* (terminates block; thunk takes over) OR an entry-cap overflow.             */
+/*                                                                            */
+/* We mirror JitlessDispatch's logic exactly: LoadInstruction populates       */
+/* m->xedd, we read rde/disp/uimm0/length and stash them; advance the         */
+/* decode PC by length and loop.                                              */
+/*                                                                            */
+/* Returns the freshly-allocated block on success, NULL on:                   */
+/*   - LoadInstruction raised a fault (m gets longjmp'd out before return,   */
+/*     so we never see this case; defensive only)                             */
+/*   - malloc failure (degrade to legacy dispatch)                            */
+/*   - entry-cap reached and we'd have produced a zero-entry block            */
+/* ────────────────────────────────────────────────────────────────────────── */
+
+extern void LoadInstruction(struct Machine *m, u64 pc);
+extern int ClassifyOp(u64 rde) pureconst;
+
+/* Defensive: cap a single block's compile work to avoid pathological        */
+/* "decode 100k linear ops before any branch" cases (synthetic; real x86     */
+/* code branches every <100 ops on average).                                  */
+static struct FbxTcBlock *CompileBlock(struct Machine *m, u64 start_pc) {
+  struct FbxTcBlock *b;
+  struct FbxTcEntry *staging;
+  u32 n = 0;
+  u64 pc = start_pc;
+  staging = (struct FbxTcEntry *)calloc(FBX_TC_MAX_BLOCK_ENTRIES,
+                                        sizeof(struct FbxTcEntry));
+  if (!staging) return NULL;
+  while (n < FBX_TC_MAX_BLOCK_ENTRIES) {
+    void (*thunk)(struct Machine *);
+    u64 rde;
+    i64 disp;
+    u64 uimm0;
+    u8 oplen;
+    int opclass;
+    /* Phase 1 thunk takes priority — if a thunk is registered at this PC,
+     * emit a single THUNK entry and end the block.  The thunk's trampoline
+     * is the function-body replacement (it performs the libc op + ret),
+     * so anything after it in the same "block" never executes naturally. */
+    if ((thunk = LookupThunkAt(m->system, pc))) {
+      staging[n].ip = pc;
+      staging[n].rde = 0;
+      staging[n].disp = 0;
+      staging[n].uimm0 = 0;
+      staging[n].fn = (void *)thunk;
+      staging[n].oplen = 0;
+      staging[n].kind = FBX_TC_KIND_THUNK;
+      memset(&staging[n].xedd, 0, sizeof(staging[n].xedd));
+      ++n;
+      break;
+    }
+    /* Decode the next instruction at `pc`.  LoadInstruction populates
+     * m->xedd, and on fault it longjmp's via HaltMachine, so we never
+     * return from a failed decode here. */
+    LoadInstruction(m, pc);
+    rde = m->xedd->op.rde;
+    disp = m->xedd->op.disp;
+    uimm0 = m->xedd->op.uimm0;
+    oplen = Oplength(rde);
+    /* Safety: refuse zero-length ops (would loop forever). */
+    if (oplen == 0) {
+      free(staging);
+      return NULL;
+    }
+    /* Populate this entry. */
+    staging[n].ip = pc;
+    staging[n].rde = rde;
+    staging[n].disp = disp;
+    staging[n].uimm0 = uimm0;
+    staging[n].fn = (void *)GetOp(Mopcode(rde));
+    staging[n].oplen = oplen;
+    staging[n].kind = FBX_TC_KIND_NORMAL;
+    /* Copy the full xedd so dispatchers reading m->xedd directly work. */
+    staging[n].xedd = *m->xedd;
+    ++n;
+    /* Block ends on branching/precious/serializing ops.  We INCLUDE the
+     * terminating op in the block (we still need to call its handler);
+     * the handler will mutate m->ip itself (jumps, calls) and our
+     * post-loop check sees the divergence. */
+    opclass = ClassifyOp(rde);
+    if (opclass != 0 /* kOpNormal */) {
+      break;
+    }
+    /* Advance to the next decode PC.  If this op overlaps a page
+     * boundary, terminate the block — re-decoding across page seams
+     * is rare and not worth the extra complexity for v0.1. */
+    {
+      u64 next = pc + oplen;
+      if ((pc & ~(u64)4095) != ((next - 1) & ~(u64)4095)) {
+        /* Op crossed a page; safer to end block. */
+        break;
+      }
+      pc = next;
+    }
+  }
+  if (n == 0) {
+    free(staging);
+    return NULL;
+  }
+  b = (struct FbxTcBlock *)calloc(1, sizeof(struct FbxTcBlock));
+  if (!b) {
+    free(staging);
+    return NULL;
+  }
+  /* Trim allocation to actual size. */
+  b->entries = (struct FbxTcEntry *)realloc(
+      staging, n * sizeof(struct FbxTcEntry));
+  if (!b->entries) {
+    /* realloc-shrink can theoretically fail; fall back to keeping the
+     * over-large alloc. */
+    b->entries = staging;
+  }
+  b->start_pc = start_pc;
+  b->end_pc = staging[n - 1].ip + staging[n - 1].oplen;
+  b->page = start_pc & ~(u64)4095;
+  b->nentries = n;
+  b->hits = 0;
+  b->next = NULL;
+  return b;
+}
+
+/* ────────────────────────────────────────────────────────────────────────── */
+/* Hot path — the dispatcher.                                                 */
+/* ────────────────────────────────────────────────────────────────────────── */
+
+static void ExecuteBlock(struct Machine *m, struct FbxTcBlock *b) {
+  u32 i;
+  ++b->hits;
+  for (i = 0; i < b->nentries; ++i) {
+    struct FbxTcEntry *e = &b->entries[i];
+    if (e->kind == FBX_TC_KIND_THUNK) {
+      /* Thunk replaces the function body + emulates ret.  After the
+       * call m->ip points to the return PC; control returns to Actor's
+       * main loop. */
+      ((void (*)(struct Machine *))e->fn)(m);
+      return;
+    }
+    /* Mirror JitlessDispatch's per-op sequence: oplen for fault rewind,
+     * advance ip, set m->xedd to the cached decode, call the handler,
+     * commit any stash, clear oplen.  See machine.c lines 2099-2118. */
+    m->oplen = (u8)e->oplen;
+    m->ip += e->oplen;
+    m->xedd = &e->xedd;
+    ((void (*)(struct Machine *, u64, i64, u64))e->fn)(
+        m, e->rde, e->disp, e->uimm0);
+    if (m->stashaddr) CommitStash(m);
+    m->oplen = 0;
+    /* A branching op may have mutated m->ip; the next iteration's PC
+     * may no longer match our cached layout.  We don't enforce this —
+     * branches are ALWAYS the last entry in their block (CompileBlock
+     * ends on kOpBranching), so the loop naturally exits after them. */
+  }
+}
+
+bool FbxTcMaybeDispatch(struct Machine *m) {
+  struct System *sys = m->system;
+  struct FbxTcBlock *b;
+  u64 ip;
+  /* Lazy init — first dispatch initialises the cache. */
+  if (!sys->tc.initialised) {
+    FbxTcInit(sys);
+  }
+  if (!sys->tc.enabled) return false;
+  /* SMC handshake: if Blink's icache was invalidated (memorymalloc.c
+   * sets opcache->invalidated on mmap/munmap that overlaps executable
+   * pages), our cache is stale too — flush it.  We check m's opcache
+   * (per-machine) rather than walking all machines; the invariant we
+   * need is "if THIS thread saw the invalidation, the cache it's about
+   * to read from must already be flushed".  The other-thread flush
+   * runs lazily when each thread hits its own dispatch. */
+  if (atomic_load_explicit(&m->opcache->invalidated, memory_order_acquire)) {
+    /* Leave the actual icache flush to LoadInstruction's normal path
+     * (which clears `invalidated`) — but flush TC eagerly. */
+    FbxTcInvalidate(sys);
+  }
+  ip = m->ip;
+  b = FbxTcLookup(sys, ip);
+  if (!b) {
+    /* Entry-cap check — flush if we'd exceed the cap.  Crude but
+     * deterministic; LRU eviction is a v0.2 concern. */
+    if (sys->tc.entry_cap && sys->tc.entry_count >= sys->tc.entry_cap) {
+      if (g_tc_trace) {
+        TcTraceLine("[tc] entry cap reached (%u) — flushing\n",
+                    sys->tc.entry_count);
+      }
+      FbxTcReset(sys);
+    }
+    b = CompileBlock(m, ip);
+    if (!b) return false;
+    InsertBlock(sys, b);
+    if (g_tc_trace) {
+      TcTraceLine("[tc] compiled block @ %#llx: %u entries (%llu..%llu)\n",
+                  (unsigned long long)b->start_pc, b->nentries,
+                  (unsigned long long)b->start_pc,
+                  (unsigned long long)b->end_pc);
+    }
+  }
+  ExecuteBlock(m, b);
+  return true;
+}

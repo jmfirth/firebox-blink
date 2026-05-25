@@ -241,6 +241,25 @@ struct FbxThunks {
   struct FbxThunkEntry entries[FBX_MAX_THUNKS];
 };
 
+/* Firebox ELF-perf Phase 2 Tier 1 — threaded-code cache.  See
+ * blink/threadedcode.h for the full design + Q1-Q6 verdicts.
+ *
+ * Embedded by value into `struct System` so NewSystem's memset
+ * zero-initialises it (matches FbxThunks); FbxTcInit allocates the
+ * bucket array lazily on first dispatch.  The hash bucket array and
+ * each block's `entries[]` are heap allocations owned by this struct;
+ * FbxTcReset frees them. */
+struct FbxTcBlock;  /* defined in blink/threadedcode.h */
+struct FbxTcCacheState {
+  struct FbxTcBlock **buckets; /* nbuckets pointers; NULL when uninit */
+  u32 nbuckets;                /* power of two for cheap masking */
+  u32 block_count;             /* total live blocks */
+  u32 entry_count;             /* total live entries (for memory cap) */
+  u32 entry_cap;               /* 0 disables the cap */
+  u8 enabled;                  /* 0 = TC disabled (FIREBOX_TC=0) */
+  u8 initialised;              /* 1 once FbxTcInit ran */
+};
+
 struct Elf {
   char *prog;
   char *execfn;
@@ -304,6 +323,7 @@ struct System {
   struct Fds fds;
   struct Elf elf;
   struct FbxThunks thunks;  /* Firebox Phase-1 libc thunk routing (see thunks.h) */
+  struct FbxTcCacheState tc; /* Firebox Phase-2 Tier-1 threaded-code cache (see threadedcode.h) */
   sigset_t exec_sigmask;
   struct sigaction_linux hands[64];
   u64 blinksigs;  // signals blink itself handles

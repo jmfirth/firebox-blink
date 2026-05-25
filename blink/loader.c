@@ -42,6 +42,7 @@
 #include "blink/overlays.h"
 #include "blink/procfs.h"
 #include "blink/random.h"
+#include "blink/threadedcode.h"
 #include "blink/thunks.h"
 #include "blink/tunables.h"
 #include "blink/util.h"
@@ -486,6 +487,12 @@ static bool LoadElf(struct Machine *m,  //
   if (m->system->thunks.count == 0) {
     FbxThunksScanFromText(m->system, ehdr, esize, elf->aslr);
   }
+  /* Phase 2 Tier 1: invalidate any threaded-code blocks compiled against
+   * the prior thunk set / prior code mapping.  An exec() lands here with
+   * fresh code at fresh PCs, so the cache from the previous program is
+   * never valid.  (NewSystem also zero-initialises sys->tc; this call
+   * covers the exec-replace case where the System persists.) */
+  FbxTcInvalidate(m->system);
   return execstack;
 }
 
