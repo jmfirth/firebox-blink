@@ -42,6 +42,7 @@
 #include "blink/overlays.h"
 #include "blink/procfs.h"
 #include "blink/random.h"
+#include "blink/thunks.h"
 #include "blink/tunables.h"
 #include "blink/util.h"
 #include "blink/vfs.h"
@@ -472,6 +473,12 @@ static bool LoadElf(struct Machine *m,  //
     unassert(!Munmap(ehdri, st.st_size));
     unassert(!VfsClose(fd));
   }
+  /* Firebox Phase-1 ELF-perf thunk routing — walk the just-loaded ELF's
+   * symbol table; record entry-PCs for recognised libc primitives so
+   * ExecuteInstruction can short-circuit them.  Statically-linked binaries
+   * (the only kind Blink runs today) always carry .symtab or .dynsym.  No
+   * effect for binaries that don't expose the names. */
+  FbxThunksRegisterFromElf(m->system, ehdr, esize, elf->aslr);
   return execstack;
 }
 

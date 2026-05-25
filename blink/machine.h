@@ -223,6 +223,24 @@ struct MachineState {
   struct MachineMemstat memstat;
 };
 
+/* Firebox ELF-perf Phase 1 — libc thunk routing.  One table per System
+ * (per-process). Populated by FbxThunksRegisterFromElf() during LoadElf;
+ * consulted by ExecuteInstruction/JitlessDispatch via FbxThunksMaybeDispatch.
+ * Definitions live in blink/thunks.h (which depends on this header);
+ * machine.h forward-declares struct FbxThunks so System can embed it. */
+#define FBX_MAX_THUNKS 5
+struct FbxThunkEntry {
+  u64 pc;
+  void (*trampoline)(struct Machine *);
+  const char *name;
+};
+struct FbxThunks {
+  int count;
+  u64 min_pc;
+  u64 max_pc;
+  struct FbxThunkEntry entries[FBX_MAX_THUNKS];
+};
+
 struct Elf {
   char *prog;
   char *execfn;
@@ -285,6 +303,7 @@ struct System {
   struct Jit jit;
   struct Fds fds;
   struct Elf elf;
+  struct FbxThunks thunks;  /* Firebox Phase-1 libc thunk routing (see thunks.h) */
   sigset_t exec_sigmask;
   struct sigaction_linux hands[64];
   u64 blinksigs;  // signals blink itself handles

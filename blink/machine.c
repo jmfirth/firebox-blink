@@ -51,6 +51,7 @@
 #include "blink/swap.h"
 #include "blink/syscall.h"
 #include "blink/thread.h"
+#include "blink/thunks.h"
 #include "blink/time.h"
 #include "blink/util.h"
 #include "blink/x86.h"
@@ -2095,6 +2096,13 @@ static bool CanJit(struct Machine *m) {
 }
 
 void JitlessDispatch(P) {
+  /* Firebox Phase-1 ELF-perf thunk routing: intercept hot libc primitives
+   * at their guest entry-PC and dispatch a wasm-native trampoline that
+   * performs the operation + emulates `ret`.  The check is range-gated
+   * (min_pc..max_pc) and tiny (<= FBX_MAX_THUNKS entries), so the cost
+   * on every instruction is one load + two compares + one early-out for
+   * workloads where no thunks were registered (count == 0). */
+  if (FbxThunksMaybeDispatch(m)) return;
   ASM_LOGF("decoding [%s] at address %" PRIx64, DescribeOp(m, GetPc(m)),
            GetPc(m));
   COSTLY_STATISTIC(++instructions_dispatched);
@@ -2185,6 +2193,11 @@ void ExecuteInstruction(struct Machine *m) {
 #if LOG_CPU
   LogCpu(m);
 #endif
+  /* Firebox Phase-1 thunk routing.  Always-on (independent of JIT) — the
+   * check is cheap (one cmp+early-out when no thunks are registered),
+   * and the trampolines need to take priority over any JIT cache because
+   * they replace the entire function body, not just one instruction. */
+  if (FbxThunksMaybeDispatch(m)) return;
 #ifdef HAVE_JIT
   u8 *dst;
   nexgen32e_f func;
