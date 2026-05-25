@@ -113,7 +113,26 @@ void LoadArgv(struct Machine *m, char *execfn, char *prog, char **args,
   while ((sp - nall * sizeof(i64)) & (STACKALIGN - 1)) --sp;
   sp -= nall * sizeof(i64);
   Write64(m->sp, sp);
-  Write64(m->dx, dx);
+  /* FIREBOX-535: Linux entry ABI requires %rdx=0 for static binaries
+   * (kernel zeros it; ld.so sets it to rtld_fini only for dynamic).
+   * Cosmopolitan libc instead reads __program_executable_name from %rdx
+   * (Justine's `f96cdbe` 2024-01: "Pass __program_executable_name to
+   * cosmo libc"). Blink unconditionally storing dx=&prog_string broke
+   * EVERY glibc-static binary's atexit chain: glibc's _start saves rdx
+   * to r9, __libc_start_main treats r9 as rtld_fini, and the non-NULL
+   * pointer is registered via __cxa_atexit -> on exit, the mangled
+   * function pointer demangles to the argv[0] string address, and
+   * `call *%rax` faults on the `das` byte of the path. Repro:
+   * `echo 'int main(){return 0;}' > t.c && gcc -static -o t t.c &&
+   *  firebox run rust -- bash -c '/t; echo $?'` -> EXIT=139.
+   * Gate on iscosmo so the Cosmo extension keeps working for APE
+   * binaries (MZqFpD/jartsr) while plain ELFs (glibc/musl static) get
+   * the Linux-correct ABI. See work/tasks/535-*. */
+  if (m->system->iscosmo) {
+    Write64(m->dx, dx);
+  } else {
+    Write64(m->dx, 0);
+  }
   Write64(m->di, 0); /* or ape detects freebsd */
   bytes = (u8 *)malloc(nall * 8);
   for (i = 0; i < nall; ++i) {
