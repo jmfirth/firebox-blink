@@ -24,6 +24,7 @@
 #include "blink/assert.h"
 #include "blink/builtin.h"
 #include "blink/endian.h"
+#include "blink/fbx_t2_glue.h"
 #include "blink/log.h"
 #include "blink/machine.h"
 #include "blink/rde.h"
@@ -348,6 +349,10 @@ static struct FbxTcBlock *CompileBlock(struct Machine *m, u64 start_pc) {
   b->page = start_pc & ~(u64)4095;
   b->nentries = n;
   b->hits = 0;
+  /* Tier 2 §6.3: fresh block has no translation.  -1 (NOT 0) is the
+   * "no funcref" sentinel — 0 is a valid funcref. */
+  b->t2_funcref = -1;
+  b->t2_attempted = 0;
   b->next = NULL;
   return b;
 }
@@ -359,6 +364,39 @@ static struct FbxTcBlock *CompileBlock(struct Machine *m, u64 start_pc) {
 static void ExecuteBlock(struct Machine *m, struct FbxTcBlock *b) {
   u32 i;
   ++b->hits;
+
+  /* Tier 2 §6.4 fast path — if we have a Tier-2-translated funcref,
+   * dispatch through it instead of walking entries[].  Bailout (exit=1)
+   * falls through to the Tier 1 entries[] walk below; host-call escape
+   * (exit=2) and normal completion (exit=0) both return immediately
+   * (the dispatched module has already advanced m->ip).
+   *
+   * Why the fall-through on exit=1: the cached translation refused the
+   * block at runtime (e.g., an opcode the v0.1 emitter accepted at
+   * synthesis time encountered an operand shape it can't lower — see
+   * spec §5.5 "correct OR refuse").  Tier 1 has the canonical behavior;
+   * running it now keeps the program correct without invalidating the
+   * cached funcref (the next hit may use a different operand shape that
+   * Tier 2 CAN handle).
+   *
+   * v0.1 disclaimer: this fast path only activates for blocks whose IR
+   * was lifted + synthesised by #583 + #588's supported opcode set
+   * (REG_GET/SET, ALU group, LEA simple, BRANCH_TAKEN, BAILOUT, PC_MARK
+   * per spec §4.2).  Every other block stays on Tier 1 because
+   * `Fbxt2TryEscalate` bails before setting `t2_funcref >= 0`. */
+  if (b->t2_funcref >= 0) {
+    int exit_code = Fbxt2Dispatch(m, b);
+    if (exit_code == 0 || exit_code == 2) {
+      /* Normal completion or host-call escape — both leave m->ip in
+       * the right state for the outer dispatch loop. */
+      return;
+    }
+    /* exit_code == 1: bailout to Tier 1.  Fall through to the entries[]
+     * walk.  We deliberately do NOT clear `b->t2_funcref` — the
+     * translation is still valid for the common case; a bailout on one
+     * dispatch isn't evidence of pervasive corruption. */
+  }
+
   for (i = 0; i < b->nentries; ++i) {
     struct FbxTcEntry *e = &b->entries[i];
     if (e->kind == FBX_TC_KIND_THUNK) {
@@ -366,7 +404,7 @@ static void ExecuteBlock(struct Machine *m, struct FbxTcBlock *b) {
        * call m->ip points to the return PC; control returns to Actor's
        * main loop. */
       ((void (*)(struct Machine *))e->fn)(m);
-      return;
+      goto post_tier1;
     }
     /* Mirror JitlessDispatch's per-op sequence: oplen for fault rewind,
      * advance ip, set m->xedd to the cached decode, call the handler,
@@ -382,6 +420,17 @@ static void ExecuteBlock(struct Machine *m, struct FbxTcBlock *b) {
      * may no longer match our cached layout.  We don't enforce this —
      * branches are ALWAYS the last entry in their block (CompileBlock
      * ends on kOpBranching), so the loop naturally exits after them. */
+  }
+
+post_tier1:
+  /* Tier 2 §6.4 escalation — opportunistically try to escalate AFTER
+   * the Tier 1 dispatch returns.  Cost is amortised: only triggers once
+   * per block (t2_attempted latches at success or failure), only when
+   * the block has been hit `FBX_T2_HOTNESS_THRESHOLD` times.  The
+   * escalation pipeline (lift → synth → instantiate) can fail at any
+   * step; on failure t2_attempted stays latched and we never try again. */
+  if (!b->t2_attempted && b->hits >= Fbxt2HotnessThreshold()) {
+    Fbxt2TryEscalate(m, b);
   }
 }
 

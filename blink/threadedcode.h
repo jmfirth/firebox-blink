@@ -86,13 +86,35 @@ struct FbxTcEntry {
 
 /* A cached basic block: contiguous sequence of pre-decoded instructions
  * ending at the first branching/precious/serializing op (or at a thunk
- * hit).  Indexed by start_pc in the hash table; chained via `next`. */
+ * hit).  Indexed by start_pc in the hash table; chained via `next`.
+ *
+ * Tier 2 §13.4 extensions (`t2_funcref`, `t2_attempted`): when a block
+ * has executed `Fbxt2HotnessThreshold()` times, `ExecuteBlock` calls
+ * `Fbxt2TryEscalate` which lifts → synthesises → instantiates → stashes
+ * a funcref here.  On subsequent hits, ExecuteBlock dispatches through
+ * `Fbxt2Dispatch(b)` instead of walking `entries[]`.  Spec §6.3 + §6.4.
+ *
+ *   t2_funcref:   -1 = no translation; >=0 = funcref into the host's
+ *                 per-System translated-module table.  The funcref's
+ *                 namespace is per-System (sys_id = (u64)m->system);
+ *                 the same funcref under a different System refers to
+ *                 a different module.
+ *   t2_attempted: 0 = never tried; 1 = tried (success or failure).
+ *                 Once set, escalation never re-attempts (idempotent
+ *                 latch — spec §6.1 concurrency assumption).
+ *
+ * Size impact: +8 bytes per block (one i32, one u8, 3 bytes padding to
+ * preserve the natural alignment of `entries`).  Spec §13.4 calls out
+ * the bounded-size constraint; this fits. */
 struct FbxTcBlock {
   u64 start_pc;            /* guest PC of the first instruction */
   u64 end_pc;              /* guest PC immediately after the last instruction */
   u64 page;                /* (start_pc & ~0xfff) — used by SMC invalidation */
   u32 nentries;            /* number of entries */
   u32 hits;                /* execution count (best-effort; not atomic) */
+  i32 t2_funcref;          /* Tier 2 funcref or -1 (spec §6.3) */
+  u8 t2_attempted;         /* Tier 2 escalation latch (spec §6.1) */
+  u8 t2_reserved[3];       /* padding to keep `entries` naturally aligned */
   struct FbxTcEntry *entries; /* malloc'd array of nentries entries */
   struct FbxTcBlock *next; /* next block in the same hash bucket */
 };

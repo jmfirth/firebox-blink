@@ -168,6 +168,14 @@ o/$(MODE)/test/blink/fbx_ir_emit_wasm_test.com: o/$(MODE)/test/blink/fbx_ir_emit
 # .compile) parse checks per AGENTS.md invariant 4.
 o/$(MODE)/test/blink/fbx_ir_emit_wasm_dump.com: o/$(MODE)/test/blink/fbx_ir_emit_wasm_dump.o o/$(MODE)/blink/blink.a
 	$(CC) $(LDFLAGS) $(TARGET_ARCH) $^ $(LOADLIBES) $(LDLIBS) -o $@
+
+# Firebox §13.4 — Tier-2 substrate end-to-end smoke test.  Provides strong
+# overrides of the weak fbx_t2_* shims in blink/fbx_t2_glue.c so the
+# substrate compose can be tested without wasmer (the wasmer-backed
+# integration is owned by crates/firebox-wasix/src/t2_bridge.rs's
+# t2_shape_* tests + the §13.8 bench harness).
+o/$(MODE)/test/blink/fbx_t2_e2e_test.com: o/$(MODE)/test/blink/fbx_t2_e2e_test.o o/$(MODE)/blink/blink.a
+	$(CC) $(LDFLAGS) $(TARGET_ARCH) $^ $(LOADLIBES) $(LDLIBS) -o $@
 o/$(MODE)/i486/test/blink/disinst_test.com: o/$(MODE)/i486/test/blink/disinst_test.o o/$(MODE)/i486/blink/blink.a
 	o/third_party/gcc/i486/bin/i486-linux-musl-gcc -static $(LDFLAGS) $(TARGET_ARCH) $^ $(LOADLIBES) $(LDLIBS) -o $@
 o/$(MODE)/m68k/test/blink/disinst_test.com: o/$(MODE)/m68k/test/blink/disinst_test.o o/$(MODE)/m68k/blink/blink.a
@@ -205,7 +213,8 @@ o/$(MODE)/test/blink:							\
 		o/$(MODE)/test/blink/ldbl_test.com.runs			\
 		o/$(MODE)/test/blink/disinst_test.com.runs		\
 		o/$(MODE)/test/blink/fbx_ir_lift_test.com.runs		\
-		o/$(MODE)/test/blink/fbx_ir_emit_wasm_test.com.runs
+		o/$(MODE)/test/blink/fbx_ir_emit_wasm_test.com.runs	\
+		o/$(MODE)/test/blink/fbx_t2_e2e_test.com.runs
 
 o/$(MODE)/test/blink/emulates:						\
 		o/$(MODE)/blink/blink					\
