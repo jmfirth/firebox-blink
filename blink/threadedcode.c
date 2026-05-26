@@ -19,6 +19,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "blink/assert.h"
@@ -34,15 +35,53 @@
 #include <stdarg.h>
 
 /* ────────────────────────────────────────────────────────────────────────── */
-/* Trace flag — lit when FIREBOX_TC_TRACE=1 in the environment.               */
+/* Trace flag — lit when FIREBOX_TC_TRACE=1 or 2 in the environment.          */
+/*                                                                            */
+/* FIREBOX_TC_TRACE=1 — legacy structural trace (init / compile / invalidate  */
+/*                     events to stderr).                                     */
+/* FIREBOX_TC_TRACE=2 — per-opcode host-time profile (NEW for §13.5/§Q7).     */
+/*                     Instruments ExecuteBlock to measure cumulative host    */
+/*                     time spent in each Mopcode handler, then dumps a       */
+/*                     ranked table to stderr at process exit.  Used by       */
+/*                     the §13.5 dispatch to resolve §Q7 — "which 30          */
+/*                     opcodes" — by host-time spent on the bench corpus,     */
+/*                     not by raw frequency (which §3.1's hints capture).     */
 /* ────────────────────────────────────────────────────────────────────────── */
 
-static int g_tc_trace = -1;  /* -1 = uninit; 0/1 once set */
+static int g_tc_trace = -1;        /* -1 = uninit; 0 = off; 1 = structural; */
+                                   /* 2 = +per-opcode profile.              */
+
+/* §Q7 per-opcode profile.  Mopcode is at most 12 bits in Blink's encoding   */
+/* (see blink/rde.h's Mopcode accessor); a 4096-entry table covers it        */
+/* densely.  Two parallel u64 arrays keep the hot path cache-tight (load     */
+/* one bucket, accumulate count, accumulate nanoseconds; no struct stride). */
+#define FBX_TC_PROFILE_BUCKETS 4096u
+static u64 g_op_count_by_mop[FBX_TC_PROFILE_BUCKETS];
+static u64 g_op_ns_by_mop[FBX_TC_PROFILE_BUCKETS];
+static u64 g_op_total_count;
+static u64 g_op_total_ns;
+static int g_op_dump_registered;   /* atexit() install latch */
 
 static void EnsureTcTraceFlag(void) {
   if (g_tc_trace == -1) {
     const char *e = getenv("FIREBOX_TC_TRACE");
-    g_tc_trace = (e && *e && *e != '0') ? 1 : 0;
+    if (!e || !*e || *e == '0') {
+      g_tc_trace = 0;
+    } else if (e[0] == '2') {
+      /* "2", "2\n", "2 " — all mean level 2.  Be lenient on trailing
+       * whitespace because guest env-var passthrough may strip or add
+       * terminators inconsistently. */
+      g_tc_trace = 2;
+    } else {
+      g_tc_trace = 1;
+    }
+    {
+      char dbg[80];
+      int n = snprintf(dbg, sizeof(dbg),
+                       "FBX_PROFILE_ENV value=\"%s\" parsed=%d\n",
+                       e ? e : "(null)", g_tc_trace);
+      if (n > 0) (void)write(2, dbg, (size_t)n);
+    }
   }
 }
 
@@ -55,6 +94,82 @@ static void TcTraceLine(const char *fmt, ...) {
   n = vsnprintf(buf, sizeof(buf), fmt, ap);
   va_end(ap);
   if (n > 0) (void)write(2, buf, (size_t)n);
+}
+
+/* §Q7 profile dump — called via atexit() when FIREBOX_TC_TRACE=2.  Emits a  */
+/* machine-parseable, sorted-descending-by-ns table to stderr.               */
+/*                                                                          */
+/* Format (one header line + one data line per opcode with non-zero count): */
+/*   FBX_PROFILE start total_count=N total_ns=M                              */
+/*   FBX_PROFILE op mop=0xNNN count=N ns=M pct_count=PP.PP pct_ns=QQ.QQ      */
+/*   ...                                                                    */
+/*   FBX_PROFILE end                                                        */
+/*                                                                          */
+/* Output is parseable by awk for the measurement step.  Sort is O(N²) over */
+/* 4096 buckets — acceptable for a one-shot exit dump.                      */
+static void FbxTcProfileDump(void) {
+  /* Sort buckets descending by ns.  We sort indices into a parallel array  */
+  /* to keep g_op_ns_by_mop's mop→ns mapping stable for the report.         */
+  u32 idx[FBX_TC_PROFILE_BUCKETS];
+  u32 n_used = 0;
+  u32 i, j;
+  char buf[200];
+  int n;
+  for (i = 0; i < FBX_TC_PROFILE_BUCKETS; ++i) {
+    if (g_op_count_by_mop[i] > 0) {
+      idx[n_used++] = i;
+    }
+  }
+  /* Selection sort descending by ns; bounded by n_used ≤ ~256 typical. */
+  for (i = 0; i + 1 < n_used; ++i) {
+    u32 best = i;
+    for (j = i + 1; j < n_used; ++j) {
+      if (g_op_ns_by_mop[idx[j]] > g_op_ns_by_mop[idx[best]]) best = j;
+    }
+    if (best != i) {
+      u32 tmp = idx[i];
+      idx[i] = idx[best];
+      idx[best] = tmp;
+    }
+  }
+  n = snprintf(buf, sizeof(buf),
+               "FBX_PROFILE start total_count=%llu total_ns=%llu\n",
+               (unsigned long long)g_op_total_count,
+               (unsigned long long)g_op_total_ns);
+  if (n > 0) (void)write(2, buf, (size_t)n);
+  for (i = 0; i < n_used; ++i) {
+    u32 m = idx[i];
+    u64 c = g_op_count_by_mop[m];
+    u64 ns = g_op_ns_by_mop[m];
+    /* Compute pct as integer hundredths to avoid float dependency.       */
+    u64 pct_count_x100 = g_op_total_count
+        ? (c * 10000ull) / g_op_total_count : 0;
+    u64 pct_ns_x100 = g_op_total_ns
+        ? (ns * 10000ull) / g_op_total_ns : 0;
+    n = snprintf(buf, sizeof(buf),
+                 "FBX_PROFILE op mop=0x%03x count=%llu ns=%llu "
+                 "pct_count=%llu.%02llu pct_ns=%llu.%02llu\n",
+                 (unsigned)m,
+                 (unsigned long long)c,
+                 (unsigned long long)ns,
+                 (unsigned long long)(pct_count_x100 / 100ull),
+                 (unsigned long long)(pct_count_x100 % 100ull),
+                 (unsigned long long)(pct_ns_x100 / 100ull),
+                 (unsigned long long)(pct_ns_x100 % 100ull));
+    if (n > 0) (void)write(2, buf, (size_t)n);
+  }
+  n = snprintf(buf, sizeof(buf), "FBX_PROFILE end\n");
+  if (n > 0) (void)write(2, buf, (size_t)n);
+}
+
+/* Read the monotonic clock as nanoseconds since an arbitrary epoch.        */
+/* Used by the §Q7 profile to measure per-opcode host time spent.            */
+/* On wasm32-wasi-threads this resolves to wasix's clock_time_get; on       */
+/* the native build it resolves to CLOCK_MONOTONIC.                          */
+static inline u64 FbxNowNs(void) {
+  struct timespec ts;
+  if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 0;
+  return (u64)ts.tv_sec * 1000000000ull + (u64)ts.tv_nsec;
 }
 
 /* ────────────────────────────────────────────────────────────────────────── */
@@ -122,6 +237,13 @@ static bool TcParseEnabled(void) {
 
 void FbxTcInit(struct System *sys) {
   EnsureTcTraceFlag();
+  /* Register the §Q7 profile dump exactly once.  We can't use a static
+   * initialiser because atexit() isn't constexpr; gate on a flag. */
+  if (g_tc_trace == 2 && !g_op_dump_registered) {
+    atexit(FbxTcProfileDump);
+    g_op_dump_registered = 1;
+    (void)write(2, "FBX_PROFILE_INIT level=2 atexit_registered\n", 43);
+  }
   if (sys->tc.initialised) return;
   sys->tc.enabled = TcParseEnabled() ? 1 : 0;
   sys->tc.entry_cap = FBX_TC_DEFAULT_ENTRY_CAP;
@@ -402,20 +524,63 @@ static void ExecuteBlock(struct Machine *m, struct FbxTcBlock *b) {
     if (e->kind == FBX_TC_KIND_THUNK) {
       /* Thunk replaces the function body + emulates ret.  After the
        * call m->ip points to the return PC; control returns to Actor's
-       * main loop. */
-      ((void (*)(struct Machine *))e->fn)(m);
+       * main loop.  Thunks are accounted at a synthetic mop (0xFFF) so
+       * they don't pollute the §Q7 ranking with libc-internal weight. */
+      if (g_tc_trace == 2) {
+        u64 t0 = FbxNowNs();
+        ((void (*)(struct Machine *))e->fn)(m);
+        {
+          u64 dt = FbxNowNs() - t0;
+          g_op_count_by_mop[0xFFFu] += 1;
+          g_op_ns_by_mop[0xFFFu] += dt;
+          g_op_total_count += 1;
+          g_op_total_ns += dt;
+        }
+      } else {
+        ((void (*)(struct Machine *))e->fn)(m);
+      }
       goto post_tier1;
     }
     /* Mirror JitlessDispatch's per-op sequence: oplen for fault rewind,
      * advance ip, set m->xedd to the cached decode, call the handler,
-     * commit any stash, clear oplen.  See machine.c lines 2099-2118. */
-    m->oplen = (u8)e->oplen;
-    m->ip += e->oplen;
-    m->xedd = &e->xedd;
-    ((void (*)(struct Machine *, u64, i64, u64))e->fn)(
-        m, e->rde, e->disp, e->uimm0);
-    if (m->stashaddr) CommitStash(m);
-    m->oplen = 0;
+     * commit any stash, clear oplen.  See machine.c lines 2099-2118.
+     *
+     * §Q7 profile mode (FIREBOX_TC_TRACE=2) wraps the handler call with
+     * a CLOCK_MONOTONIC measurement.  The branch is a single global
+     * load + compare-against-immediate; in non-trace mode the cost is
+     * ~negligible (mispredict-free since g_tc_trace is set once at
+     * init and never written again on the hot path).  In trace=2 mode
+     * the measurement adds ~50-200ns per opcode on macOS aarch64 — a
+     * very large tax (often >50% of run time on tight loops) but
+     * acceptable for a one-shot ranking measurement.  Acceptance:
+     * the RANKING is what we trust, not absolute ns figures. */
+    if (g_tc_trace == 2) {
+      u64 mop = Mopcode(e->rde);
+      u64 bucket = mop & (FBX_TC_PROFILE_BUCKETS - 1u);
+      u64 t0 = FbxNowNs();
+      m->oplen = (u8)e->oplen;
+      m->ip += e->oplen;
+      m->xedd = &e->xedd;
+      ((void (*)(struct Machine *, u64, i64, u64))e->fn)(
+          m, e->rde, e->disp, e->uimm0);
+      if (m->stashaddr) CommitStash(m);
+      m->oplen = 0;
+      {
+        u64 dt = FbxNowNs() - t0;
+        g_op_count_by_mop[bucket] += 1;
+        g_op_ns_by_mop[bucket] += dt;
+        g_op_total_count += 1;
+        g_op_total_ns += dt;
+      }
+    } else {
+      m->oplen = (u8)e->oplen;
+      m->ip += e->oplen;
+      m->xedd = &e->xedd;
+      ((void (*)(struct Machine *, u64, i64, u64))e->fn)(
+          m, e->rde, e->disp, e->uimm0);
+      if (m->stashaddr) CommitStash(m);
+      m->oplen = 0;
+    }
     /* A branching op may have mutated m->ip; the next iteration's PC
      * may no longer match our cached layout.  We don't enforce this —
      * branches are ALWAYS the last entry in their block (CompileBlock
