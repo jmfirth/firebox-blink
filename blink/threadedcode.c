@@ -75,13 +75,6 @@ static void EnsureTcTraceFlag(void) {
     } else {
       g_tc_trace = 1;
     }
-    {
-      char dbg[80];
-      int n = snprintf(dbg, sizeof(dbg),
-                       "FBX_PROFILE_ENV value=\"%s\" parsed=%d\n",
-                       e ? e : "(null)", g_tc_trace);
-      if (n > 0) (void)write(2, dbg, (size_t)n);
-    }
   }
 }
 
@@ -242,7 +235,6 @@ void FbxTcInit(struct System *sys) {
   if (g_tc_trace == 2 && !g_op_dump_registered) {
     atexit(FbxTcProfileDump);
     g_op_dump_registered = 1;
-    (void)write(2, "FBX_PROFILE_INIT level=2 atexit_registered\n", 43);
   }
   if (sys->tc.initialised) return;
   sys->tc.enabled = TcParseEnabled() ? 1 : 0;
