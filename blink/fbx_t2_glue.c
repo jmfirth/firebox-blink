@@ -235,15 +235,25 @@ int Fbxt2Dispatch(struct Machine *m, struct FbxTcBlock *b) {
 /* Weak default stubs — see fbx_t2_glue.h "Why" block for rationale.          */
 /*                                                                            */
 /* These are weak so that:                                                    */
-/*   - The wasm-cc toolchain leaves them unresolved → wasm imports → host    */
-/*     functions registered by firebox-wasix at instantiation time.           */
 /*   - Native test benches that supply strong overrides win at link time.    */
 /*   - Standalone native Blink falls through to "T2 permanently disabled".   */
 /*                                                                            */
-/* On wasm targets, the weak bodies are kept ONLY so the source file is      */
-/* well-formed; they are dead code in that build because the wasm linker     */
-/* prefers the host-import resolution.                                        */
+/* They are gated on `!defined(__wasm__)` because on wasm targets the         */
+/* header declarations carry `__attribute__((import_module("fbx")))` so       */
+/* wasm-ld emits these symbols as wasm imports under the `"fbx"` module       */
+/* (spec §11.2).  If we ALSO defined the weak bodies for wasm targets, the    */
+/* static linker would resolve the externs locally to the weak defs and       */
+/* skip the import emission entirely — exactly the #604 failure mode this     */
+/* task (#607) closes.  See                                                   */
+/* `class_lesson_wasm_import_module_name_drift_between_spec_and_undecorated_extern`
+ * for the underlying pattern.  The three-way resolution from                 */
+/* `class_lesson_weak_symbol_default_stub_for_three_way_host_shim_resolution`
+ * is preserved: (a) wasm → wasm imports (this file emits nothing), (b)       */
+/* native test bench → strong overrides win, (c) standalone native → weak     */
+/* defaults below.                                                             */
 /* ────────────────────────────────────────────────────────────────────────── */
+
+#ifndef __wasm__
 
 __attribute__((weak))
 int fbx_t2_instantiate(u64 sys_id, const u8 *wasm_bytes, u32 wasm_len) {
@@ -279,3 +289,5 @@ void fbx_t2_get_stats(u64 sys_id, u32 *modules, u64 *bytes) {
   if (modules) *modules = 0;
   if (bytes) *bytes = 0;
 }
+
+#endif /* !__wasm__ */

@@ -67,20 +67,40 @@ struct FbxTcBlock;
 /* Signatures pin-point identical to                                        */
 /* crates/firebox-wasix/src/t2_bridge.rs:782-859 — DO NOT drift without    */
 /* a parallel update on the Rust side (spec §11.2 + §591 reconciliation). */
+/*                                                                          */
+/* `FBX_T2_HOST_IMPORT` decoration (#607): on wasm builds we attach        */
+/* `__attribute__((import_module("fbx")))` so wasi-sdk/clang emits the     */
+/* externs as wasm imports under the `"fbx"` module name (spec §11.2),    */
+/* not the default `"env"` module.  Without this decoration wasi-sdk      */
+/* placed undecorated externs under `"env"` and the weak local defaults   */
+/* in `fbx_t2_glue.c` won the link silently — see                          */
+/* `class_lesson_wasm_import_module_name_drift_between_spec_and_undecorated_extern`
+ * (#604/#607 witness).  On native builds the decoration is empty so the */
+/* three-way resolution from `class_lesson_weak_symbol_default_stub_for_three_way_host_shim_resolution`
+ * still applies (test-bench strong override > weak default).             */
 /* ────────────────────────────────────────────────────────────────────────── */
+
+#ifdef __wasm__
+#define FBX_T2_HOST_IMPORT __attribute__((import_module("fbx")))
+#else
+#define FBX_T2_HOST_IMPORT
+#endif
 
 /* Instantiate a wasm module fragment.  Returns a funcref index (>=0) or
  * -1 on failure (instantiation error, OOM, cap reached, T2 disabled). */
+FBX_T2_HOST_IMPORT
 int fbx_t2_instantiate(u64 sys_id, const u8 *wasm_bytes, u32 wasm_len);
 
 /* Dispatch the translated block.  Returns the wasm function's exit code
  * (0 = normal completion, 1 = bailout to Tier 1, 2 = host-call escape).
  * Spec §5.1 (translated_block return-value convention). */
+FBX_T2_HOST_IMPORT
 int fbx_t2_dispatch(u64 sys_id, i32 funcref, i32 m_ptr);
 
 /* Drop all translated modules for this System.  Called from
  * FbxTcInvalidate (§7.1).  Epoch-aware on the host side — in-flight
  * dispatches keep their module alive until they return (spec §Q4). */
+FBX_T2_HOST_IMPORT
 void fbx_t2_drop_all(u64 sys_id);
 
 /* Resolve an indirect-call target to a translated funcref, or -1 if
@@ -88,10 +108,12 @@ void fbx_t2_drop_all(u64 sys_id);
  * as block-end-with-bailout, so the runtime path doesn't call this in
  * v0.1 — kept here so the wire contract is complete and v0.2 can light
  * it up without re-revving the import shape. */
+FBX_T2_HOST_IMPORT
 int fbx_t2_resolve_indirect(u64 sys_id, u64 target_pc);
 
 /* Populate `*modules` and `*bytes` with the current cache occupancy
  * for this System.  Either pointer may be NULL to skip that field. */
+FBX_T2_HOST_IMPORT
 void fbx_t2_get_stats(u64 sys_id, u32 *modules, u64 *bytes);
 
 /* ────────────────────────────────────────────────────────────────────────── */
