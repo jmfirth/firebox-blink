@@ -424,6 +424,111 @@ static int Dump599FlagJcc(const char *dir, const char *filename, u64 alu_mop,
   return rc;
 }
 
+/* #602 — bare CALL_DIRECT module. */
+static int Dump602Call(const char *dir) {
+  struct FbxIrBlock ir;
+  struct FbxIrInst insts[1];
+  struct FbxTcBlock *tc;
+  struct FbxWasmBuffer out;
+  char path[1024];
+  int rc;
+  memset(&ir, 0, sizeof ir);
+  memset(insts, 0, sizeof insts);
+  insts[0].opcode = FBX_IR_OP_CALL_DIRECT;
+  insts[0].src2_kind = FBX_IR_KIND_IMM;
+  insts[0].src2 = 0xA005;
+  insts[0].imm = 0xA100;
+  ir.insts = insts;
+  ir.ninsts = 1;
+  ir.start_pc = 0xA000;
+  ir.end_pc = 0xA005;
+  tc = MakeTc(0x0E8, 0, 0, 0x100, 0xA000, 5);
+  fbx_wasm_buffer_init(&out);
+  if (!fbx_ir_emit_wasm(&ir, tc, &out)) {
+    fprintf(stderr, "602_call: synthesis refused\n");
+    FreeTc(tc);
+    return 0;
+  }
+  snprintf(path, sizeof path, "%s/602_call.wasm", dir);
+  rc = WriteFile(path, out.data, out.len);
+  fbx_wasm_buffer_free(&out);
+  FreeTc(tc);
+  return rc;
+}
+
+/* #602 — bare RET module. */
+static int Dump602Ret(const char *dir) {
+  struct FbxIrBlock ir;
+  struct FbxIrInst insts[1];
+  struct FbxTcBlock *tc;
+  struct FbxWasmBuffer out;
+  char path[1024];
+  int rc;
+  memset(&ir, 0, sizeof ir);
+  memset(insts, 0, sizeof insts);
+  insts[0].opcode = FBX_IR_OP_RET;
+  ir.insts = insts;
+  ir.ninsts = 1;
+  ir.start_pc = 0xB000;
+  ir.end_pc = 0xB001;
+  tc = MakeTc(0x0C3, 0, 0, 0, 0xB000, 1);
+  fbx_wasm_buffer_init(&out);
+  if (!fbx_ir_emit_wasm(&ir, tc, &out)) {
+    fprintf(stderr, "602_ret: synthesis refused\n");
+    FreeTc(tc);
+    return 0;
+  }
+  snprintf(path, sizeof path, "%s/602_ret.wasm", dir);
+  rc = WriteFile(path, out.data, out.len);
+  fbx_wasm_buffer_free(&out);
+  FreeTc(tc);
+  return rc;
+}
+
+/* #602 — PUSH RBP + POP RBP end-to-end (lifted from real opcodes). */
+static int Dump602PushPop(const char *dir) {
+  struct FbxTcBlock *b = (struct FbxTcBlock *)calloc(1, sizeof *b);
+  struct FbxIrBlock *ir;
+  struct FbxWasmBuffer out;
+  char path[1024];
+  int rc;
+  b->start_pc = 0xD000;
+  b->end_pc = 0xD002;
+  b->page = 0xD000;
+  b->nentries = 2;
+  b->entries = (struct FbxTcEntry *)calloc(2, sizeof(struct FbxTcEntry));
+  b->entries[0].ip = 0xD000;
+  b->entries[0].rde = (u64)0x055 << 050;   /* PUSH RBP */
+  b->entries[0].oplen = 1;
+  b->entries[0].kind = FBX_TC_KIND_NORMAL;
+  b->entries[1].ip = 0xD001;
+  b->entries[1].rde = (u64)0x05D << 050;   /* POP RBP */
+  b->entries[1].oplen = 1;
+  b->entries[1].kind = FBX_TC_KIND_NORMAL;
+  ir = fbx_ir_lift(b);
+  if (!ir) {
+    fprintf(stderr, "602_push_pop: lift failed\n");
+    free(b->entries);
+    free(b);
+    return 0;
+  }
+  fbx_wasm_buffer_init(&out);
+  if (!fbx_ir_emit_wasm(ir, b, &out)) {
+    fprintf(stderr, "602_push_pop: synthesis refused\n");
+    fbx_ir_free(ir);
+    free(b->entries);
+    free(b);
+    return 0;
+  }
+  snprintf(path, sizeof path, "%s/602_push_pop.wasm", dir);
+  rc = WriteFile(path, out.data, out.len);
+  fbx_wasm_buffer_free(&out);
+  fbx_ir_free(ir);
+  free(b->entries);
+  free(b);
+  return rc;
+}
+
 int main(int argc, char **argv) {
   const char *dir;
   if (argc < 2) {
@@ -451,6 +556,10 @@ int main(int argc, char **argv) {
   if (!Dump599FlagJcc(dir, "599_test_jbe", 0x085, RDE_MOD3, 0x076)) return 1;
   if (!Dump599FlagJcc(dir, "599_add_jl", 0x001, RDE_MOD3, 0x07C)) return 1;
   if (!Dump599FlagJcc(dir, "599_cmp_jle", 0x039, RDE_MOD3, 0x07E)) return 1;
-  fprintf(stdout, "wrote 16 modules to %s\n", dir);
+  /* #602 — CALL_DIRECT / RET / PUSH / POP. */
+  if (!Dump602Call(dir)) return 1;
+  if (!Dump602Ret(dir)) return 1;
+  if (!Dump602PushPop(dir)) return 1;
+  fprintf(stdout, "wrote 19 modules to %s\n", dir);
   return 0;
 }

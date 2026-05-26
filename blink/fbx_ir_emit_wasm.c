@@ -398,6 +398,10 @@ static int CoverageGate(const struct FbxIrBlock *ir,
       case FBX_IR_OP_CMP:
       case FBX_IR_OP_TEST:
       case FBX_IR_OP_BRANCH_COND:  /* #599: synthesisable for Jcc 0-9, C-F */
+      case FBX_IR_OP_CALL_DIRECT:  /* #602: stack-mutating control flow */
+      case FBX_IR_OP_RET:          /* #602 */
+      case FBX_IR_OP_PUSH:         /* #602 */
+      case FBX_IR_OP_POP:          /* #602 */
         continue;
       default:
         return 0;
@@ -473,6 +477,18 @@ static int CoverageGate(const struct FbxIrBlock *ir,
       case 0x0E9:
       case 0x0EB:
         break;
+      /* #602 — direct CALL rel32 (0x0E8) + RET (0x0C3).  Neither has a
+       * modrm; no mod3 check applies. */
+      case 0x0E8:
+      case 0x0C3:
+        break;
+      /* #602 — PUSH reg (0x050-0x057) + POP reg (0x058-0x05F).  No modrm;
+       * register encoded in low 3 bits of mopcode (extended via REX.B). */
+      case 0x050: case 0x051: case 0x052: case 0x053:
+      case 0x054: case 0x055: case 0x056: case 0x057:
+      case 0x058: case 0x059: case 0x05A: case 0x05B:
+      case 0x05C: case 0x05D: case 0x05E: case 0x05F:
+        break;
       /* #599 — Conditional jumps.  The synthesis pass emits the lazy-flag
        * + select-based branch decision.  Predicate refusal (Jcc PF/NP)
        * happens at EmitJccPredicate-emit-time. */
@@ -532,6 +548,14 @@ static int CoverageGate(const struct FbxIrBlock *ir,
 /* #599 — Machine.flags is u32 (eflags register).  Position is compiler-
  * dependent but offsetof keeps the synthesis pass cross-compiler stable. */
 #define M_OFF_FLAGS ((u32)offsetof(struct Machine, flags))
+
+/* #602 — RSP register id in Machine.weg[].  Per the Machine struct union
+ * (blink/machine.h:385-430), the ordered register file is ax(0), cx(1),
+ * dx(2), bx(3), sp(4), bp(5), si(6), di(7), r8(8)..r15(15).  So RSP=4,
+ * RBP=5.  Pinned constants: cross-build determinism (spec §Q5 axis 2). */
+#define FBX_GREG_RSP 4u
+#define FBX_GREG_RBP 5u
+#define M_OFF_RSP   (M_OFF_WEG + FBX_GREG_RSP * 8u)
 
 /* x86 EFLAGS bit positions — duplicated from blink/flags.h to keep this
  * file standalone (no further include dependency).  Phase 4's offline
@@ -1223,6 +1247,316 @@ static int EmitBranchCond(struct FbxWasmBuffer *body,
   return 1;
 }
 
+/* ────────────────────────────────────────────────────────────────────────── */
+/* #602 — Guest-memory + stack-mutating control-flow emit.                    */
+/*                                                                            */
+/* CALL_DIRECT / RET / PUSH / POP all mutate the guest stack at [RSP-8]      */
+/* (push-side) or [RSP] (pop/ret-side).  The v0.1 emitter (§13.5c) accesses */
+/* the guest stack through the imported wasm linear memory under the         */
+/* assumption that guest virtual addresses alias host linear-memory          */
+/* offsets — the same invariant the existing `m_ptr + offsetof(Machine, X)` */
+/* loads/stores already rely on (see §13.4 + spec §3.1 preamble; ToHost(va) */
+/* = va + kSkew where kSkew == 0 in linear-mapping mode).  Out-of-bounds    */
+/* guest-stack access traps the wasm runtime; the bridge catches and bails */
+/* to Tier 1 (T2Bridge::dispatch returns 1 on Err — see                      */
+/* crates/firebox-wasix/src/t2_bridge.rs `dispatch_impl` + `fbx_t2_dispatch` */
+/* shim).                                                                    */
+/*                                                                            */
+/* Stack-pointer width: RSP is read as i64, narrowed to i32 via              */
+/* i32.wrap_i64 for use as a wasm linear-memory address.  Wasm MVP uses     */
+/* i32 addresses (4 GiB max); the upper 32 bits of RSP must be zero for     */
+/* the access to land in the linear-memory region.  Blink's loader pages    */
+/* the stack into low VAs in linear-mapping mode (see blink/loader.c:806-   */
+/* 814 — `stack` = ReserveVirtual result; under kSkew==0 + linear mapping  */
+/* the stack lives in low 32 bits of guest VA space).                       */
+/*                                                                            */
+/* Width handling: PUSH/POP/CALL/RET only synthesize the 8-byte form in     */
+/* v0.1 (matches x86-64 default operand size + §Q7 top-30 ranking which    */
+/* counts 0x055 PUSH RBP at rank 16 and 0x05D POP RBP at rank 17 — both    */
+/* 8-byte default).                                                          */
+/* ────────────────────────────────────────────────────────────────────────── */
+
+/* Emit code that stores the i64 currently on top of the wasm stack to the
+ * guest memory location (m->weg[base_reg] + disp).  Leaves the stack
+ * empty.  Width is the store width (1/2/4/8); only 8 used in v0.1.
+ *
+ * The emitted sequence:
+ *   <produce i64 value on the wasm stack> (caller's responsibility)
+ *   local.get 0                     ;; m_ptr (i32)
+ *   i64.load offset=M_OFF_WEG+...   ;; guest base reg as i64
+ *   i64.const disp
+ *   i64.add
+ *   i32.wrap_i64                    ;; convert to wasm i32 address
+ *   <stash value via local>
+ *   ...
+ *
+ * Wasm's store opcodes take [addr, value] from the stack.  Since the
+ * caller already pushed the value FIRST, we need to interleave: we
+ * pre-compute the address before the caller's value emit, OR we use a
+ * different ordering helper.  This emitter inverts the call: the helper
+ * itself emits the address+value sequence given a `src_local` that
+ * carries the i64 value to store.  Callers stash the value in a vreg
+ * local first (CALL/PUSH stash a constant or greg value into scratch_z;
+ * RET/POP read the value back into a local before the helper runs). */
+static void EmitGuestMemStoreFromLocal(struct FbxWasmBuffer *body,
+                                       u32 base_reg, i64 disp,
+                                       u32 src_local, u8 width) {
+  u32 base_off = M_OFF_WEG + base_reg * 8u;
+  /* Compute the wasm i32 address = i32.wrap_i64(m->weg[base_reg] + disp). */
+  fbx_wasm_buffer_u8(body, WASM_OP_LOCAL_GET);
+  fbx_wasm_buffer_uleb(body, 0);              /* m_ptr (i32 base) */
+  fbx_wasm_buffer_u8(body, WASM_OP_I64_LOAD); /* read base reg as i64 */
+  fbx_wasm_buffer_uleb(body, 3);
+  fbx_wasm_buffer_uleb(body, base_off);
+  if (disp != 0) {
+    fbx_wasm_buffer_u8(body, WASM_OP_I64_CONST);
+    fbx_wasm_buffer_sleb(body, disp);
+    fbx_wasm_buffer_u8(body, WASM_OP_I64_ADD);
+  }
+  fbx_wasm_buffer_u8(body, WASM_OP_I32_WRAP_I64); /* → i32 address */
+  /* Push value to store. */
+  fbx_wasm_buffer_u8(body, WASM_OP_LOCAL_GET);
+  fbx_wasm_buffer_uleb(body, src_local);
+  /* Width-tagged store; effective addr = i32_addr + offset=0. */
+  switch (width) {
+    case 1:
+      fbx_wasm_buffer_u8(body, WASM_OP_I64_STORE8);
+      fbx_wasm_buffer_uleb(body, 0);
+      fbx_wasm_buffer_uleb(body, 0);
+      break;
+    case 2:
+      fbx_wasm_buffer_u8(body, WASM_OP_I64_STORE16);
+      fbx_wasm_buffer_uleb(body, 1);
+      fbx_wasm_buffer_uleb(body, 0);
+      break;
+    case 4:
+      fbx_wasm_buffer_u8(body, WASM_OP_I64_STORE32);
+      fbx_wasm_buffer_uleb(body, 2);
+      fbx_wasm_buffer_uleb(body, 0);
+      break;
+    case 8:
+    default:
+      fbx_wasm_buffer_u8(body, WASM_OP_I64_STORE);
+      fbx_wasm_buffer_uleb(body, 3);
+      fbx_wasm_buffer_uleb(body, 0);
+      break;
+  }
+}
+
+/* Emit code that stores the immediate `imm` (i64) to guest memory at
+ * (m->weg[base_reg] + disp).  Helper for CALL_DIRECT (which stores
+ * return_pc — a constant determined at lift time). */
+static void EmitGuestMemStoreImm(struct FbxWasmBuffer *body, u32 base_reg,
+                                 i64 disp, u64 imm, u8 width) {
+  u32 base_off = M_OFF_WEG + base_reg * 8u;
+  fbx_wasm_buffer_u8(body, WASM_OP_LOCAL_GET);
+  fbx_wasm_buffer_uleb(body, 0);
+  fbx_wasm_buffer_u8(body, WASM_OP_I64_LOAD);
+  fbx_wasm_buffer_uleb(body, 3);
+  fbx_wasm_buffer_uleb(body, base_off);
+  if (disp != 0) {
+    fbx_wasm_buffer_u8(body, WASM_OP_I64_CONST);
+    fbx_wasm_buffer_sleb(body, disp);
+    fbx_wasm_buffer_u8(body, WASM_OP_I64_ADD);
+  }
+  fbx_wasm_buffer_u8(body, WASM_OP_I32_WRAP_I64);
+  fbx_wasm_buffer_u8(body, WASM_OP_I64_CONST);
+  fbx_wasm_buffer_sleb(body, (i64)imm);
+  switch (width) {
+    case 1:
+      fbx_wasm_buffer_u8(body, WASM_OP_I64_STORE8);
+      fbx_wasm_buffer_uleb(body, 0);
+      fbx_wasm_buffer_uleb(body, 0);
+      break;
+    case 2:
+      fbx_wasm_buffer_u8(body, WASM_OP_I64_STORE16);
+      fbx_wasm_buffer_uleb(body, 1);
+      fbx_wasm_buffer_uleb(body, 0);
+      break;
+    case 4:
+      fbx_wasm_buffer_u8(body, WASM_OP_I64_STORE32);
+      fbx_wasm_buffer_uleb(body, 2);
+      fbx_wasm_buffer_uleb(body, 0);
+      break;
+    case 8:
+    default:
+      fbx_wasm_buffer_u8(body, WASM_OP_I64_STORE);
+      fbx_wasm_buffer_uleb(body, 3);
+      fbx_wasm_buffer_uleb(body, 0);
+      break;
+  }
+}
+
+/* Emit code that loads `width` bytes from guest memory at
+ * (m->weg[base_reg] + disp) and leaves the value as i64 on the wasm
+ * stack.  Width-tagged (zero-extending for narrow widths). */
+static void EmitGuestMemLoad(struct FbxWasmBuffer *body, u32 base_reg,
+                             i64 disp, u8 width) {
+  u32 base_off = M_OFF_WEG + base_reg * 8u;
+  fbx_wasm_buffer_u8(body, WASM_OP_LOCAL_GET);
+  fbx_wasm_buffer_uleb(body, 0);
+  fbx_wasm_buffer_u8(body, WASM_OP_I64_LOAD);
+  fbx_wasm_buffer_uleb(body, 3);
+  fbx_wasm_buffer_uleb(body, base_off);
+  if (disp != 0) {
+    fbx_wasm_buffer_u8(body, WASM_OP_I64_CONST);
+    fbx_wasm_buffer_sleb(body, disp);
+    fbx_wasm_buffer_u8(body, WASM_OP_I64_ADD);
+  }
+  fbx_wasm_buffer_u8(body, WASM_OP_I32_WRAP_I64);
+  switch (width) {
+    case 1:
+      fbx_wasm_buffer_u8(body, WASM_OP_I64_LOAD8U);
+      fbx_wasm_buffer_uleb(body, 0);
+      fbx_wasm_buffer_uleb(body, 0);
+      break;
+    case 2:
+      fbx_wasm_buffer_u8(body, WASM_OP_I64_LOAD16U);
+      fbx_wasm_buffer_uleb(body, 1);
+      fbx_wasm_buffer_uleb(body, 0);
+      break;
+    case 4:
+      fbx_wasm_buffer_u8(body, WASM_OP_I64_LOAD32U);
+      fbx_wasm_buffer_uleb(body, 2);
+      fbx_wasm_buffer_uleb(body, 0);
+      break;
+    case 8:
+    default:
+      fbx_wasm_buffer_u8(body, WASM_OP_I64_LOAD);
+      fbx_wasm_buffer_uleb(body, 3);
+      fbx_wasm_buffer_uleb(body, 0);
+      break;
+  }
+}
+
+/* Emit `m->weg[base_reg] += delta` as an in-place i64 add.  Wraps natively
+ * (x86-64 RSP is u64; modular arithmetic matches). */
+static void EmitGregAddImm(struct FbxWasmBuffer *body, u32 base_reg,
+                           i64 delta) {
+  u32 base_off = M_OFF_WEG + base_reg * 8u;
+  fbx_wasm_buffer_u8(body, WASM_OP_LOCAL_GET);
+  fbx_wasm_buffer_uleb(body, 0); /* m_ptr (i32 base for the store) */
+  fbx_wasm_buffer_u8(body, WASM_OP_LOCAL_GET);
+  fbx_wasm_buffer_uleb(body, 0); /* m_ptr (i32 base for the load) */
+  fbx_wasm_buffer_u8(body, WASM_OP_I64_LOAD);
+  fbx_wasm_buffer_uleb(body, 3);
+  fbx_wasm_buffer_uleb(body, base_off);
+  fbx_wasm_buffer_u8(body, WASM_OP_I64_CONST);
+  fbx_wasm_buffer_sleb(body, delta);
+  fbx_wasm_buffer_u8(body, WASM_OP_I64_ADD);
+  fbx_wasm_buffer_u8(body, WASM_OP_I64_STORE);
+  fbx_wasm_buffer_uleb(body, 3);
+  fbx_wasm_buffer_uleb(body, base_off);
+}
+
+/* Lower a CALL_DIRECT IR inst.
+ *
+ *   m->weg[RSP] -= 8;
+ *   *m->weg[RSP] = return_pc;
+ *   m->ip = target_pc;
+ *   return 0;
+ *
+ * Block-terminating.  Returns 1 on success. */
+static int EmitCallDirect(struct FbxWasmBuffer *body,
+                          const struct FbxIrInst *p) {
+  u64 target_pc = p->imm;
+  /* fallthrough/return PC is encoded as low 32 bits of src2 (matches
+   * LiftCallJvds in fbx_ir_lift.c:706-715).  Treat as unsigned absolute
+   * PC; sign-extension irrelevant since bench-corpus PCs are < 4 GiB. */
+  u64 return_pc = (u64)(u32)p->src2;
+  /* Step 1: RSP -= 8. */
+  EmitGregAddImm(body, FBX_GREG_RSP, -8);
+  /* Step 2: mem[RSP] = return_pc. */
+  EmitGuestMemStoreImm(body, FBX_GREG_RSP, 0, return_pc, 8);
+  /* Step 3: m->ip = target_pc and return exit=0. */
+  EmitStoreIp(body, target_pc);
+  fbx_wasm_buffer_u8(body, WASM_OP_I32_CONST);
+  fbx_wasm_buffer_sleb(body, 0);
+  fbx_wasm_buffer_u8(body, WASM_OP_RETURN);
+  return 1;
+}
+
+/* Lower a RET IR inst.
+ *
+ *   m->ip = *m->weg[RSP];
+ *   m->weg[RSP] += 8;
+ *   return 0;
+ *
+ * Block-terminating.  Uses scratch_z (i64) to stash the popped PC across
+ * the wasm-stack-emptying boundary required by the i64.store to m->ip. */
+static int EmitRet(struct FbxWasmBuffer *body, u16 nvregs) {
+  u32 scratch_z = ScratchZLocal(nvregs);
+  /* Step 1: load *RSP into scratch_z. */
+  EmitGuestMemLoad(body, FBX_GREG_RSP, 0, 8);
+  fbx_wasm_buffer_u8(body, WASM_OP_LOCAL_SET);
+  fbx_wasm_buffer_uleb(body, scratch_z);
+  /* Step 2: m->ip = scratch_z. */
+  fbx_wasm_buffer_u8(body, WASM_OP_LOCAL_GET);
+  fbx_wasm_buffer_uleb(body, 0); /* m_ptr */
+  fbx_wasm_buffer_u8(body, WASM_OP_LOCAL_GET);
+  fbx_wasm_buffer_uleb(body, scratch_z);
+  fbx_wasm_buffer_u8(body, WASM_OP_I64_STORE);
+  fbx_wasm_buffer_uleb(body, 3);
+  fbx_wasm_buffer_uleb(body, M_OFF_IP);
+  /* Step 3: RSP += 8. */
+  EmitGregAddImm(body, FBX_GREG_RSP, 8);
+  /* Step 4: return exit=0. */
+  fbx_wasm_buffer_u8(body, WASM_OP_I32_CONST);
+  fbx_wasm_buffer_sleb(body, 0);
+  fbx_wasm_buffer_u8(body, WASM_OP_RETURN);
+  return 1;
+}
+
+/* Lower a PUSH IR inst.
+ *
+ *   m->weg[RSP] -= width;
+ *   *m->weg[RSP] = greg[reg_id];
+ *
+ * NOT block-terminating; the lifter emits a separate terminator (or
+ * next opcode) after.  Uses scratch_z to stash the greg value.
+ *
+ * Width: v0.1 emits 8 only (matches lifter); the helper handles widths
+ * 1/2/4/8 generically for forward-compatibility.  PUSH with 8-byte
+ * width is the §Q7 top-30 ranking case. */
+static int EmitPush(struct FbxWasmBuffer *body, const struct FbxIrInst *p,
+                    u16 nvregs) {
+  u32 scratch_z = ScratchZLocal(nvregs);
+  u8 width = p->width ? p->width : 8u;
+  if (p->src1_kind != FBX_IR_KIND_GREG) return 0;
+  /* Step 1: stash greg[reg_id] into scratch_z. */
+  EmitRegLoad(body, p->src1, width);
+  fbx_wasm_buffer_u8(body, WASM_OP_LOCAL_SET);
+  fbx_wasm_buffer_uleb(body, scratch_z);
+  /* Step 2: RSP -= width. */
+  EmitGregAddImm(body, FBX_GREG_RSP, -(i64)width);
+  /* Step 3: *RSP = scratch_z. */
+  EmitGuestMemStoreFromLocal(body, FBX_GREG_RSP, 0, scratch_z, width);
+  return 1;
+}
+
+/* Lower a POP IR inst.
+ *
+ *   greg[reg_id] = *m->weg[RSP];
+ *   m->weg[RSP] += width;
+ *
+ * NOT block-terminating.  Uses scratch_z to stash the popped value
+ * across the load-then-RSP-bump-then-store sequence. */
+static int EmitPop(struct FbxWasmBuffer *body, const struct FbxIrInst *p,
+                   u16 nvregs) {
+  u32 scratch_z = ScratchZLocal(nvregs);
+  u8 width = p->width ? p->width : 8u;
+  if (p->dst_kind != FBX_IR_KIND_GREG) return 0;
+  /* Step 1: load *RSP into scratch_z. */
+  EmitGuestMemLoad(body, FBX_GREG_RSP, 0, width);
+  fbx_wasm_buffer_u8(body, WASM_OP_LOCAL_SET);
+  fbx_wasm_buffer_uleb(body, scratch_z);
+  /* Step 2: RSP += width. */
+  EmitGregAddImm(body, FBX_GREG_RSP, (i64)width);
+  /* Step 3: greg[dst] = scratch_z. */
+  EmitRegStoreFromLocal(body, p->dst, scratch_z, width);
+  return 1;
+}
+
 /* Decide whether this block needs the i64 + i32 scratch locals reserved
  * after the vreg block.  Any flag-reader (BRANCH_COND) is the trigger;
  * dead-flag-elision blocks (SET_FLAGS_RAW with no reader) still skip
@@ -1238,6 +1572,13 @@ static int BlockNeedsScratchLocals(const struct FbxIrBlock *ir) {
   for (i = 0; i < ir->ninsts; ++i) {
     u8 op = ir->insts[i].opcode;
     if (op == FBX_IR_OP_BRANCH_COND || op == FBX_IR_OP_GET_FLAG) return 1;
+    /* #602 — RET/PUSH/POP stash the popped or to-be-pushed value in
+     * scratch_z to bridge the wasm-stack ordering between the load
+     * and the subsequent RSP adjust + store-to-ip / store-to-greg.
+     * CALL_DIRECT does NOT need scratch (it stores a constant return_pc
+     * directly via EmitGuestMemStoreImm) but checking is cheap. */
+    if (op == FBX_IR_OP_RET || op == FBX_IR_OP_PUSH ||
+        op == FBX_IR_OP_POP) return 1;
   }
   return 0;
 }
@@ -1355,6 +1696,24 @@ static int EmitFunctionBody(struct FbxWasmBuffer *body,
         fbx_wasm_buffer_sleb(body, 1);
         fbx_wasm_buffer_u8(body, WASM_OP_RETURN);
         terminated = 1;
+        break;
+      case FBX_IR_OP_CALL_DIRECT:
+        /* #602 — push return_pc onto guest stack; jump to target_pc. */
+        if (!EmitCallDirect(body, p)) return 0;
+        terminated = 1;
+        break;
+      case FBX_IR_OP_RET:
+        /* #602 — pop guest stack into m->ip; bump RSP. */
+        if (!EmitRet(body, ir->nvregs)) return 0;
+        terminated = 1;
+        break;
+      case FBX_IR_OP_PUSH:
+        /* #602 — stash greg, decrement RSP, store. */
+        if (!EmitPush(body, p, ir->nvregs)) return 0;
+        break;
+      case FBX_IR_OP_POP:
+        /* #602 — load from RSP, increment RSP, write greg. */
+        if (!EmitPop(body, p, ir->nvregs)) return 0;
         break;
       default:
         /* Coverage gate should have rejected this. */

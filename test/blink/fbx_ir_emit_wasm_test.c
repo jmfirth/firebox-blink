@@ -670,7 +670,10 @@ TEST(FbxWasmEmit, RefusesMalformedSetFlagsRawWithBranchCond) {
   FreeTc(tc);
 }
 
-TEST(FbxWasmEmit, RefusesCallDirect) {
+/* #602 — CALL_DIRECT now synthesizes (previously refused).  The wasm
+ * module produced should: (1) succeed synthesis, (2) emit non-zero bytes,
+ * (3) start with the wasm magic, (4) be deterministic. */
+TEST(FbxWasmEmit, SynthsCallDirect) {
   struct FbxIrBlock ir;
   struct FbxIrInst insts[1];
   struct FbxTcBlock *tc;
@@ -678,12 +681,19 @@ TEST(FbxWasmEmit, RefusesCallDirect) {
   memset(&ir, 0, sizeof ir);
   memset(insts, 0, sizeof insts);
   insts[0].opcode = FBX_IR_OP_CALL_DIRECT;
-  insts[0].imm = 0xA100;
+  insts[0].src2_kind = FBX_IR_KIND_IMM;
+  insts[0].src2 = 0xA005;       /* return_pc (32-bit truncated) */
+  insts[0].imm = 0xA100;        /* target_pc */
   ir.insts = insts;
   ir.ninsts = 1;
   tc = MakeTc(0x0E8, 0, 0, 0x100, 0xA000, 5, FBX_TC_KIND_NORMAL);
   fbx_wasm_buffer_init(&out);
-  ASSERT_EQ(0, fbx_ir_emit_wasm(&ir, tc, &out));
+  ASSERT_EQ(1, fbx_ir_emit_wasm(&ir, tc, &out));
+  ASSERT_NE((i64)0, (i64)out.len);
+  ASSERT_EQ(0x00, out.data[0]);
+  ASSERT_EQ(0x61, out.data[1]);
+  ASSERT_EQ(0x73, out.data[2]);
+  ASSERT_EQ(0x6D, out.data[3]);
   fbx_wasm_buffer_free(&out);
   FreeTc(tc);
 }
@@ -1238,8 +1248,12 @@ TEST(FbxWasm599, DeterministicFlagSynth) {
 TEST(FbxWasm599, IrVersionBumped) {
   /* #599 changes the SET_FLAGS_RAW shape; the IR version constant
    * MUST be bumped so Phase 4 sidecar caches invalidate.  This guards
-   * against silently shipping a layout change with the same version. */
-  ASSERT_EQ(2u, (u32)FBX_IR_VERSION);
+   * against silently shipping a layout change with the same version.
+   *
+   * #602 (CALL_DIRECT / RET / PUSH / POP synthesis) re-bumps to 3 —
+   * adds new IR opcodes (PUSH/POP) and flips CALL/RET emit from
+   * refuse to synthesize, so stale v2 sidecars must invalidate. */
+  ASSERT_EQ(3u, (u32)FBX_IR_VERSION);
 }
 
 TEST(FbxWasm599, FlagSynthDifferentOpKindProducesDifferentBytes) {
@@ -1260,6 +1274,317 @@ TEST(FbxWasm599, FlagSynthDifferentOpKindProducesDifferentBytes) {
   fbx_wasm_buffer_free(&add_out);
   fbx_wasm_buffer_free(&sub_out);
   fbx_wasm_buffer_free(&and_out);
+}
+
+/* ────────────────────────────────────────────────────────────────────────── */
+/* #602 — CALL_DIRECT / RET / PUSH / POP wasm synthesis.                      */
+/*                                                                            */
+/* The §13.5c emit pass lowers all four stack-mutating control-flow ops       */
+/* into wasm that mutates the guest stack via the imported linear memory      */
+/* (using i32.wrap_i64(RSP) as the address).  Tests:                          */
+/*                                                                            */
+/*   - SynthsRet            — bare RET lifts + emits                          */
+/*   - SynthsPushRbp        — PUSH RBP lifts + emits                          */
+/*   - SynthsPopRbp         — POP RBP lifts + emits                           */
+/*   - PushPopFromLift      — PUSH RBP; ...; POP RBP lifted as a block        */
+/*   - BranchCondJESynthsWithCallRet — CMP+JE multi-inst with CALL/RET emit   */
+/*   - DeterministicCallEmit— same input → same bytes                         */
+/*   - PushPopWidthIs8      — lifter emits width=8 for PUSH/POP (#602 v0.1)   */
+/* ────────────────────────────────────────────────────────────────────────── */
+
+TEST(FbxWasm602, SynthsRet) {
+  struct FbxIrBlock ir;
+  struct FbxIrInst insts[1];
+  struct FbxTcBlock *tc;
+  struct FbxWasmBuffer out;
+  memset(&ir, 0, sizeof ir);
+  memset(insts, 0, sizeof insts);
+  insts[0].opcode = FBX_IR_OP_RET;
+  ir.insts = insts;
+  ir.ninsts = 1;
+  ir.nvregs = 0;
+  ir.start_pc = 0xB000;
+  ir.end_pc = 0xB001;
+  tc = MakeTc(0x0C3, 0, 0, 0, 0xB000, 1, FBX_TC_KIND_NORMAL);
+  fbx_wasm_buffer_init(&out);
+  ASSERT_EQ(1, fbx_ir_emit_wasm(&ir, tc, &out));
+  ASSERT_NE((i64)0, (i64)out.len);
+  /* Magic prefix. */
+  ASSERT_EQ(0x00, out.data[0]);
+  ASSERT_EQ(0x61, out.data[1]);
+  fbx_wasm_buffer_free(&out);
+  FreeTc(tc);
+}
+
+TEST(FbxWasm602, SynthsPushRbp) {
+  /* Direct IR construction: PUSH RBP (greg 5, width 8). */
+  struct FbxIrBlock ir;
+  struct FbxIrInst insts[2];
+  struct FbxTcBlock *tc;
+  struct FbxWasmBuffer out;
+  memset(&ir, 0, sizeof ir);
+  memset(insts, 0, sizeof insts);
+  insts[0].opcode = FBX_IR_OP_PUSH;
+  insts[0].width = 8;
+  insts[0].src1_kind = FBX_IR_KIND_GREG;
+  insts[0].src1 = 5;            /* RBP */
+  insts[1].opcode = FBX_IR_OP_BRANCH_TAKEN;
+  insts[1].imm = 0xB001;
+  ir.insts = insts;
+  ir.ninsts = 2;
+  ir.nvregs = 0;
+  ir.start_pc = 0xB000;
+  ir.end_pc = 0xB001;
+  tc = MakeTc(0x055, 0, 0, 0, 0xB000, 1, FBX_TC_KIND_NORMAL);
+  fbx_wasm_buffer_init(&out);
+  ASSERT_EQ(1, fbx_ir_emit_wasm(&ir, tc, &out));
+  ASSERT_NE((i64)0, (i64)out.len);
+  fbx_wasm_buffer_free(&out);
+  FreeTc(tc);
+}
+
+TEST(FbxWasm602, SynthsPopRbp) {
+  /* Direct IR construction: POP RBP. */
+  struct FbxIrBlock ir;
+  struct FbxIrInst insts[2];
+  struct FbxTcBlock *tc;
+  struct FbxWasmBuffer out;
+  memset(&ir, 0, sizeof ir);
+  memset(insts, 0, sizeof insts);
+  insts[0].opcode = FBX_IR_OP_POP;
+  insts[0].width = 8;
+  insts[0].dst_kind = FBX_IR_KIND_GREG;
+  insts[0].dst = 5;             /* RBP */
+  insts[1].opcode = FBX_IR_OP_BRANCH_TAKEN;
+  insts[1].imm = 0xC001;
+  ir.insts = insts;
+  ir.ninsts = 2;
+  ir.nvregs = 0;
+  ir.start_pc = 0xC000;
+  ir.end_pc = 0xC001;
+  tc = MakeTc(0x05D, 0, 0, 0, 0xC000, 1, FBX_TC_KIND_NORMAL);
+  fbx_wasm_buffer_init(&out);
+  ASSERT_EQ(1, fbx_ir_emit_wasm(&ir, tc, &out));
+  ASSERT_NE((i64)0, (i64)out.len);
+  fbx_wasm_buffer_free(&out);
+  FreeTc(tc);
+}
+
+TEST(FbxWasm602, PushPopFromLift) {
+  /* End-to-end: lift PUSH RBP + POP RBP as adjacent TC entries; verify
+   * the lifted IR has FBX_IR_OP_PUSH + FBX_IR_OP_POP, and synthesis
+   * succeeds. */
+  u64 mops[2] = {0x055, 0x05D};                 /* PUSH RBP; POP RBP */
+  u64 rdes[2] = {0, 0};
+  u64 uimms[2] = {0, 0};
+  i64 disps[2] = {0, 0};
+  u64 ips[2] = {0xD000, 0xD001};
+  u8 oplens[2] = {1, 1};
+  struct FbxTcBlock *tc = MakeTcN(mops, rdes, uimms, disps, ips, oplens, 2);
+  struct FbxIrBlock *ir;
+  struct FbxWasmBuffer out;
+  ir = fbx_ir_lift(tc);
+  ASSERT_NE((i64)0, (i64)(intptr_t)ir);
+  /* Walk IR, expect FBX_IR_OP_PUSH and FBX_IR_OP_POP somewhere. */
+  {
+    u32 i;
+    int saw_push = 0, saw_pop = 0;
+    for (i = 0; i < ir->ninsts; ++i) {
+      if (ir->insts[i].opcode == FBX_IR_OP_PUSH) {
+        saw_push = 1;
+        ASSERT_EQ(8u, (u32)ir->insts[i].width);
+        ASSERT_EQ((u32)FBX_IR_KIND_GREG, (u32)ir->insts[i].src1_kind);
+        ASSERT_EQ(5u, (u32)ir->insts[i].src1);  /* RBP = greg 5 */
+      }
+      if (ir->insts[i].opcode == FBX_IR_OP_POP) {
+        saw_pop = 1;
+        ASSERT_EQ(8u, (u32)ir->insts[i].width);
+        ASSERT_EQ((u32)FBX_IR_KIND_GREG, (u32)ir->insts[i].dst_kind);
+        ASSERT_EQ(5u, (u32)ir->insts[i].dst);
+      }
+    }
+    ASSERT_EQ(1, saw_push);
+    ASSERT_EQ(1, saw_pop);
+  }
+  fbx_wasm_buffer_init(&out);
+  ASSERT_EQ(1, fbx_ir_emit_wasm(ir, tc, &out));
+  ASSERT_NE((i64)0, (i64)out.len);
+  fbx_wasm_buffer_free(&out);
+  fbx_ir_free(ir);
+  FreeTc(tc);
+}
+
+TEST(FbxWasm602, BranchCondJESynthsWithCallRet) {
+  /* Multi-instruction block:
+   *   CMP %rax, %rbx     ; 0x039  (3 bytes)
+   *   JE  rel8           ; 0x074  (2 bytes)
+   * The block ends with a Jcc; CALL/RET would be a separate basic block
+   * in real code (each is block-terminating).  Build it via the lift
+   * path to confirm CMP+JE multi-inst works alongside the #602 emit
+   * changes (regression guard — none of the #602 surface should break
+   * #599's lazy-flag synthesis).
+   *
+   * After the CMP+JE base case, also synthesize a bare CALL_DIRECT IR
+   * directly to confirm both surfaces compose. */
+  u64 mops[2] = {0x039, 0x074};                 /* CMP RR + JE rel8 */
+  u64 rdes[2] = {RDE_MOD3, 0};
+  u64 uimms[2] = {0, 0};
+  i64 disps[2] = {0, 0x10};
+  u64 ips[2] = {0xE000, 0xE003};
+  u8 oplens[2] = {3, 2};
+  struct FbxTcBlock *cmpje_tc = MakeTcN(mops, rdes, uimms, disps, ips, oplens, 2);
+  struct FbxIrBlock *cmpje_ir;
+  struct FbxWasmBuffer cmpje_out, call_out;
+  /* Synth the CMP+JE block (lazy-flag + BRANCH_COND emit from #599). */
+  cmpje_ir = fbx_ir_lift(cmpje_tc);
+  ASSERT_NE((i64)0, (i64)(intptr_t)cmpje_ir);
+  fbx_wasm_buffer_init(&cmpje_out);
+  ASSERT_EQ(1, fbx_ir_emit_wasm(cmpje_ir, cmpje_tc, &cmpje_out));
+  ASSERT_NE((i64)0, (i64)cmpje_out.len);
+  /* Synth a bare CALL_DIRECT block — the §13.5c addition.  This sibling
+   * surface must produce a non-zero, magic-prefixed wasm module. */
+  {
+    struct FbxIrBlock ir2;
+    struct FbxIrInst insts[1];
+    struct FbxTcBlock *call_tc;
+    memset(&ir2, 0, sizeof ir2);
+    memset(insts, 0, sizeof insts);
+    insts[0].opcode = FBX_IR_OP_CALL_DIRECT;
+    insts[0].src2_kind = FBX_IR_KIND_IMM;
+    insts[0].src2 = 0xE008;
+    insts[0].imm = 0xF000;
+    ir2.insts = insts;
+    ir2.ninsts = 1;
+    ir2.nvregs = 0;
+    call_tc = MakeTc(0x0E8, 0, 0, 0x1000, 0xE003, 5, FBX_TC_KIND_NORMAL);
+    fbx_wasm_buffer_init(&call_out);
+    ASSERT_EQ(1, fbx_ir_emit_wasm(&ir2, call_tc, &call_out));
+    ASSERT_NE((i64)0, (i64)call_out.len);
+    FreeTc(call_tc);
+  }
+  fbx_wasm_buffer_free(&cmpje_out);
+  fbx_wasm_buffer_free(&call_out);
+  fbx_ir_free(cmpje_ir);
+  FreeTc(cmpje_tc);
+}
+
+TEST(FbxWasm602, DeterministicCallEmit) {
+  /* Two synth calls over the same CALL_DIRECT IR must produce identical
+   * bytes (spec §Q5 determinism contract). */
+  struct FbxIrBlock ir;
+  struct FbxIrInst insts[1];
+  struct FbxTcBlock *tc;
+  struct FbxWasmBuffer out1, out2;
+  memset(&ir, 0, sizeof ir);
+  memset(insts, 0, sizeof insts);
+  insts[0].opcode = FBX_IR_OP_CALL_DIRECT;
+  insts[0].src2_kind = FBX_IR_KIND_IMM;
+  insts[0].src2 = 0xA005;
+  insts[0].imm = 0xA100;
+  ir.insts = insts;
+  ir.ninsts = 1;
+  tc = MakeTc(0x0E8, 0, 0, 0x100, 0xA000, 5, FBX_TC_KIND_NORMAL);
+  fbx_wasm_buffer_init(&out1);
+  fbx_wasm_buffer_init(&out2);
+  ASSERT_EQ(1, fbx_ir_emit_wasm(&ir, tc, &out1));
+  ASSERT_EQ(1, fbx_ir_emit_wasm(&ir, tc, &out2));
+  ASSERT_EQ((i64)out1.len, (i64)out2.len);
+  ASSERT_EQ(0, memcmp(out1.data, out2.data, out1.len));
+  fbx_wasm_buffer_free(&out1);
+  fbx_wasm_buffer_free(&out2);
+  FreeTc(tc);
+}
+
+TEST(FbxWasm602, DeterministicRetEmit) {
+  /* RET is even simpler; assert determinism + non-empty body. */
+  struct FbxIrBlock ir;
+  struct FbxIrInst insts[1];
+  struct FbxTcBlock *tc;
+  struct FbxWasmBuffer out1, out2;
+  memset(&ir, 0, sizeof ir);
+  memset(insts, 0, sizeof insts);
+  insts[0].opcode = FBX_IR_OP_RET;
+  ir.insts = insts;
+  ir.ninsts = 1;
+  tc = MakeTc(0x0C3, 0, 0, 0, 0xB000, 1, FBX_TC_KIND_NORMAL);
+  fbx_wasm_buffer_init(&out1);
+  fbx_wasm_buffer_init(&out2);
+  ASSERT_EQ(1, fbx_ir_emit_wasm(&ir, tc, &out1));
+  ASSERT_EQ(1, fbx_ir_emit_wasm(&ir, tc, &out2));
+  ASSERT_EQ((i64)out1.len, (i64)out2.len);
+  ASSERT_EQ(0, memcmp(out1.data, out2.data, out1.len));
+  fbx_wasm_buffer_free(&out1);
+  fbx_wasm_buffer_free(&out2);
+  FreeTc(tc);
+}
+
+TEST(FbxWasm602, CallAndRetProduceDifferentBytes) {
+  /* CALL_DIRECT and RET have distinct lowerings; their wasm output must
+   * differ.  Guard against an accidental fallthrough that emits the
+   * same module shell for both. */
+  struct FbxIrBlock ir_call, ir_ret;
+  struct FbxIrInst call_insts[1], ret_insts[1];
+  struct FbxTcBlock *call_tc, *ret_tc;
+  struct FbxWasmBuffer call_out, ret_out;
+  memset(&ir_call, 0, sizeof ir_call);
+  memset(&ir_ret, 0, sizeof ir_ret);
+  memset(call_insts, 0, sizeof call_insts);
+  memset(ret_insts, 0, sizeof ret_insts);
+  call_insts[0].opcode = FBX_IR_OP_CALL_DIRECT;
+  call_insts[0].src2_kind = FBX_IR_KIND_IMM;
+  call_insts[0].src2 = 0xA005;
+  call_insts[0].imm = 0xA100;
+  ir_call.insts = call_insts;
+  ir_call.ninsts = 1;
+  ret_insts[0].opcode = FBX_IR_OP_RET;
+  ir_ret.insts = ret_insts;
+  ir_ret.ninsts = 1;
+  call_tc = MakeTc(0x0E8, 0, 0, 0x100, 0xA000, 5, FBX_TC_KIND_NORMAL);
+  ret_tc = MakeTc(0x0C3, 0, 0, 0, 0xB000, 1, FBX_TC_KIND_NORMAL);
+  fbx_wasm_buffer_init(&call_out);
+  fbx_wasm_buffer_init(&ret_out);
+  ASSERT_EQ(1, fbx_ir_emit_wasm(&ir_call, call_tc, &call_out));
+  ASSERT_EQ(1, fbx_ir_emit_wasm(&ir_ret, ret_tc, &ret_out));
+  /* Either length differs or bytes differ — they must NOT be identical. */
+  if ((i64)call_out.len == (i64)ret_out.len) {
+    ASSERT_NE(0, memcmp(call_out.data, ret_out.data, call_out.len));
+  }
+  fbx_wasm_buffer_free(&call_out);
+  fbx_wasm_buffer_free(&ret_out);
+  FreeTc(call_tc);
+  FreeTc(ret_tc);
+}
+
+TEST(FbxWasm602, PushPopOpcodeNamesPresent) {
+  /* Diagnostic tables expose the new opcode names — sanity check that
+   * the strings exist (avoids "UNKNOWN" returns from stale tables). */
+  EXPECT_STREQ("PUSH", fbx_ir_opcode_name(FBX_IR_OP_PUSH));
+  EXPECT_STREQ("POP",  fbx_ir_opcode_name(FBX_IR_OP_POP));
+}
+
+TEST(FbxWasm602, RefusesPushWithoutGregSrc) {
+  /* Defense: malformed IR with PUSH but src1_kind != GREG must be
+   * refused by the emitter (correct-or-refuse contract). */
+  struct FbxIrBlock ir;
+  struct FbxIrInst insts[1];
+  struct FbxTcBlock *tc;
+  struct FbxWasmBuffer out;
+  memset(&ir, 0, sizeof ir);
+  memset(insts, 0, sizeof insts);
+  insts[0].opcode = FBX_IR_OP_PUSH;
+  insts[0].width = 8;
+  insts[0].src1_kind = FBX_IR_KIND_IMM;   /* malformed: should be GREG */
+  insts[0].imm = 0xdeadbeef;
+  ir.insts = insts;
+  ir.ninsts = 1;
+  tc = MakeTc(0x055, 0, 0, 0, 0xF000, 1, FBX_TC_KIND_NORMAL);
+  fbx_wasm_buffer_init(&out);
+  /* CoverageGate passes (it doesn't introspect PUSH operand kinds);
+   * the emit pass refuses at EmitPush.  Either way, the final result
+   * is `0` (refusal). */
+  ASSERT_EQ(0, fbx_ir_emit_wasm(&ir, tc, &out));
+  fbx_wasm_buffer_free(&out);
+  FreeTc(tc);
 }
 
 TEST(FbxWasmBuffer, AppendStress) {

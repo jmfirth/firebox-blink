@@ -235,6 +235,8 @@ static const char *const kOpcodeNames[FBX_IR_OP_LAST_] = {
     [FBX_IR_OP_RET] = "RET",
     [FBX_IR_OP_BAILOUT] = "BAILOUT",
     [FBX_IR_OP_CALL_HOST] = "CALL_HOST",
+    [FBX_IR_OP_PUSH] = "PUSH",
+    [FBX_IR_OP_POP] = "POP",
 };
 
 const char *fbx_ir_opcode_name(u8 opcode) {
@@ -807,6 +809,49 @@ static int LiftOne(struct LiftCtx *ctx, const struct FbxTcEntry *e,
     /* CALL rel32 — 0xE8. */
     case 0x0E8:
       return LiftCallJvds(ctx, (u64)((i64)next_pc + e->disp), next_pc);
+    /* #602 — PUSH reg (0x050-0x057, low 3 bits = Srm reg id; REX.B
+     * prefix extends to 0x58-0x5F greg ids via the high bit at
+     * kRegRexbSrmMask bit 15).
+     *
+     * Source of truth for the register id: x86 encodes the register
+     * in the LOW 3 BITS OF THE OPCODE itself (mop & 7), plus REX.B (1
+     * bit) if a REX prefix is present.  Blink's xed decoder mirrors
+     * this into rde's Srm/RexbSrm fields, but the mopcode low nibble
+     * is the authoritative source.  Using `(u32)(mop & 0x7)` here
+     * (instead of RexbSrm(rde)) makes the lifter robust against test
+     * fixtures that don't populate rde's Srm bits explicitly — the
+     * mopcode low nibble carries the same information by definition.
+     *
+     * REX.B-extended registers (r8-r15 for PUSH/POP) come in via rde's
+     * top bit of kRegRexbSrmMask (bit 15), which `RexbSrm(rde) & 0x8`
+     * captures.  We OR them together for completeness.
+     *
+     * Width = 8 (x86-64 default operand size; the v0.1 emitter only
+     * synthesizes the 8-byte form, matching the §Q7 top-30 ranking
+     * where 0x055 = PUSH RBP appears as rank 16). */
+    case 0x050: case 0x051: case 0x052: case 0x053:
+    case 0x054: case 0x055: case 0x056: case 0x057: {
+      struct FbxIrInst *p = CtxEmit(ctx);
+      if (!p) return 0;
+      p->opcode = FBX_IR_OP_PUSH;
+      p->width = 8;
+      p->src1_kind = FBX_IR_KIND_GREG;
+      p->src1 = (u32)((mop & 0x7) | (RexbSrm(rde) & 0x8));
+      return 1;
+    }
+    /* #602 — POP reg (0x058-0x05F).  Inverse of PUSH; greg[reg_id] = *RSP
+     * then RSP += 8.  Same width semantics as PUSH.  Same reg-id
+     * extraction strategy: mop low 3 bits OR'd with REX.B from rde. */
+    case 0x058: case 0x059: case 0x05A: case 0x05B:
+    case 0x05C: case 0x05D: case 0x05E: case 0x05F: {
+      struct FbxIrInst *p = CtxEmit(ctx);
+      if (!p) return 0;
+      p->opcode = FBX_IR_OP_POP;
+      p->width = 8;
+      p->dst_kind = FBX_IR_KIND_GREG;
+      p->dst = (u32)((mop & 0x7) | (RexbSrm(rde) & 0x8));
+      return 1;
+    }
     /* RET — 0xC3. */
     case 0x0C3: {
       struct FbxIrInst *r = CtxEmit(ctx);

@@ -106,8 +106,16 @@ extern "C" {
  *     already carried condition code in src1).  The version bump invalidates
  *     stale Phase 4 sidecars compiled against v1's "refuse" semantics so a
  *     fresh emit-side pass runs and the cache reflects the larger covered
- *     surface.  See work/tasks/599-* for the full closure narrative. */
-#define FBX_IR_VERSION 2u
+ *     surface.  See work/tasks/599-* for the full closure narrative.
+ * v3: §13.5c follow-on (#602) — CALL_DIRECT / RET / PUSH / POP wasm
+ *     synthesis.  Adds FBX_IR_OP_PUSH and FBX_IR_OP_POP opcodes (new
+ *     enumerators at the tail; pinned values preserved).  CALL_DIRECT
+ *     and RET already existed; the version bump reflects the emit-side
+ *     flip from "refuse" to "synthesize" for these four opcodes plus
+ *     the two new PUSH/POP opcodes.  Stale Phase 4 sidecars compiled
+ *     against v2's refuse semantics invalidate cleanly so the new emit
+ *     pass runs.  See work/tasks/602-* for closure narrative. */
+#define FBX_IR_VERSION 3u
 
 /* ────────────────────────────────────────────────────────────────────────── */
 /* IR opcodes.                                                                */
@@ -175,6 +183,25 @@ enum FbxIrOpcode {
    * Always block-terminating.  NOT emitted in v0.1 (thunk blocks bail
    * out, syscalls bail out); reserved for v0.2+ extension. */
   FBX_IR_OP_CALL_HOST = 21,
+
+  /* #602 — guest-stack push/pop of a guest register.  Mutates RSP and
+   * writes/reads the 8-byte word at the new/current top-of-stack.
+   *
+   * PUSH semantics: RSP -= 8; mem[RSP] = greg[reg_id].
+   *   dst_kind = NONE; src1_kind = GREG (the register to push);
+   *   width   = operand size (1/2/4/8 — v0.1 only emits 8 for the
+   *             x86-64 default operand size).
+   *
+   * POP semantics: greg[reg_id] = mem[RSP]; RSP += 8.
+   *   dst_kind = GREG (the register being loaded);
+   *   src1_kind = NONE; width = operand size (8 in v0.1).
+   *
+   * Both opcodes mutate the guest stack at the always-known address
+   * RSP; the v0.1 emitter (§13.5c) lowers them via i64.load/i64.store
+   * against the imported wasm linear memory + i32.wrap_i64(RSP).
+   * CALL/RET reuse the same memory machinery. */
+  FBX_IR_OP_PUSH = 22,
+  FBX_IR_OP_POP  = 23,
 
   /* Sentinel — count of defined opcodes.  Used by validation; not emitted. */
   FBX_IR_OP_LAST_,
