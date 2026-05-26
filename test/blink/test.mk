@@ -156,6 +156,18 @@ o/$(MODE)/test/blink/disinst_test.com: o/$(MODE)/test/blink/disinst_test.o o/$(M
 # only the lifter, which is pure C; no need for cross-toolchain coverage).
 o/$(MODE)/test/blink/fbx_ir_lift_test.com: o/$(MODE)/test/blink/fbx_ir_lift_test.o o/$(MODE)/blink/blink.a
 	$(CC) $(LDFLAGS) $(TARGET_ARCH) $^ $(LOADLIBES) $(LDLIBS) -o $@
+
+# Firebox §13.2 — wasm synthesis pass unit tests.  Host-only (the emitter is
+# pure C; emitted wasm bytes are validated cross-engine by an out-of-tree
+# harness — see work/tasks/588-elf-perf-tier-2-13-2-wasm-synthesis/).
+o/$(MODE)/test/blink/fbx_ir_emit_wasm_test.com: o/$(MODE)/test/blink/fbx_ir_emit_wasm_test.o o/$(MODE)/blink/blink.a
+	$(CC) $(LDFLAGS) $(TARGET_ARCH) $^ $(LOADLIBES) $(LDLIBS) -o $@
+
+# Cross-engine validation dumper — emits representative synthesised modules
+# to a directory for native (wasmer::Module::new) + browser (WebAssembly
+# .compile) parse checks per AGENTS.md invariant 4.
+o/$(MODE)/test/blink/fbx_ir_emit_wasm_dump.com: o/$(MODE)/test/blink/fbx_ir_emit_wasm_dump.o o/$(MODE)/blink/blink.a
+	$(CC) $(LDFLAGS) $(TARGET_ARCH) $^ $(LOADLIBES) $(LDLIBS) -o $@
 o/$(MODE)/i486/test/blink/disinst_test.com: o/$(MODE)/i486/test/blink/disinst_test.o o/$(MODE)/i486/blink/blink.a
 	o/third_party/gcc/i486/bin/i486-linux-musl-gcc -static $(LDFLAGS) $(TARGET_ARCH) $^ $(LOADLIBES) $(LDLIBS) -o $@
 o/$(MODE)/m68k/test/blink/disinst_test.com: o/$(MODE)/m68k/test/blink/disinst_test.o o/$(MODE)/m68k/blink/blink.a
@@ -192,7 +204,8 @@ o/$(MODE)/test/blink:							\
 		o/$(MODE)/test/blink/x86_test.com.runs			\
 		o/$(MODE)/test/blink/ldbl_test.com.runs			\
 		o/$(MODE)/test/blink/disinst_test.com.runs		\
-		o/$(MODE)/test/blink/fbx_ir_lift_test.com.runs
+		o/$(MODE)/test/blink/fbx_ir_lift_test.com.runs		\
+		o/$(MODE)/test/blink/fbx_ir_emit_wasm_test.com.runs
 
 o/$(MODE)/test/blink/emulates:						\
 		o/$(MODE)/blink/blink					\
