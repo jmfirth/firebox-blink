@@ -97,7 +97,17 @@ extern "C" {
 /*   - the lifting pass emits ANY new IR for previously-unsupported input     */
 /* ────────────────────────────────────────────────────────────────────────── */
 
-#define FBX_IR_VERSION 1u
+/* v1: §13.1 + §13.2 + §13.5 initial (lift+emit for top-30 mod3, dead-flag
+ *     elision, no lazy-flag synthesis).
+ * v2: §13.5 follow-on (#599) — lazy-flag wasm synthesis for ALU ops
+ *     (ADD/SUB/AND/OR/XOR/CMP/TEST × widths 1/2/4/8) + BRANCH_COND emit
+ *     for all 16 Jcc condition codes.  The IR shape is byte-identical to
+ *     v1 (SET_FLAGS_RAW already carried op-kind in imm; BRANCH_COND
+ *     already carried condition code in src1).  The version bump invalidates
+ *     stale Phase 4 sidecars compiled against v1's "refuse" semantics so a
+ *     fresh emit-side pass runs and the cache reflects the larger covered
+ *     surface.  See work/tasks/599-* for the full closure narrative. */
+#define FBX_IR_VERSION 2u
 
 /* ────────────────────────────────────────────────────────────────────────── */
 /* IR opcodes.                                                                */

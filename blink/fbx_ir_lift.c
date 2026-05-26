@@ -528,6 +528,14 @@ static int LiftAlui(struct LiftCtx *ctx, u64 rde, u64 uimm0, int byte_op) {
   flags->opcode = FBX_IR_OP_SET_FLAGS_RAW;
   flags->width = width;
   flags->imm = op; /* records which ALU op set the flags */
+  /* #599 (FBX_IR_VERSION 2): also encode the operand vregs so the emit pass
+   * can compute the flag update without re-walking IR history.  The encoding
+   * is uniform across CMP/non-CMP — emit pass recomputes the i64 result
+   * locally from src1/src2/op for the flag-bit derivation. */
+  flags->src1_kind = FBX_IR_KIND_VREG;
+  flags->src1 = lhs_vreg;
+  flags->src2_kind = FBX_IR_KIND_VREG;
+  flags->src2 = rhs_vreg;
   return 1;
 }
 
@@ -622,6 +630,14 @@ static int LiftAluRR(struct LiftCtx *ctx, u64 rde, u8 op, int byte_op,
   flags->opcode = FBX_IR_OP_SET_FLAGS_RAW;
   flags->width = width;
   flags->imm = op;
+  /* #599 (FBX_IR_VERSION 2): encode operand vregs so the emit pass can
+   * synthesize the lazy-flag wasm without walking back through IR history.
+   * See LiftAlui for the encoding rationale + the version-bump comment in
+   * blink/fbx_ir.h. */
+  flags->src1_kind = FBX_IR_KIND_VREG;
+  flags->src1 = lhs_vreg;
+  flags->src2_kind = FBX_IR_KIND_VREG;
+  flags->src2 = rhs_vreg;
   return 1;
 }
 

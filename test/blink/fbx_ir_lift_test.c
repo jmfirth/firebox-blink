@@ -213,6 +213,55 @@ TEST(FbxIrLift, AddRR) {
   FreeTc(tc);
 }
 
+TEST(FbxIrLift, SetFlagsRawCarriesOperandsV2) {
+  /* #599 (FBX_IR_VERSION 2) — SET_FLAGS_RAW must encode (lhs_vreg, rhs_vreg)
+   * into (src1, src2) so the wasm synthesis can compute the flag update
+   * without re-walking IR history.  This test guards against regression to
+   * v1's "imm-only" encoding.  Both LiftAluRR and LiftAlui have to maintain
+   * this contract — covered by ADD r/m, r (LiftAluRR) below + AluiSubImm
+   * test variant. */
+  struct FbxTcBlock *tc = MakeTc(0x001, 0, 0, 0, 0x400000, 3,
+                                 FBX_TC_KIND_NORMAL);
+  struct FbxIrBlock *ir = fbx_ir_lift(tc);
+  u32 i;
+  int saw_flags = 0;
+  ASSERT_NOTNULL(ir);
+  for (i = 0; i < ir->ninsts; ++i) {
+    if (ir->insts[i].opcode == FBX_IR_OP_SET_FLAGS_RAW) {
+      saw_flags = 1;
+      EXPECT_EQ(FBX_IR_KIND_VREG, ir->insts[i].src1_kind);
+      EXPECT_EQ(FBX_IR_KIND_VREG, ir->insts[i].src2_kind);
+      /* op_kind in imm stays. */
+      EXPECT_EQ((u64)FBX_IR_OP_ADD, ir->insts[i].imm);
+    }
+  }
+  EXPECT_EQ(1, saw_flags);
+  fbx_ir_free(ir);
+  FreeTc(tc);
+}
+
+TEST(FbxIrLift, SetFlagsRawCarriesOperandsV2Alui) {
+  /* Same v2 IR contract for LiftAlui (opcode 0x83 group-1 r/m, imm8). */
+  u64 rde_extra = ((u64)5) << 0; /* ModrmReg=5 → SUB */
+  struct FbxTcBlock *tc = MakeTc(0x083, rde_extra, 0x10, 0, 0x400000, 4,
+                                 FBX_TC_KIND_NORMAL);
+  struct FbxIrBlock *ir = fbx_ir_lift(tc);
+  u32 i;
+  int saw_flags = 0;
+  ASSERT_NOTNULL(ir);
+  for (i = 0; i < ir->ninsts; ++i) {
+    if (ir->insts[i].opcode == FBX_IR_OP_SET_FLAGS_RAW) {
+      saw_flags = 1;
+      EXPECT_EQ(FBX_IR_KIND_VREG, ir->insts[i].src1_kind);
+      EXPECT_EQ(FBX_IR_KIND_VREG, ir->insts[i].src2_kind);
+      EXPECT_EQ((u64)FBX_IR_OP_SUB, ir->insts[i].imm);
+    }
+  }
+  EXPECT_EQ(1, saw_flags);
+  fbx_ir_free(ir);
+  FreeTc(tc);
+}
+
 TEST(FbxIrLift, AluiSubImm) {
   /* opcode 0x83: group 1 r/m, imm8 — pick SUB via ModrmReg=5. */
   u64 rde_extra = ((u64)5) << 0; /* ModrmReg=5 */

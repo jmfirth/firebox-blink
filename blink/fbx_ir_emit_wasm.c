@@ -197,6 +197,38 @@ static void EmitName(struct FbxWasmBuffer *b, const char *s) {
 #define WASM_OP_I64_OR      0x84u
 #define WASM_OP_I64_XOR     0x85u
 
+/* §13.5 follow-on (#599) — lazy-flag synthesis + BRANCH_COND.  Wasm MVP
+ * opcodes only; portable across V8 Liftoff + wasmer Cranelift + JSC + SpiderMonkey.
+ *
+ * The flag-update path uses i32-typed flag-bit values (cf/zf/sf/of/af shifted
+ * into position and OR'd into m->flags) and i64-typed operand-width arithmetic
+ * to compute the bits.  i32.wrap_i64 is the bridge.
+ *
+ * The BRANCH_COND path reads m->flags as i32, masks the relevant bit, then
+ * uses `select` to choose between taken_pc and fallthrough_pc as i64. */
+#define WASM_OP_I32_LOAD    0x28u
+#define WASM_OP_I32_STORE   0x36u
+#define WASM_OP_I32_EQZ     0x45u
+#define WASM_OP_I32_EQ      0x46u
+#define WASM_OP_I32_NE      0x47u
+#define WASM_OP_I32_LT_U    0x49u
+#define WASM_OP_I32_AND     0x71u
+#define WASM_OP_I32_OR      0x72u
+#define WASM_OP_I32_XOR     0x73u
+#define WASM_OP_I32_SHL     0x74u
+#define WASM_OP_I32_SHR_U   0x76u
+#define WASM_OP_I32_WRAP_I64 0xA7u
+#define WASM_OP_I64_EQZ     0x50u
+#define WASM_OP_I64_EQ      0x51u
+#define WASM_OP_I64_NE      0x52u
+#define WASM_OP_I64_LT_U    0x54u
+#define WASM_OP_I64_LT_S    0x53u
+#define WASM_OP_I64_SHL     0x86u
+#define WASM_OP_I64_SHR_U   0x88u
+#define WASM_OP_I64_SHR_S   0x87u
+#define WASM_OP_I64_EXTEND_I32_U 0xADu
+#define WASM_OP_SELECT      0x1Bu
+
 /* ────────────────────────────────────────────────────────────────────────── */
 /* Host-import table.  Names + signatures FIXED at v0.1.                      */
 /*                                                                            */
@@ -298,14 +330,56 @@ static int CoverageGate(const struct FbxIrBlock *ir,
       saw_flag_writer = 1;
     }
   }
-  /* If any flag-reader is present, refuse — the synthesis pass has no
-   * wasm-side flag-shadow representation to feed it. */
-  if (saw_flag_reader) return 0;
+  /* #599 (FBX_IR_VERSION 2): flag-reader-bearing blocks are now emit-eligible.
+   * Two sub-gates apply:
+   *
+   *   - GET_FLAG: deferred to a follow-on (no consumer in v0.1; the lifter
+   *     doesn't emit it as of #596).  Refuse for now.
+   *   - BRANCH_COND: synthesizable for 14 of 16 Jcc predicates (Jcc PF/NP
+   *     deferred — see EmitJccPredicate).  We can't tell predicate ID
+   *     without scanning instructions; accept-then-refuse-at-emit is the
+   *     pattern (mirror the LEA-SIB acceptance gate). */
+  for (i = 0; i < ir->ninsts; ++i) {
+    u8 op = ir->insts[i].opcode;
+    if (op == FBX_IR_OP_GET_FLAG) {
+      return 0; /* deferred — no consumer at v0.1 */
+    }
+  }
+  /* SET_FLAGS_RAW: when a flag-reader follows, the eager-update path is
+   * triggered.  This requires the v2 IR shape (src1/src2 = operand vregs).
+   * Validate that every SET_FLAGS_RAW carries the expected encoding. */
+  if (saw_flag_reader) {
+    for (i = 0; i < ir->ninsts; ++i) {
+      const struct FbxIrInst *p = &ir->insts[i];
+      if (p->opcode == FBX_IR_OP_SET_FLAGS_RAW) {
+        if (p->src1_kind != FBX_IR_KIND_VREG ||
+            p->src2_kind != FBX_IR_KIND_VREG) {
+          /* Stale v1 lift output without operand encoding — refuse. */
+          return 0;
+        }
+        /* Width must be 1/2/4/8 (we use it as i64 shift amount). */
+        if (p->width != 1 && p->width != 2 &&
+            p->width != 4 && p->width != 8) {
+          return 0;
+        }
+        /* op_kind in imm must be one of the supported flag-emitters. */
+        switch ((u8)p->imm) {
+          case FBX_IR_OP_ADD:
+          case FBX_IR_OP_SUB:
+          case FBX_IR_OP_AND:
+          case FBX_IR_OP_OR:
+          case FBX_IR_OP_XOR:
+          case FBX_IR_OP_CMP:
+          case FBX_IR_OP_TEST:
+            break;
+          default:
+            return 0;
+        }
+      }
+    }
+  }
   (void)saw_flag_writer; /* presence-only; no further gating */
-  /* Pass 2 — per-op acceptance.  SET_FLAGS_RAW / CMP / TEST allowed only
-   * because Pass 1 verified no reader follows.  Their emit-side handling
-   * treats them as no-ops (CMP / TEST) or as dropped markers
-   * (SET_FLAGS_RAW). */
+  /* Pass 2 — per-op acceptance. */
   for (i = 0; i < ir->ninsts; ++i) {
     u8 op = ir->insts[i].opcode;
     switch (op) {
@@ -320,9 +394,10 @@ static int CoverageGate(const struct FbxIrBlock *ir,
       case FBX_IR_OP_LEA:
       case FBX_IR_OP_BRANCH_TAKEN:
       case FBX_IR_OP_BAILOUT:
-      case FBX_IR_OP_SET_FLAGS_RAW:  /* §13.5: no-op when no reader follows */
-      case FBX_IR_OP_CMP:            /* §13.5: dead-flag elide */
-      case FBX_IR_OP_TEST:           /* §13.5: dead-flag elide */
+      case FBX_IR_OP_SET_FLAGS_RAW:
+      case FBX_IR_OP_CMP:
+      case FBX_IR_OP_TEST:
+      case FBX_IR_OP_BRANCH_COND:  /* #599: synthesisable for Jcc 0-9, C-F */
         continue;
       default:
         return 0;
@@ -398,6 +473,18 @@ static int CoverageGate(const struct FbxIrBlock *ir,
       case 0x0E9:
       case 0x0EB:
         break;
+      /* #599 — Conditional jumps.  The synthesis pass emits the lazy-flag
+       * + select-based branch decision.  Predicate refusal (Jcc PF/NP)
+       * happens at EmitJccPredicate-emit-time. */
+      case 0x070: case 0x071: case 0x072: case 0x073:
+      case 0x074: case 0x075: case 0x076: case 0x077:
+      case 0x078: case 0x079: case 0x07A: case 0x07B:
+      case 0x07C: case 0x07D: case 0x07E: case 0x07F:
+      case 0x180: case 0x181: case 0x182: case 0x183:
+      case 0x184: case 0x185: case 0x186: case 0x187:
+      case 0x188: case 0x189: case 0x18A: case 0x18B:
+      case 0x18C: case 0x18D: case 0x18E: case 0x18F:
+        break;
       default:
         /* The lifter would have bailed for anything outside the top-10 set;
          * if we reach here with an unsupported mopcode, refuse. */
@@ -442,6 +529,75 @@ static int CoverageGate(const struct FbxIrBlock *ir,
 /* offsetof helpers — baked at C compile time. */
 #define M_OFF_IP    ((u32)offsetof(struct Machine, ip))
 #define M_OFF_WEG   ((u32)offsetof(struct Machine, weg))
+/* #599 — Machine.flags is u32 (eflags register).  Position is compiler-
+ * dependent but offsetof keeps the synthesis pass cross-compiler stable. */
+#define M_OFF_FLAGS ((u32)offsetof(struct Machine, flags))
+
+/* x86 EFLAGS bit positions — duplicated from blink/flags.h to keep this
+ * file standalone (no further include dependency).  Phase 4's offline
+ * emitter uses the same constants; cross-build determinism requires they
+ * stay in sync with blink/flags.h.  See spec §Q5 axis 2. */
+#define EMIT_FLAGS_CF 0u
+#define EMIT_FLAGS_PF 2u
+#define EMIT_FLAGS_AF 4u
+#define EMIT_FLAGS_ZF 6u
+#define EMIT_FLAGS_SF 7u
+#define EMIT_FLAGS_OF 11u
+
+/* Pre-baked AND-mask that clears CF|ZF|SF|OF|AF|0xFF000000 in one i32.const.
+ * Matches blink/alu.c:AluFlags exactly:
+ *   m->flags &= ~(CF | ZF | SF | OF | AF | 0xFF000000u);
+ * Computed:
+ *   ~((1<<0)|(1<<6)|(1<<7)|(1<<11)|(1<<4)|0xFF000000)
+ *   = ~(0x000008D1u | 0xFF000000u)
+ *   = ~0xFF0008D1u
+ *   = 0x00FFF72Eu
+ */
+#define EMIT_FLAGS_CLEAR_MASK 0x00FFF72Eu
+
+/* Scratch local indices (after m_ptr local 0 + nvregs i64 locals).
+ *
+ * The synthesis pass reserves 2 scratch locals at the end of the locals
+ * array when the block needs them (any flag-writing ALU op present).  The
+ * indices below are RELATIVE to `nvregs + 1`; the EmitFunctionBody adds
+ * the offset at call sites.
+ *
+ * SCRATCH_Z holds the width-truncated i64 ALU result during a flag-update
+ * sequence.  SCRATCH_FLAGS holds the i32 new-flags value being built up
+ * before the final i32.store back into m->flags.
+ *
+ * These are PER-block scratch — re-used across multiple ALU ops in the
+ * same lifted block.  Each ALU op's flag-update sequence writes them
+ * before reading.  Wasm doesn't require local init beyond the default-0
+ * fill the validator gives us.
+ */
+#define EMIT_LOCAL_OFF_SCRATCH_Z      0u  /* i64 */
+#define EMIT_LOCAL_OFF_SCRATCH_FLAGS  1u  /* i32 */
+#define EMIT_NUM_SCRATCH_LOCALS       2u
+
+/* Width → sign-bit position (width*8 - 1). */
+static u32 SignBitPos(u8 width) {
+  switch (width) {
+    case 1: return 7u;
+    case 2: return 15u;
+    case 4: return 31u;
+    case 8:
+    default: return 63u;
+  }
+}
+
+/* Width → low-bits mask as i64.  For widths < 8, the wasm i64 result of
+ * arithmetic naturally extends; we mask explicitly to keep the carry/zf
+ * derivation matching x86 width semantics. */
+static u64 WidthMask(u8 width) {
+  switch (width) {
+    case 1: return 0xFFull;
+    case 2: return 0xFFFFull;
+    case 4: return 0xFFFFFFFFull;
+    case 8:
+    default: return 0xFFFFFFFFFFFFFFFFull;
+  }
+}
 
 /* Emit `local.get m_ptr; i32.const reg_offset; i32.add; load.WIDTH` to leave
  * the guest register value on the stack as an i64. */
@@ -635,15 +791,478 @@ static int EmitLea(struct FbxWasmBuffer *body, const struct FbxIrInst *p) {
   return 1;
 }
 
+/* ────────────────────────────────────────────────────────────────────────── */
+/* #599 — Lazy-flag wasm synthesis.                                           */
+/*                                                                            */
+/* Each flag-emitting ALU op (ADD/SUB/AND/OR/XOR/CMP/TEST) generates wasm     */
+/* that matches blink/alu.c's AluFlags() byte-for-byte.  The eager-update    */
+/* representation:                                                            */
+/*                                                                            */
+/*   m->flags &= ~(CF|ZF|SF|OF|AF|0xFF000000u);                              */
+/*   m->flags |= sf<<7 | cf<<0 | (z==0)<<6 | of<<11 | af<<4 | (z&0xFF)<<24;  */
+/*                                                                            */
+/* Per-op derivations (matching the int-width-specific helpers in alu.c):    */
+/*                                                                            */
+/*   ADD: z = (lhs + rhs) & mask                                              */
+/*        cf = z <u rhs                                                       */
+/*        af = (z & 15) <u (rhs & 15)                                         */
+/*        of = ((z^lhs) & (z^rhs)) >> sign_bit_pos                           */
+/*        sf = z >> sign_bit_pos                                              */
+/*                                                                            */
+/*   SUB / CMP: z = (lhs - rhs) & mask                                        */
+/*        cf = lhs <u z                                                       */
+/*        af = (lhs & 15) <u (z & 15)                                         */
+/*        of = ((lhs^rhs) & (z^lhs)) >> sign_bit_pos                         */
+/*        sf = z >> sign_bit_pos                                              */
+/*                                                                            */
+/*   AND / OR / XOR / TEST:                                                   */
+/*        z = (lhs OP rhs) & mask    (AND for TEST)                          */
+/*        cf = 0                                                              */
+/*        af = 0                                                              */
+/*        of = 0                                                              */
+/*        sf = z >> sign_bit_pos                                              */
+/*                                                                            */
+/* The emitted wasm assigns the computed result to SCRATCH_Z (i64) first,    */
+/* then builds the new-flags i32 value into SCRATCH_FLAGS, then writes it    */
+/* back to m->flags.  ZF and PF derive from the final z value.                */
+/*                                                                            */
+/* Width handling: i64 arithmetic naturally width-extends; the explicit     */
+/* mask after each op restores x86 semantics (lower 8/16/32/64 bits used).  */
+/* The sign-bit extraction uses width*8-1 as the shift amount, so the same   */
+/* helper handles all four widths.                                            */
+/* ────────────────────────────────────────────────────────────────────────── */
+
+/* Get the local index of the i64 scratch_z, given nvregs. */
+static u32 ScratchZLocal(u16 nvregs) {
+  return 1u + (u32)nvregs + EMIT_LOCAL_OFF_SCRATCH_Z;
+}
+
+/* Get the local index of the i32 scratch_flags, given nvregs. */
+static u32 ScratchFlagsLocal(u16 nvregs) {
+  return 1u + (u32)nvregs + EMIT_LOCAL_OFF_SCRATCH_FLAGS;
+}
+
+/* Emit code that pushes (vreg_local & width_mask) on the stack as i64.
+ * width is 1/2/4/8; for width 8 no mask is needed but we emit one anyway
+ * for uniformity (i64.const 0xFFFFFFFFFFFFFFFFu + i64.and is a no-op). */
+static void EmitMaskedVreg(struct FbxWasmBuffer *body, u32 vreg_local,
+                           u8 width) {
+  fbx_wasm_buffer_u8(body, WASM_OP_LOCAL_GET);
+  fbx_wasm_buffer_uleb(body, vreg_local);
+  if (width != 8) {
+    fbx_wasm_buffer_u8(body, WASM_OP_I64_CONST);
+    fbx_wasm_buffer_sleb(body, (i64)WidthMask(width));
+    fbx_wasm_buffer_u8(body, WASM_OP_I64_AND);
+  }
+}
+
+/* Emit the AluFlags update wasm.  The caller has ensured the IR op_kind is
+ * one of ADD/SUB/AND/OR/XOR/CMP/TEST.  `lhs_local` and `rhs_local` are the
+ * vreg local indices carrying the i64 operands (already populated by prior
+ * REG_GET emits).
+ *
+ * Postconditions: m->flags written, SCRATCH_Z + SCRATCH_FLAGS locals
+ * clobbered.  No values left on the wasm stack.
+ *
+ * The op_kind selects the ALU op + cf/af/of formulae per the comment block
+ * above.  CMP behaves identically to SUB for flag purposes (same formula);
+ * TEST behaves identically to AND (cf=0/af=0/of=0; only sf/zf vary).
+ */
+static void EmitFlagsAfterAlu(struct FbxWasmBuffer *body, u16 nvregs,
+                              u8 op_kind, u32 lhs_local, u32 rhs_local,
+                              u8 width) {
+  u32 scratch_z = ScratchZLocal(nvregs);
+  u32 scratch_flags = ScratchFlagsLocal(nvregs);
+  u32 sign_pos = SignBitPos(width);
+  int is_sub_like = (op_kind == FBX_IR_OP_SUB || op_kind == FBX_IR_OP_CMP);
+  int is_add = (op_kind == FBX_IR_OP_ADD);
+  int is_logical = (op_kind == FBX_IR_OP_AND || op_kind == FBX_IR_OP_OR ||
+                    op_kind == FBX_IR_OP_XOR || op_kind == FBX_IR_OP_TEST);
+
+  /* Step 1: compute z = (lhs OP rhs) & width_mask, save in scratch_z. */
+  EmitMaskedVreg(body, lhs_local, width);
+  EmitMaskedVreg(body, rhs_local, width);
+  switch (op_kind) {
+    case FBX_IR_OP_ADD:
+      fbx_wasm_buffer_u8(body, WASM_OP_I64_ADD);
+      break;
+    case FBX_IR_OP_SUB:
+    case FBX_IR_OP_CMP:
+      fbx_wasm_buffer_u8(body, WASM_OP_I64_SUB);
+      break;
+    case FBX_IR_OP_AND:
+    case FBX_IR_OP_TEST:
+      fbx_wasm_buffer_u8(body, WASM_OP_I64_AND);
+      break;
+    case FBX_IR_OP_OR:
+      fbx_wasm_buffer_u8(body, WASM_OP_I64_OR);
+      break;
+    case FBX_IR_OP_XOR:
+      fbx_wasm_buffer_u8(body, WASM_OP_I64_XOR);
+      break;
+    default:
+      /* Caller violated precondition.  Emit a no-op (i64.drop equivalent
+       * would leave stack dirty; emit a constant + drop instead).  In
+       * practice the caller's switch must match this one's cases — keep
+       * here as defensive zero. */
+      fbx_wasm_buffer_u8(body, WASM_OP_I64_AND);
+      break;
+  }
+  if (width != 8) {
+    fbx_wasm_buffer_u8(body, WASM_OP_I64_CONST);
+    fbx_wasm_buffer_sleb(body, (i64)WidthMask(width));
+    fbx_wasm_buffer_u8(body, WASM_OP_I64_AND);
+  }
+  fbx_wasm_buffer_u8(body, WASM_OP_LOCAL_SET);
+  fbx_wasm_buffer_uleb(body, scratch_z);
+
+  /* Step 2: build the new flags value into scratch_flags.
+   *   start with (old_flags & EMIT_FLAGS_CLEAR_MASK). */
+  fbx_wasm_buffer_u8(body, WASM_OP_LOCAL_GET);
+  fbx_wasm_buffer_uleb(body, 0); /* m_ptr */
+  fbx_wasm_buffer_u8(body, WASM_OP_I32_LOAD);
+  fbx_wasm_buffer_uleb(body, 2); /* align log2 for i32 */
+  fbx_wasm_buffer_uleb(body, M_OFF_FLAGS);
+  fbx_wasm_buffer_u8(body, WASM_OP_I32_CONST);
+  fbx_wasm_buffer_sleb(body, (i64)(i32)EMIT_FLAGS_CLEAR_MASK);
+  fbx_wasm_buffer_u8(body, WASM_OP_I32_AND);
+  fbx_wasm_buffer_u8(body, WASM_OP_LOCAL_SET);
+  fbx_wasm_buffer_uleb(body, scratch_flags);
+
+  /* Step 3: ZF — (z == 0) << FLAGS_ZF.  i64.eqz returns i32 (0 or 1). */
+  fbx_wasm_buffer_u8(body, WASM_OP_LOCAL_GET);
+  fbx_wasm_buffer_uleb(body, scratch_flags);
+  fbx_wasm_buffer_u8(body, WASM_OP_LOCAL_GET);
+  fbx_wasm_buffer_uleb(body, scratch_z);
+  fbx_wasm_buffer_u8(body, WASM_OP_I64_EQZ);
+  fbx_wasm_buffer_u8(body, WASM_OP_I32_CONST);
+  fbx_wasm_buffer_sleb(body, (i64)EMIT_FLAGS_ZF);
+  fbx_wasm_buffer_u8(body, WASM_OP_I32_SHL);
+  fbx_wasm_buffer_u8(body, WASM_OP_I32_OR);
+  fbx_wasm_buffer_u8(body, WASM_OP_LOCAL_SET);
+  fbx_wasm_buffer_uleb(body, scratch_flags);
+
+  /* Step 4: SF — (z >> sign_pos) << FLAGS_SF.  i64.shr_u → i32.wrap_i64. */
+  fbx_wasm_buffer_u8(body, WASM_OP_LOCAL_GET);
+  fbx_wasm_buffer_uleb(body, scratch_flags);
+  fbx_wasm_buffer_u8(body, WASM_OP_LOCAL_GET);
+  fbx_wasm_buffer_uleb(body, scratch_z);
+  fbx_wasm_buffer_u8(body, WASM_OP_I64_CONST);
+  fbx_wasm_buffer_sleb(body, (i64)sign_pos);
+  fbx_wasm_buffer_u8(body, WASM_OP_I64_SHR_U);
+  fbx_wasm_buffer_u8(body, WASM_OP_I32_WRAP_I64);
+  fbx_wasm_buffer_u8(body, WASM_OP_I32_CONST);
+  fbx_wasm_buffer_sleb(body, (i64)EMIT_FLAGS_SF);
+  fbx_wasm_buffer_u8(body, WASM_OP_I32_SHL);
+  fbx_wasm_buffer_u8(body, WASM_OP_I32_OR);
+  fbx_wasm_buffer_u8(body, WASM_OP_LOCAL_SET);
+  fbx_wasm_buffer_uleb(body, scratch_flags);
+
+  /* Step 5: CF.
+   *   ADD-like: cf = z <u rhs_masked
+   *   SUB-like: cf = lhs_masked <u z
+   *   logical:  cf = 0  (skip emit)
+   */
+  if (is_add || is_sub_like) {
+    fbx_wasm_buffer_u8(body, WASM_OP_LOCAL_GET);
+    fbx_wasm_buffer_uleb(body, scratch_flags);
+    if (is_add) {
+      fbx_wasm_buffer_u8(body, WASM_OP_LOCAL_GET);
+      fbx_wasm_buffer_uleb(body, scratch_z);
+      EmitMaskedVreg(body, rhs_local, width);
+    } else {
+      EmitMaskedVreg(body, lhs_local, width);
+      fbx_wasm_buffer_u8(body, WASM_OP_LOCAL_GET);
+      fbx_wasm_buffer_uleb(body, scratch_z);
+    }
+    fbx_wasm_buffer_u8(body, WASM_OP_I64_LT_U);
+    /* CF is bit 0, no shift needed. */
+    fbx_wasm_buffer_u8(body, WASM_OP_I32_OR);
+    fbx_wasm_buffer_u8(body, WASM_OP_LOCAL_SET);
+    fbx_wasm_buffer_uleb(body, scratch_flags);
+  }
+
+  /* Step 6: OF.
+   *   ADD: of = ((z^lhs) & (z^rhs)) >> sign_pos
+   *   SUB: of = ((lhs^rhs) & (z^lhs)) >> sign_pos
+   *   logical: of = 0 (skip)
+   */
+  if (is_add || is_sub_like) {
+    fbx_wasm_buffer_u8(body, WASM_OP_LOCAL_GET);
+    fbx_wasm_buffer_uleb(body, scratch_flags);
+    if (is_add) {
+      /* (z ^ lhs_masked) */
+      fbx_wasm_buffer_u8(body, WASM_OP_LOCAL_GET);
+      fbx_wasm_buffer_uleb(body, scratch_z);
+      EmitMaskedVreg(body, lhs_local, width);
+      fbx_wasm_buffer_u8(body, WASM_OP_I64_XOR);
+      /* (z ^ rhs_masked) */
+      fbx_wasm_buffer_u8(body, WASM_OP_LOCAL_GET);
+      fbx_wasm_buffer_uleb(body, scratch_z);
+      EmitMaskedVreg(body, rhs_local, width);
+      fbx_wasm_buffer_u8(body, WASM_OP_I64_XOR);
+    } else {
+      /* (lhs_masked ^ rhs_masked) */
+      EmitMaskedVreg(body, lhs_local, width);
+      EmitMaskedVreg(body, rhs_local, width);
+      fbx_wasm_buffer_u8(body, WASM_OP_I64_XOR);
+      /* (z ^ lhs_masked) */
+      fbx_wasm_buffer_u8(body, WASM_OP_LOCAL_GET);
+      fbx_wasm_buffer_uleb(body, scratch_z);
+      EmitMaskedVreg(body, lhs_local, width);
+      fbx_wasm_buffer_u8(body, WASM_OP_I64_XOR);
+    }
+    fbx_wasm_buffer_u8(body, WASM_OP_I64_AND);
+    fbx_wasm_buffer_u8(body, WASM_OP_I64_CONST);
+    fbx_wasm_buffer_sleb(body, (i64)sign_pos);
+    fbx_wasm_buffer_u8(body, WASM_OP_I64_SHR_U);
+    fbx_wasm_buffer_u8(body, WASM_OP_I32_WRAP_I64);
+    fbx_wasm_buffer_u8(body, WASM_OP_I32_CONST);
+    fbx_wasm_buffer_sleb(body, (i64)EMIT_FLAGS_OF);
+    fbx_wasm_buffer_u8(body, WASM_OP_I32_SHL);
+    fbx_wasm_buffer_u8(body, WASM_OP_I32_OR);
+    fbx_wasm_buffer_u8(body, WASM_OP_LOCAL_SET);
+    fbx_wasm_buffer_uleb(body, scratch_flags);
+  }
+
+  /* Step 7: AF.
+   *   ADD: af = (z & 15) <u (rhs_masked & 15)
+   *   SUB: af = (lhs_masked & 15) <u (z & 15)
+   *   logical: af = 0 (skip)
+   */
+  if (is_add || is_sub_like) {
+    fbx_wasm_buffer_u8(body, WASM_OP_LOCAL_GET);
+    fbx_wasm_buffer_uleb(body, scratch_flags);
+    if (is_add) {
+      fbx_wasm_buffer_u8(body, WASM_OP_LOCAL_GET);
+      fbx_wasm_buffer_uleb(body, scratch_z);
+      fbx_wasm_buffer_u8(body, WASM_OP_I64_CONST);
+      fbx_wasm_buffer_sleb(body, 15);
+      fbx_wasm_buffer_u8(body, WASM_OP_I64_AND);
+      EmitMaskedVreg(body, rhs_local, width);
+      fbx_wasm_buffer_u8(body, WASM_OP_I64_CONST);
+      fbx_wasm_buffer_sleb(body, 15);
+      fbx_wasm_buffer_u8(body, WASM_OP_I64_AND);
+    } else {
+      EmitMaskedVreg(body, lhs_local, width);
+      fbx_wasm_buffer_u8(body, WASM_OP_I64_CONST);
+      fbx_wasm_buffer_sleb(body, 15);
+      fbx_wasm_buffer_u8(body, WASM_OP_I64_AND);
+      fbx_wasm_buffer_u8(body, WASM_OP_LOCAL_GET);
+      fbx_wasm_buffer_uleb(body, scratch_z);
+      fbx_wasm_buffer_u8(body, WASM_OP_I64_CONST);
+      fbx_wasm_buffer_sleb(body, 15);
+      fbx_wasm_buffer_u8(body, WASM_OP_I64_AND);
+    }
+    fbx_wasm_buffer_u8(body, WASM_OP_I64_LT_U);
+    fbx_wasm_buffer_u8(body, WASM_OP_I32_CONST);
+    fbx_wasm_buffer_sleb(body, (i64)EMIT_FLAGS_AF);
+    fbx_wasm_buffer_u8(body, WASM_OP_I32_SHL);
+    fbx_wasm_buffer_u8(body, WASM_OP_I32_OR);
+    fbx_wasm_buffer_u8(body, WASM_OP_LOCAL_SET);
+    fbx_wasm_buffer_uleb(body, scratch_flags);
+  }
+  (void)is_logical; /* logical ops skip CF/OF/AF emit; just SF + ZF + lazy-PF */
+
+  /* Step 8: lazy-PF byte: (z & 0xFF) << 24. */
+  fbx_wasm_buffer_u8(body, WASM_OP_LOCAL_GET);
+  fbx_wasm_buffer_uleb(body, scratch_flags);
+  fbx_wasm_buffer_u8(body, WASM_OP_LOCAL_GET);
+  fbx_wasm_buffer_uleb(body, scratch_z);
+  fbx_wasm_buffer_u8(body, WASM_OP_I64_CONST);
+  fbx_wasm_buffer_sleb(body, 0xFF);
+  fbx_wasm_buffer_u8(body, WASM_OP_I64_AND);
+  fbx_wasm_buffer_u8(body, WASM_OP_I32_WRAP_I64);
+  fbx_wasm_buffer_u8(body, WASM_OP_I32_CONST);
+  fbx_wasm_buffer_sleb(body, 24);
+  fbx_wasm_buffer_u8(body, WASM_OP_I32_SHL);
+  fbx_wasm_buffer_u8(body, WASM_OP_I32_OR);
+  fbx_wasm_buffer_u8(body, WASM_OP_LOCAL_SET);
+  fbx_wasm_buffer_uleb(body, scratch_flags);
+
+  /* Step 9: store scratch_flags → m->flags. */
+  fbx_wasm_buffer_u8(body, WASM_OP_LOCAL_GET);
+  fbx_wasm_buffer_uleb(body, 0); /* m_ptr */
+  fbx_wasm_buffer_u8(body, WASM_OP_LOCAL_GET);
+  fbx_wasm_buffer_uleb(body, scratch_flags);
+  fbx_wasm_buffer_u8(body, WASM_OP_I32_STORE);
+  fbx_wasm_buffer_uleb(body, 2); /* align log2 for i32 */
+  fbx_wasm_buffer_uleb(body, M_OFF_FLAGS);
+}
+
+/* ────────────────────────────────────────────────────────────────────────── */
+/* #599 — BRANCH_COND wasm synthesis.                                         */
+/*                                                                            */
+/* Reads m->flags as i32, evaluates the per-condition predicate, then         */
+/* uses wasm `select` to choose between taken_pc and fallthrough_pc.  The     */
+/* chosen i64 is stored into m->ip.  Block terminator (returns 0).            */
+/*                                                                            */
+/* Condition encoding from x86 Jcc opcode low-nibble (Intel SDM Vol 1 §B.1): */
+/*   0 = O   (OF=1)             8 = S   (SF=1)                               */
+/*   1 = NO  (OF=0)             9 = NS  (SF=0)                               */
+/*   2 = B   (CF=1)             A = P   (PF=1)                               */
+/*   3 = NB  (CF=0)             B = NP  (PF=0)                               */
+/*   4 = Z   (ZF=1)             C = L   (SF!=OF)                             */
+/*   5 = NZ  (ZF=0)             D = NL  (SF==OF)                             */
+/*   6 = BE  (CF=1 or ZF=1)     E = LE  (ZF=1 or SF!=OF)                     */
+/*   7 = A   (CF=0 and ZF=0)    F = G   (ZF=0 and SF==OF)                    */
+/*                                                                            */
+/* Each predicate evaluates to an i32 (0 or non-zero); `select` consumes 3   */
+/* values [v1, v2, cond] and pushes v1 if cond≠0 else v2.  We pre-place the  */
+/* (taken_pc, fallthrough_pc) operands then push the predicate.              */
+/* ────────────────────────────────────────────────────────────────────────── */
+
+/* Emit code that loads m->flags as i32 onto the stack. */
+static void EmitLoadFlags(struct FbxWasmBuffer *body) {
+  fbx_wasm_buffer_u8(body, WASM_OP_LOCAL_GET);
+  fbx_wasm_buffer_uleb(body, 0); /* m_ptr */
+  fbx_wasm_buffer_u8(body, WASM_OP_I32_LOAD);
+  fbx_wasm_buffer_uleb(body, 2); /* align log2 */
+  fbx_wasm_buffer_uleb(body, M_OFF_FLAGS);
+}
+
+/* Emit code that pushes (flags >> bit_pos) & 1 as i32 onto the stack. */
+static void EmitFlagBit(struct FbxWasmBuffer *body, u32 bit_pos) {
+  EmitLoadFlags(body);
+  fbx_wasm_buffer_u8(body, WASM_OP_I32_CONST);
+  fbx_wasm_buffer_sleb(body, (i64)bit_pos);
+  fbx_wasm_buffer_u8(body, WASM_OP_I32_SHR_U);
+  fbx_wasm_buffer_u8(body, WASM_OP_I32_CONST);
+  fbx_wasm_buffer_sleb(body, 1);
+  fbx_wasm_buffer_u8(body, WASM_OP_I32_AND);
+}
+
+/* Emit code that pushes the i32 (0 or 1) value of the Jcc predicate
+ * for `cond_id` (0-15).  See the table above. */
+static int EmitJccPredicate(struct FbxWasmBuffer *body, u32 cond_id) {
+  /* cond_id bit 0 == 1 means "invert" — odd-numbered conditions are
+   * the NOT of the prior even one.  Compute the base predicate, then
+   * XOR with 1 if odd. */
+  u32 base = cond_id & 0xFEu;
+  switch (base) {
+    case 0x0: /* O / NO  — OF */
+      EmitFlagBit(body, EMIT_FLAGS_OF);
+      break;
+    case 0x2: /* B / NB  — CF */
+      EmitFlagBit(body, EMIT_FLAGS_CF);
+      break;
+    case 0x4: /* Z / NZ  — ZF */
+      EmitFlagBit(body, EMIT_FLAGS_ZF);
+      break;
+    case 0x6: /* BE / A  — CF or ZF */
+      EmitFlagBit(body, EMIT_FLAGS_CF);
+      EmitFlagBit(body, EMIT_FLAGS_ZF);
+      fbx_wasm_buffer_u8(body, WASM_OP_I32_OR);
+      break;
+    case 0x8: /* S / NS  — SF */
+      EmitFlagBit(body, EMIT_FLAGS_SF);
+      break;
+    case 0xA: /* P / NP  — PF (lazy parity from low byte) */
+      /* PF semantics in Blink: GetParity((flags >> 24) & 0xFF).  Lazy.
+       * The wasm-side computation is non-trivial (parity-of-byte).
+       * v0.1 of #599 refuses Jcc PF/NP — extremely rare in compiler-
+       * emitted code; defer to a follow-on.  Return 0 to signal refusal. */
+      return 0;
+    case 0xC: /* L / NL  — SF != OF */
+      EmitFlagBit(body, EMIT_FLAGS_SF);
+      EmitFlagBit(body, EMIT_FLAGS_OF);
+      fbx_wasm_buffer_u8(body, WASM_OP_I32_XOR);
+      break;
+    case 0xE: /* LE / G  — ZF or (SF != OF) */
+      EmitFlagBit(body, EMIT_FLAGS_ZF);
+      EmitFlagBit(body, EMIT_FLAGS_SF);
+      EmitFlagBit(body, EMIT_FLAGS_OF);
+      fbx_wasm_buffer_u8(body, WASM_OP_I32_XOR);
+      fbx_wasm_buffer_u8(body, WASM_OP_I32_OR);
+      break;
+    default:
+      return 0;
+  }
+  /* Invert for odd cond_id. */
+  if (cond_id & 1u) {
+    fbx_wasm_buffer_u8(body, WASM_OP_I32_EQZ);
+  }
+  return 1;
+}
+
+/* Lower a BRANCH_COND IR inst.  Returns 1 on success, 0 if the predicate
+ * isn't synthesisable (Jcc PF/NP at v0.1). */
+static int EmitBranchCond(struct FbxWasmBuffer *body,
+                          const struct FbxIrInst *p) {
+  u64 taken_pc = p->imm;
+  /* fallthrough_pc is encoded as the low 32 bits of src2 (per the lifter
+   * in LiftJcc).  Sign-extension is irrelevant — we treat it as unsigned
+   * absolute PC. */
+  u64 fallthrough_pc = (u64)(u32)p->src2;
+  u32 cond_id = p->src1; /* low nibble of mopcode */
+  /* Push m_ptr for the eventual i64.store at m->ip. */
+  fbx_wasm_buffer_u8(body, WASM_OP_LOCAL_GET);
+  fbx_wasm_buffer_uleb(body, 0);
+  /* Push taken_pc (operand 1 of select). */
+  fbx_wasm_buffer_u8(body, WASM_OP_I64_CONST);
+  fbx_wasm_buffer_sleb(body, (i64)taken_pc);
+  /* Push fallthrough_pc (operand 2 of select). */
+  fbx_wasm_buffer_u8(body, WASM_OP_I64_CONST);
+  fbx_wasm_buffer_sleb(body, (i64)fallthrough_pc);
+  /* Push predicate (cond, i32; non-zero ⇒ taken_pc). */
+  if (!EmitJccPredicate(body, cond_id)) {
+    return 0;
+  }
+  /* select pops [v1, v2, cond] and pushes v1 if cond, else v2.  Result
+   * is i64 (the operand type). */
+  fbx_wasm_buffer_u8(body, WASM_OP_SELECT);
+  /* Store the chosen i64 to m->ip. */
+  fbx_wasm_buffer_u8(body, WASM_OP_I64_STORE);
+  fbx_wasm_buffer_uleb(body, 3);
+  fbx_wasm_buffer_uleb(body, M_OFF_IP);
+  /* Block terminator: return exit=0 (normal control transfer).  Note
+   * that Tier 1 will re-resolve the PC; this matches BRANCH_TAKEN. */
+  fbx_wasm_buffer_u8(body, WASM_OP_I32_CONST);
+  fbx_wasm_buffer_sleb(body, 0);
+  fbx_wasm_buffer_u8(body, WASM_OP_RETURN);
+  return 1;
+}
+
+/* Decide whether this block needs the i64 + i32 scratch locals reserved
+ * after the vreg block.  Any flag-reader (BRANCH_COND) is the trigger;
+ * dead-flag-elision blocks (SET_FLAGS_RAW with no reader) still skip
+ * scratch reservation because EmitFunctionBody drops SET_FLAGS_RAW in
+ * that case (preserving the §13.5 fast-path).
+ *
+ * §599: blocks with a flag-reader present trigger the eager-update path;
+ * every SET_FLAGS_RAW in such a block expands into the AluFlags emit
+ * sequence and needs scratch_z + scratch_flags.
+ */
+static int BlockNeedsScratchLocals(const struct FbxIrBlock *ir) {
+  u32 i;
+  for (i = 0; i < ir->ninsts; ++i) {
+    u8 op = ir->insts[i].opcode;
+    if (op == FBX_IR_OP_BRANCH_COND || op == FBX_IR_OP_GET_FLAG) return 1;
+  }
+  return 0;
+}
+
 /* Emit the function body for one IR block.  Returns 1 on success, 0 on
  * unsupported op encountered mid-emission (caller frees scratch). */
 static int EmitFunctionBody(struct FbxWasmBuffer *body,
                             const struct FbxIrBlock *ir) {
   u32 i;
   int terminated = 0;
-  /* Locals declaration: 1 group of nvregs i64s.  (If nvregs == 0 we still
-   * emit "0 local groups" — valid wasm.) */
-  if (ir->nvregs > 0) {
+  int needs_scratch = BlockNeedsScratchLocals(ir);
+  /* Locals declaration.  When the block needs scratch locals (#599 path),
+   * emit two groups: vregs as i64, then a pair (i64 scratch_z, i32
+   * scratch_flags).  Wasm encodes per-group as (count, valtype); separate
+   * groups are required because the types differ. */
+  if (needs_scratch) {
+    /* Group 1: nvregs i64s + 1 more i64 for scratch_z.  Combining them
+     * into one group is byte-cheaper than two separate i64 groups. */
+    fbx_wasm_buffer_uleb(body, 2); /* 2 groups */
+    fbx_wasm_buffer_uleb(body, (u64)ir->nvregs + 1u);
+    fbx_wasm_buffer_u8(body, WASM_VALTYPE_I64);
+    /* Group 2: 1 i32 for scratch_flags. */
+    fbx_wasm_buffer_uleb(body, 1);
+    fbx_wasm_buffer_u8(body, WASM_VALTYPE_I32);
+  } else if (ir->nvregs > 0) {
     fbx_wasm_buffer_uleb(body, 1);
     fbx_wasm_buffer_uleb(body, ir->nvregs);
     fbx_wasm_buffer_u8(body, WASM_VALTYPE_I64);
@@ -657,14 +1276,36 @@ static int EmitFunctionBody(struct FbxWasmBuffer *body,
         /* No code emitted at v0.1.  Future: emit a custom section entry or
          * a debug intrinsic. */
         break;
-      case FBX_IR_OP_SET_FLAGS_RAW:
+      case FBX_IR_OP_SET_FLAGS_RAW: {
+        /* §13.5 (v1): dead-flag elision — when no flag-reader follows in
+         * the block, the SET_FLAGS_RAW is a no-op and we drop it at emit
+         * time.
+         *
+         * #599 (v2 / FBX_IR_VERSION 2): when a flag-reader is present in
+         * the same block, the eager-update path emits the wasm that
+         * matches blink/alu.c:AluFlags byte-for-byte.  The IR encoding
+         * carries (op_kind in imm) + (lhs_vreg in src1) + (rhs_vreg in
+         * src2) + (width in width) — see LiftAlui + LiftAluRR. */
+        if (!needs_scratch) break; /* dead-flag elision path */
+        if (p->src1_kind != FBX_IR_KIND_VREG ||
+            p->src2_kind != FBX_IR_KIND_VREG) {
+          return 0; /* malformed IR */
+        }
+        EmitFlagsAfterAlu(body, ir->nvregs, (u8)p->imm,
+                          VregLocal(p->src1), VregLocal(p->src2),
+                          p->width ? p->width : 8u);
+        break;
+      }
       case FBX_IR_OP_CMP:
       case FBX_IR_OP_TEST:
-        /* §13.5 — no code emitted for these when CoverageGate has
-         * verified no flag-reader follows in the block.  Pass 1 of the
-         * gate enforces the invariant; here we treat them as semantic
-         * markers that consume no emitter state.  When #597 lands the
-         * lazy-flag wasm representation, these grow real emit logic. */
+        /* CMP / TEST: no register write.  The flag update happens at the
+         * subsequent SET_FLAGS_RAW.  No code emitted for the ALU op
+         * itself — the flag computation re-derives the result from
+         * lhs/rhs/op_kind in EmitFlagsAfterAlu. */
+        break;
+      case FBX_IR_OP_BRANCH_COND:
+        if (!EmitBranchCond(body, p)) return 0;
+        terminated = 1;
         break;
       case FBX_IR_OP_REG_GET: {
         /* dst is a vreg local; src1 is a guest register. */

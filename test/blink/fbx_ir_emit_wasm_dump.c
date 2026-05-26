@@ -375,6 +375,55 @@ static int DumpAluAddFromLift(const char *dir) {
   return rc;
 }
 
+/* #599 — generic helper: lift a 2-instruction block (flag-writer + Jcc) and
+ * dump to <dir>/<filename>.wasm.  This is the post-#599 emit surface. */
+static int Dump599FlagJcc(const char *dir, const char *filename, u64 alu_mop,
+                          u64 alu_rde, u64 jcc_mop) {
+  /* Build 2-entry TC: ALU op + Jcc.  IPs are chosen so end of ALU op (oplen=3)
+   * matches start of Jcc, satisfying the lifter's adjacency invariant. */
+  struct FbxTcBlock *b = (struct FbxTcBlock *)calloc(1, sizeof *b);
+  struct FbxIrBlock *ir;
+  struct FbxWasmBuffer out;
+  char path[1024];
+  int rc;
+  b->start_pc = 0x10000;
+  b->end_pc = 0x10005;
+  b->page = 0x10000;
+  b->nentries = 2;
+  b->entries = (struct FbxTcEntry *)calloc(2, sizeof(struct FbxTcEntry));
+  b->entries[0].ip = 0x10000;
+  b->entries[0].rde = (alu_mop << 050) | alu_rde;
+  b->entries[0].oplen = 3;
+  b->entries[0].kind = FBX_TC_KIND_NORMAL;
+  b->entries[1].ip = 0x10003;
+  b->entries[1].rde = (jcc_mop << 050);
+  b->entries[1].disp = 0x10;
+  b->entries[1].oplen = 2;
+  b->entries[1].kind = FBX_TC_KIND_NORMAL;
+  ir = fbx_ir_lift(b);
+  if (!ir) {
+    fprintf(stderr, "%s: lift failed\n", filename);
+    free(b->entries);
+    free(b);
+    return 0;
+  }
+  fbx_wasm_buffer_init(&out);
+  if (!fbx_ir_emit_wasm(ir, b, &out)) {
+    fprintf(stderr, "%s: synthesis refused\n", filename);
+    fbx_ir_free(ir);
+    free(b->entries);
+    free(b);
+    return 0;
+  }
+  snprintf(path, sizeof path, "%s/%s.wasm", dir, filename);
+  rc = WriteFile(path, out.data, out.len);
+  fbx_wasm_buffer_free(&out);
+  fbx_ir_free(ir);
+  free(b->entries);
+  free(b);
+  return rc;
+}
+
 int main(int argc, char **argv) {
   const char *dir;
   if (argc < 2) {
@@ -391,6 +440,17 @@ int main(int argc, char **argv) {
   /* §13.5 additions */
   if (!DumpMovzx(dir)) return 1;
   if (!DumpAluAddFromLift(dir)) return 1;
-  fprintf(stdout, "wrote 8 modules to %s\n", dir);
+  /* #599 — lazy-flag synthesis + BRANCH_COND.  These exercise the
+   * SET_FLAGS_RAW eager-update path for several (op_kind, jcc_cond)
+   * combinations and the BRANCH_COND select-based dispatch. */
+  if (!Dump599FlagJcc(dir, "599_add_je", 0x001, RDE_MOD3, 0x074)) return 1;
+  if (!Dump599FlagJcc(dir, "599_sub_jne", 0x029, RDE_MOD3, 0x075)) return 1;
+  if (!Dump599FlagJcc(dir, "599_and_jz", 0x021, RDE_MOD3, 0x074)) return 1;
+  if (!Dump599FlagJcc(dir, "599_xor_jo", 0x031, RDE_MOD3, 0x070)) return 1;
+  if (!Dump599FlagJcc(dir, "599_cmp_jb", 0x039, RDE_MOD3, 0x072)) return 1;
+  if (!Dump599FlagJcc(dir, "599_test_jbe", 0x085, RDE_MOD3, 0x076)) return 1;
+  if (!Dump599FlagJcc(dir, "599_add_jl", 0x001, RDE_MOD3, 0x07C)) return 1;
+  if (!Dump599FlagJcc(dir, "599_cmp_jle", 0x039, RDE_MOD3, 0x07E)) return 1;
+  fprintf(stdout, "wrote 16 modules to %s\n", dir);
   return 0;
 }
