@@ -151,6 +151,11 @@ o/$(MODE)/powerpc64le/test/blink/ldbl_test.com: o/$(MODE)/powerpc64le/test/blink
 
 o/$(MODE)/test/blink/disinst_test.com: o/$(MODE)/test/blink/disinst_test.o o/$(MODE)/blink/blink.a
 	$(CC) $(LDFLAGS) $(TARGET_ARCH) $^ $(LOADLIBES) $(LDLIBS) -o $@
+
+# Firebox §13.1 — IR + lifting pass unit tests.  Host-only (the test exercises
+# only the lifter, which is pure C; no need for cross-toolchain coverage).
+o/$(MODE)/test/blink/fbx_ir_lift_test.com: o/$(MODE)/test/blink/fbx_ir_lift_test.o o/$(MODE)/blink/blink.a
+	$(CC) $(LDFLAGS) $(TARGET_ARCH) $^ $(LOADLIBES) $(LDLIBS) -o $@
 o/$(MODE)/i486/test/blink/disinst_test.com: o/$(MODE)/i486/test/blink/disinst_test.o o/$(MODE)/i486/blink/blink.a
 	o/third_party/gcc/i486/bin/i486-linux-musl-gcc -static $(LDFLAGS) $(TARGET_ARCH) $^ $(LOADLIBES) $(LDLIBS) -o $@
 o/$(MODE)/m68k/test/blink/disinst_test.com: o/$(MODE)/m68k/test/blink/disinst_test.o o/$(MODE)/m68k/blink/blink.a
@@ -186,7 +191,8 @@ o/$(MODE)/test/blink:							\
 		o/$(MODE)/test/blink/modrm_test.com.runs		\
 		o/$(MODE)/test/blink/x86_test.com.runs			\
 		o/$(MODE)/test/blink/ldbl_test.com.runs			\
-		o/$(MODE)/test/blink/disinst_test.com.runs
+		o/$(MODE)/test/blink/disinst_test.com.runs		\
+		o/$(MODE)/test/blink/fbx_ir_lift_test.com.runs
 
 o/$(MODE)/test/blink/emulates:						\
 		o/$(MODE)/blink/blink					\
