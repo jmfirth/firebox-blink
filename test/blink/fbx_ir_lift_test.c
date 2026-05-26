@@ -477,3 +477,247 @@ TEST(FbxIrLift, MultiInstBlock) {
 TEST(FbxIrLift, NullInputReturnsNull) {
   EXPECT_EQ(0, (i64)(intptr_t)fbx_ir_lift(NULL));
 }
+
+/* ────────────────────────────────────────────────────────────────────────── */
+/* §13.5 — Mirror-direction ALU forms (lift extension).                       */
+/*                                                                            */
+/* These mopcodes were previously routed to the default-case BAILOUT path     */
+/* and the runtime stayed on Tier 1.  After §13.5, the lifter produces       */
+/* full IR (REG_GET x2 + ALU + REG_SET? + SET_FLAGS_RAW) and the synthesis    */
+/* pass refuses on SET_FLAGS_RAW — runtime still stays on Tier 1, but the     */
+/* IR is now available for #597's lazy-flag work and Phase 4 reachability.    */
+/* The tests below validate the IR shape, NOT the synthesis (separate test    */
+/* file).                                                                     */
+/* ────────────────────────────────────────────────────────────────────────── */
+
+TEST(FbxIrLift, MirrorAddRRm) {
+  /* opcode 0x003: ADD r, r/m.  Lift to REG_GET x2 + ADD + REG_SET + flags. */
+  struct FbxTcBlock *tc = MakeTc(0x003, 0, 0, 0, 0x400000, 3,
+                                 FBX_TC_KIND_NORMAL);
+  struct FbxIrBlock *ir = fbx_ir_lift(tc);
+  ASSERT_NOTNULL(ir);
+  EXPECT_NE(0, BlockHas(ir, FBX_IR_OP_ADD));
+  EXPECT_NE(0, BlockHas(ir, FBX_IR_OP_REG_GET));
+  EXPECT_NE(0, BlockHas(ir, FBX_IR_OP_REG_SET));
+  EXPECT_NE(0, BlockHas(ir, FBX_IR_OP_SET_FLAGS_RAW));
+  EXPECT_EQ(0, BlockHas(ir, FBX_IR_OP_BAILOUT));
+  fbx_ir_free(ir);
+  FreeTc(tc);
+}
+
+TEST(FbxIrLift, MirrorSubRRm) {
+  /* opcode 0x02B: SUB r, r/m. */
+  struct FbxTcBlock *tc = MakeTc(0x02B, 0, 0, 0, 0x400000, 3,
+                                 FBX_TC_KIND_NORMAL);
+  struct FbxIrBlock *ir = fbx_ir_lift(tc);
+  ASSERT_NOTNULL(ir);
+  EXPECT_NE(0, BlockHas(ir, FBX_IR_OP_SUB));
+  EXPECT_NE(0, BlockHas(ir, FBX_IR_OP_SET_FLAGS_RAW));
+  fbx_ir_free(ir);
+  FreeTc(tc);
+}
+
+TEST(FbxIrLift, MirrorCmpRRm) {
+  /* opcode 0x03B: CMP r, r/m.  CMP must NOT emit REG_SET (flag-only op). */
+  struct FbxTcBlock *tc = MakeTc(0x03B, 0, 0, 0, 0x400000, 3,
+                                 FBX_TC_KIND_NORMAL);
+  struct FbxIrBlock *ir = fbx_ir_lift(tc);
+  ASSERT_NOTNULL(ir);
+  EXPECT_NE(0, BlockHas(ir, FBX_IR_OP_CMP));
+  EXPECT_NE(0, BlockHas(ir, FBX_IR_OP_SET_FLAGS_RAW));
+  /* CMP r, r/m must not REG_SET — same invariant as 0x39 CMP r/m, r. */
+  EXPECT_EQ(0, BlockHas(ir, FBX_IR_OP_REG_SET));
+  fbx_ir_free(ir);
+  FreeTc(tc);
+}
+
+TEST(FbxIrLift, MirrorXorRRm) {
+  /* opcode 0x033: XOR r, r/m. */
+  struct FbxTcBlock *tc = MakeTc(0x033, 0, 0, 0, 0x400000, 3,
+                                 FBX_TC_KIND_NORMAL);
+  struct FbxIrBlock *ir = fbx_ir_lift(tc);
+  ASSERT_NOTNULL(ir);
+  EXPECT_NE(0, BlockHas(ir, FBX_IR_OP_XOR));
+  fbx_ir_free(ir);
+  FreeTc(tc);
+}
+
+TEST(FbxIrLift, MirrorAndRRm) {
+  /* opcode 0x023: AND r, r/m. */
+  struct FbxTcBlock *tc = MakeTc(0x023, 0, 0, 0, 0x400000, 3,
+                                 FBX_TC_KIND_NORMAL);
+  struct FbxIrBlock *ir = fbx_ir_lift(tc);
+  ASSERT_NOTNULL(ir);
+  EXPECT_NE(0, BlockHas(ir, FBX_IR_OP_AND));
+  fbx_ir_free(ir);
+  FreeTc(tc);
+}
+
+TEST(FbxIrLift, MirrorOrRRm) {
+  /* opcode 0x00B: OR r, r/m. */
+  struct FbxTcBlock *tc = MakeTc(0x00B, 0, 0, 0, 0x400000, 3,
+                                 FBX_TC_KIND_NORMAL);
+  struct FbxIrBlock *ir = fbx_ir_lift(tc);
+  ASSERT_NOTNULL(ir);
+  EXPECT_NE(0, BlockHas(ir, FBX_IR_OP_OR));
+  fbx_ir_free(ir);
+  FreeTc(tc);
+}
+
+TEST(FbxIrLift, MirrorByteAddRRm) {
+  /* opcode 0x002: ADD r8, r/m8.  Byte-form mirror.  Width should be 1. */
+  struct FbxTcBlock *tc = MakeTc(0x002, 0, 0, 0, 0x400000, 2,
+                                 FBX_TC_KIND_NORMAL);
+  struct FbxIrBlock *ir = fbx_ir_lift(tc);
+  u32 i;
+  int saw_byte_get = 0;
+  ASSERT_NOTNULL(ir);
+  EXPECT_NE(0, BlockHas(ir, FBX_IR_OP_ADD));
+  for (i = 0; i < ir->ninsts; ++i) {
+    if (ir->insts[i].opcode == FBX_IR_OP_REG_GET &&
+        ir->insts[i].width == 1) {
+      saw_byte_get = 1;
+    }
+  }
+  EXPECT_EQ(1, saw_byte_get);
+  fbx_ir_free(ir);
+  FreeTc(tc);
+}
+
+TEST(FbxIrLift, MirrorRegisterAssignment) {
+  /* Mirror ops swap the source greg ids.  Use RexrReg=3, RexbRm=5; verify:
+   *   - For 0x001 (ADD r/m, r): lhs greg = 5 (RexbRm), rhs greg = 3 (RexrReg),
+   *     dst greg = 5
+   *   - For 0x003 (ADD r, r/m): lhs greg = 3 (RexrReg), rhs greg = 5 (RexbRm),
+   *     dst greg = 3
+   * rde_extra encodes both RexbRm (bits 7-10, shifted >> 7) and RexrReg
+   * (bits 0-3).  See blink/rde.h.
+   *   RexrReg=3 → bits 0-3 = 3
+   *   RexbRm=5  → bits 7-10 = 5 → 5 << 7 = 0x280 = 0640o (octal)
+   */
+  u64 rde_extra = (u64)3 | ((u64)5 << 7);
+  struct FbxTcBlock *tc_a = MakeTc(0x001, rde_extra, 0, 0, 0x400000, 3,
+                                   FBX_TC_KIND_NORMAL);
+  struct FbxTcBlock *tc_b = MakeTc(0x003, rde_extra, 0, 0, 0x400000, 3,
+                                   FBX_TC_KIND_NORMAL);
+  struct FbxIrBlock *a = fbx_ir_lift(tc_a);
+  struct FbxIrBlock *b = fbx_ir_lift(tc_b);
+  u32 i;
+  u32 a_lhs_src = 0xFFFF, a_rhs_src = 0xFFFF, a_dst = 0xFFFF;
+  u32 b_lhs_src = 0xFFFF, b_rhs_src = 0xFFFF, b_dst = 0xFFFF;
+  int seen = 0;
+  ASSERT_NOTNULL(a);
+  ASSERT_NOTNULL(b);
+  for (i = 0; i < a->ninsts; ++i) {
+    if (a->insts[i].opcode == FBX_IR_OP_REG_GET) {
+      if (seen == 0) a_lhs_src = a->insts[i].src1;
+      else if (seen == 1) a_rhs_src = a->insts[i].src1;
+      seen++;
+    } else if (a->insts[i].opcode == FBX_IR_OP_REG_SET) {
+      a_dst = a->insts[i].dst;
+    }
+  }
+  seen = 0;
+  for (i = 0; i < b->ninsts; ++i) {
+    if (b->insts[i].opcode == FBX_IR_OP_REG_GET) {
+      if (seen == 0) b_lhs_src = b->insts[i].src1;
+      else if (seen == 1) b_rhs_src = b->insts[i].src1;
+      seen++;
+    } else if (b->insts[i].opcode == FBX_IR_OP_REG_SET) {
+      b_dst = b->insts[i].dst;
+    }
+  }
+  /* 0x001: RM_R direction; lhs=RexbRm=5, rhs=RexrReg=3, dst=RexbRm=5. */
+  EXPECT_EQ(5u, a_lhs_src);
+  EXPECT_EQ(3u, a_rhs_src);
+  EXPECT_EQ(5u, a_dst);
+  /* 0x003: R_RM direction; lhs=RexrReg=3, rhs=RexbRm=5, dst=RexrReg=3. */
+  EXPECT_EQ(3u, b_lhs_src);
+  EXPECT_EQ(5u, b_rhs_src);
+  EXPECT_EQ(3u, b_dst);
+  fbx_ir_free(a);
+  fbx_ir_free(b);
+  FreeTc(tc_a);
+  FreeTc(tc_b);
+}
+
+/* ────────────────────────────────────────────────────────────────────────── */
+/* §13.5 — MOVZX (zero-extending move).                                       */
+/*                                                                            */
+/* Lift to REG_GET (narrow) + REG_SET (wide).  Synthesis SHOULD handle this   */
+/* via the existing i64.load{8,16}_u → i64.store pipeline (separate test).    */
+/* ────────────────────────────────────────────────────────────────────────── */
+
+TEST(FbxIrLift, Movzx8) {
+  /* opcode 0x1B6: MOVZX r, r/m8.  No REX.W → dst width = 4. */
+  struct FbxTcBlock *tc = MakeTc(0x1B6, 0, 0, 0, 0x400000, 4,
+                                 FBX_TC_KIND_NORMAL);
+  struct FbxIrBlock *ir = fbx_ir_lift(tc);
+  u32 i;
+  int saw_byte_get = 0;
+  int saw_wide_set = 0;
+  ASSERT_NOTNULL(ir);
+  EXPECT_EQ(0, BlockHas(ir, FBX_IR_OP_BAILOUT));
+  /* Must have exactly one REG_GET with width=1 and one REG_SET with
+   * width >= 4 (full register destination). */
+  for (i = 0; i < ir->ninsts; ++i) {
+    if (ir->insts[i].opcode == FBX_IR_OP_REG_GET) {
+      EXPECT_EQ(1, (int)ir->insts[i].width);
+      saw_byte_get = 1;
+    }
+    if (ir->insts[i].opcode == FBX_IR_OP_REG_SET) {
+      EXPECT_NE(0, ir->insts[i].width >= 4);
+      saw_wide_set = 1;
+    }
+  }
+  EXPECT_EQ(1, saw_byte_get);
+  EXPECT_EQ(1, saw_wide_set);
+  /* MOVZX must NOT emit ALU ops or flag effects. */
+  EXPECT_EQ(0, BlockHas(ir, FBX_IR_OP_SET_FLAGS_RAW));
+  EXPECT_EQ(0, BlockHas(ir, FBX_IR_OP_ADD));
+  fbx_ir_free(ir);
+  FreeTc(tc);
+}
+
+TEST(FbxIrLift, Movzx16) {
+  /* opcode 0x1B7: MOVZX r, r/m16. */
+  struct FbxTcBlock *tc = MakeTc(0x1B7, 0, 0, 0, 0x400000, 4,
+                                 FBX_TC_KIND_NORMAL);
+  struct FbxIrBlock *ir = fbx_ir_lift(tc);
+  u32 i;
+  int saw_word_get = 0;
+  ASSERT_NOTNULL(ir);
+  EXPECT_EQ(0, BlockHas(ir, FBX_IR_OP_BAILOUT));
+  for (i = 0; i < ir->ninsts; ++i) {
+    if (ir->insts[i].opcode == FBX_IR_OP_REG_GET) {
+      EXPECT_EQ(2, (int)ir->insts[i].width);
+      saw_word_get = 1;
+    }
+  }
+  EXPECT_EQ(1, saw_word_get);
+  EXPECT_EQ(0, BlockHas(ir, FBX_IR_OP_SET_FLAGS_RAW));
+  fbx_ir_free(ir);
+  FreeTc(tc);
+}
+
+TEST(FbxIrLift, Movzx8Rexw) {
+  /* opcode 0x1B6 with REX.W set — dst width must be 8 (Qword reg).
+   * Per blink/rde.h:  Rexw(x) = ((x & 0100o) >> 6).  Octal 0100 = 0x40 =
+   * bit 6.  Set rde bit 6 to force REX.W = 1.  Width helper:
+   * WidthFromRde(rde, byte_op=0) → 8 when REX.W is set. */
+  u64 rexw_bit = (u64)0x40;
+  struct FbxTcBlock *tc = MakeTc(0x1B6, rexw_bit, 0, 0, 0x400000, 4,
+                                 FBX_TC_KIND_NORMAL);
+  struct FbxIrBlock *ir = fbx_ir_lift(tc);
+  u32 i;
+  int saw_qword_set = 0;
+  ASSERT_NOTNULL(ir);
+  for (i = 0; i < ir->ninsts; ++i) {
+    if (ir->insts[i].opcode == FBX_IR_OP_REG_SET) {
+      if (ir->insts[i].width == 8) saw_qword_set = 1;
+    }
+  }
+  EXPECT_EQ(1, saw_qword_set);
+  fbx_ir_free(ir);
+  FreeTc(tc);
+}

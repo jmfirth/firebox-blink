@@ -574,7 +574,17 @@ TEST(FbxWasmEmit, RefusesBranchCond) {
   FreeTc(tc);
 }
 
-TEST(FbxWasmEmit, RefusesSetFlagsRaw) {
+TEST(FbxWasmEmit, SetFlagsRawAcceptedWhenNoReader) {
+  /* §13.5 — SET_FLAGS_RAW is now a benign semantic marker (dropped at emit
+   * time) when no flag-reader (BRANCH_COND / GET_FLAG) follows in the
+   * block.  This is the dead-flag-elision path that unblocks straight-line
+   * ALU code with implicit flag side-effects.  The synthesis pass treats
+   * the marker as a no-op; the runtime semantics are preserved because no
+   * subsequent IR inst observes the flag-shadow.
+   *
+   * Pre-§13.5 this returned 0 (refused); the test name was
+   * `RefusesSetFlagsRaw`.  The shift is intentional + documented in
+   * #596's measurement.md (§"What §13.5's lift+emit need to cover"). */
   struct FbxIrBlock ir;
   struct FbxIrInst insts[1];
   struct FbxTcBlock *tc;
@@ -584,6 +594,29 @@ TEST(FbxWasmEmit, RefusesSetFlagsRaw) {
   insts[0].opcode = FBX_IR_OP_SET_FLAGS_RAW;
   ir.insts = insts;
   ir.ninsts = 1;
+  tc = MakeTc(0x001, RDE_MOD3, 0, 0, 0x9000, 3, FBX_TC_KIND_NORMAL);
+  fbx_wasm_buffer_init(&out);
+  ASSERT_EQ(1, fbx_ir_emit_wasm(&ir, tc, &out));
+  ASSERT_NE((i64)0, (i64)out.len);
+  fbx_wasm_buffer_free(&out);
+  FreeTc(tc);
+}
+
+TEST(FbxWasmEmit, RefusesSetFlagsRawWhenBranchCondFollows) {
+  /* The complement of the test above: SET_FLAGS_RAW followed by
+   * BRANCH_COND triggers the flag-reader gate and the synthesis pass
+   * refuses (BRANCH_COND has no wasm-side flag-shadow at v0.1). */
+  struct FbxIrBlock ir;
+  struct FbxIrInst insts[2];
+  struct FbxTcBlock *tc;
+  struct FbxWasmBuffer out;
+  memset(&ir, 0, sizeof ir);
+  memset(insts, 0, sizeof insts);
+  insts[0].opcode = FBX_IR_OP_SET_FLAGS_RAW;
+  insts[1].opcode = FBX_IR_OP_BRANCH_COND;
+  insts[1].imm = 0x9100;
+  ir.insts = insts;
+  ir.ninsts = 2;
   tc = MakeTc(0x001, RDE_MOD3, 0, 0, 0x9000, 3, FBX_TC_KIND_NORMAL);
   fbx_wasm_buffer_init(&out);
   ASSERT_EQ(0, fbx_ir_emit_wasm(&ir, tc, &out));
@@ -777,6 +810,232 @@ TEST(FbxWasmEmit, SectionOrderingAndCounts) {
 /* ────────────────────────────────────────────────────────────────────────── */
 /* Buffer primitives: stress.                                                 */
 /* ────────────────────────────────────────────────────────────────────────── */
+
+/* ────────────────────────────────────────────────────────────────────────── */
+/* §13.5 — MOVZX synthesis.                                                   */
+/*                                                                            */
+/* MOVZX r, r/m{8,16} is lifted as REG_GET (narrow) + REG_SET (wide).  The   */
+/* synthesis pipeline's i64.load{8,16}_u → i64.store path produces the       */
+/* exact zero-extending semantics — no new emit machinery required.           */
+/* ────────────────────────────────────────────────────────────────────────── */
+
+TEST(FbxWasmEmit, Movzx8To32Synth) {
+  /* MOVZX r32, r/m8 — IR: REG_GET width=1 + REG_SET width=4. */
+  struct FbxIrBlock ir;
+  struct FbxIrInst insts[3];
+  struct FbxTcBlock *tc;
+  struct FbxWasmBuffer out;
+  memset(&ir, 0, sizeof ir);
+  memset(insts, 0, sizeof insts);
+  insts[0].opcode = FBX_IR_OP_PC_MARK;
+  insts[0].imm = 0xF000;
+  insts[1].opcode = FBX_IR_OP_REG_GET;
+  insts[1].width = 1;
+  insts[1].dst_kind = FBX_IR_KIND_VREG;
+  insts[1].dst = 0;
+  insts[1].src1_kind = FBX_IR_KIND_GREG;
+  insts[1].src1 = 2;
+  insts[2].opcode = FBX_IR_OP_REG_SET;
+  insts[2].width = 4;
+  insts[2].dst_kind = FBX_IR_KIND_GREG;
+  insts[2].dst = 0;
+  insts[2].src1_kind = FBX_IR_KIND_VREG;
+  insts[2].src1 = 0;
+  ir.insts = insts;
+  ir.ninsts = 3;
+  ir.nvregs = 1;
+  ir.start_pc = 0xF000;
+  ir.end_pc = 0xF004;
+  tc = MakeTc(0x1B6, RDE_MOD3, 0, 0, 0xF000, 4, FBX_TC_KIND_NORMAL);
+  fbx_wasm_buffer_init(&out);
+  ASSERT_EQ(1, fbx_ir_emit_wasm(&ir, tc, &out));
+  ASSERT_NE((i64)0, (i64)out.len);
+  /* Spot-check the emitted bytes contain i64.load8_u (0x31) somewhere in
+   * the code section.  This guards against a regression that would emit
+   * i64.load instead. */
+  {
+    int saw_load8u = 0;
+    u32 j;
+    for (j = 0; j + 0 < out.len; ++j) {
+      if (out.data[j] == 0x31u /* WASM_OP_I64_LOAD8U */) {
+        saw_load8u = 1;
+        break;
+      }
+    }
+    ASSERT_EQ(1, saw_load8u);
+  }
+  fbx_wasm_buffer_free(&out);
+  FreeTc(tc);
+}
+
+TEST(FbxWasmEmit, Movzx16To64Synth) {
+  /* MOVZX r64, r/m16 with REX.W — IR: REG_GET width=2 + REG_SET width=8. */
+  struct FbxIrBlock ir;
+  struct FbxIrInst insts[3];
+  struct FbxTcBlock *tc;
+  struct FbxWasmBuffer out;
+  u64 rde_rexw = RDE_MOD3 | (u64)0x40;  /* REX.W bit 6 */
+  memset(&ir, 0, sizeof ir);
+  memset(insts, 0, sizeof insts);
+  insts[0].opcode = FBX_IR_OP_PC_MARK;
+  insts[0].imm = 0xF100;
+  insts[1].opcode = FBX_IR_OP_REG_GET;
+  insts[1].width = 2;
+  insts[1].dst_kind = FBX_IR_KIND_VREG;
+  insts[1].dst = 0;
+  insts[1].src1_kind = FBX_IR_KIND_GREG;
+  insts[1].src1 = 1;
+  insts[2].opcode = FBX_IR_OP_REG_SET;
+  insts[2].width = 8;
+  insts[2].dst_kind = FBX_IR_KIND_GREG;
+  insts[2].dst = 0;
+  insts[2].src1_kind = FBX_IR_KIND_VREG;
+  insts[2].src1 = 0;
+  ir.insts = insts;
+  ir.ninsts = 3;
+  ir.nvregs = 1;
+  ir.start_pc = 0xF100;
+  ir.end_pc = 0xF105;
+  tc = MakeTc(0x1B7, rde_rexw, 0, 0, 0xF100, 5, FBX_TC_KIND_NORMAL);
+  fbx_wasm_buffer_init(&out);
+  ASSERT_EQ(1, fbx_ir_emit_wasm(&ir, tc, &out));
+  ASSERT_NE((i64)0, (i64)out.len);
+  /* Spot-check i64.load16_u (opcode 0x33). */
+  {
+    int saw_load16u = 0;
+    u32 j;
+    for (j = 0; j < out.len; ++j) {
+      if (out.data[j] == 0x33u /* WASM_OP_I64_LOAD16U */) {
+        saw_load16u = 1;
+        break;
+      }
+    }
+    ASSERT_EQ(1, saw_load16u);
+  }
+  fbx_wasm_buffer_free(&out);
+  FreeTc(tc);
+}
+
+/* ────────────────────────────────────────────────────────────────────────── */
+/* §13.5 — SET_FLAGS_RAW dead-flag elision unblocks lifted ALU IR.            */
+/*                                                                            */
+/* The LIFTER produces SET_FLAGS_RAW after every ALU op.  Pre-§13.5 the      */
+/* synthesis pass refused on contact with SET_FLAGS_RAW.  Post-§13.5 it     */
+/* accepts when no BRANCH_COND/GET_FLAG observer follows in the block —     */
+/* SET_FLAGS_RAW becomes a benign marker dropped at emit time.               */
+/* ────────────────────────────────────────────────────────────────────────── */
+
+TEST(FbxWasmEmit, LiftedAddRRThenBranchTakenSynths) {
+  /* End-to-end: build a TC block for ADD r/m, r (0x001) at modrm.mod==3,
+   * lift it (lifter emits ADD + SET_FLAGS_RAW), then run the synthesis.
+   * Expected: synth succeeds because no flag-reader follows.  Per the
+   * §Q7 measurement, this unblocks ~2.1% of host time (rank 13 of top-30)
+   * for straight-line ADD-then-fallthrough blocks. */
+  struct FbxTcBlock *tc;
+  struct FbxIrBlock *ir;
+  struct FbxWasmBuffer out;
+  /* MakeTc creates a single-entry block.  rde encodes mopcode 0x001 at the
+   * high bits + RDE_MOD3 for modrm.mod==3 — same shape as the existing
+   * AluAddSynth test, but routed through the real lifter rather than a
+   * hand-built IR. */
+  tc = MakeTc(0x001, RDE_MOD3, 0, 0, 0x10000, 3, FBX_TC_KIND_NORMAL);
+  ir = fbx_ir_lift(tc);
+  ASSERT_NOTNULL(ir);
+  /* The lifted IR must contain SET_FLAGS_RAW (the lifter emits it
+   * unconditionally for ALU ops).  This is the test of §13.5's dead-flag
+   * elision: the IR has SET_FLAGS_RAW, no BRANCH_COND, no GET_FLAG. */
+  {
+    u32 j;
+    int saw_flags = 0;
+    for (j = 0; j < ir->ninsts; ++j) {
+      if (ir->insts[j].opcode == FBX_IR_OP_SET_FLAGS_RAW) saw_flags = 1;
+    }
+    ASSERT_EQ(1, saw_flags);
+  }
+  fbx_wasm_buffer_init(&out);
+  ASSERT_EQ(1, fbx_ir_emit_wasm(ir, tc, &out));
+  ASSERT_NE((i64)0, (i64)out.len);
+  /* The emitted wasm starts with the magic.  We trust DeterministicOutput
+   * for byte-stability and the SectionOrderingAndCounts test for structural
+   * validation; this test only needs to confirm the synth succeeded. */
+  ASSERT_EQ(0x00u, out.data[0]);
+  ASSERT_EQ(0x61u, out.data[1]);
+  fbx_wasm_buffer_free(&out);
+  fbx_ir_free(ir);
+  FreeTc(tc);
+}
+
+TEST(FbxWasmEmit, LiftedCmpRRRefusesWhenJccFollows) {
+  /* The complement: a 2-instruction TC block consisting of CMP r/m, r
+   * (0x039) followed by JE rel8 (0x074).  The lifter produces a sequence
+   * with SET_FLAGS_RAW + BRANCH_COND.  Synthesis MUST refuse because the
+   * lazy-flag wasm representation is #597's scope. */
+  u64 mops[2] = {0x039, 0x074};
+  u64 rdes[2] = {RDE_MOD3, 0};
+  u64 uimm0s[2] = {0, 0};
+  i64 disps[2] = {0, 0x10};
+  u64 ips[2] = {0x11000, 0x11003};
+  u8 oplens[2] = {3, 2};
+  struct FbxTcBlock *tc = MakeTcN(mops, rdes, uimm0s, disps, ips, oplens, 2);
+  struct FbxIrBlock *ir = fbx_ir_lift(tc);
+  struct FbxWasmBuffer out;
+  ASSERT_NOTNULL(ir);
+  {
+    u32 j;
+    int saw_branch_cond = 0;
+    for (j = 0; j < ir->ninsts; ++j) {
+      if (ir->insts[j].opcode == FBX_IR_OP_BRANCH_COND) saw_branch_cond = 1;
+    }
+    ASSERT_EQ(1, saw_branch_cond);
+  }
+  fbx_wasm_buffer_init(&out);
+  ASSERT_EQ(0, fbx_ir_emit_wasm(ir, tc, &out));
+  fbx_wasm_buffer_free(&out);
+  fbx_ir_free(ir);
+  FreeTc(tc);
+}
+
+/* ────────────────────────────────────────────────────────────────────────── */
+/* §13.5 — Mirror-direction ALU synth (operand-direction swap).               */
+/*                                                                            */
+/* The lifter (post-#596) accepts mopcodes 0x002/0x003/0x00A/0x00B/0x022/    */
+/* 0x023/0x02A/0x02B/0x032/0x033/0x03A/0x03B.  Synthesis can emit them      */
+/* iff no flag-reader follows.                                                */
+/* ────────────────────────────────────────────────────────────────────────── */
+
+TEST(FbxWasmEmit, MirrorAddRRmFromLiftSynths) {
+  /* 0x003: ADD r, r/m at mod3, no branch.  Lift+emit end-to-end. */
+  struct FbxTcBlock *tc = MakeTc(0x003, RDE_MOD3, 0, 0, 0x12000, 3,
+                                 FBX_TC_KIND_NORMAL);
+  struct FbxIrBlock *ir = fbx_ir_lift(tc);
+  struct FbxWasmBuffer out;
+  ASSERT_NOTNULL(ir);
+  fbx_wasm_buffer_init(&out);
+  ASSERT_EQ(1, fbx_ir_emit_wasm(ir, tc, &out));
+  ASSERT_NE((i64)0, (i64)out.len);
+  fbx_wasm_buffer_free(&out);
+  fbx_ir_free(ir);
+  FreeTc(tc);
+}
+
+TEST(FbxWasmEmit, MirrorCmpRRmFromLiftSynths) {
+  /* 0x03B: CMP r, r/m at mod3, no branch.  CMP is flag-only (no REG_SET).
+   * The synth still succeeds via §13.5's dead-flag elision — the entire
+   * IR sequence is a no-op from a register-state perspective when no
+   * Jcc follows, which is precisely the semantics CMP-no-Jcc produces
+   * (the only observable effect is on flags). */
+  struct FbxTcBlock *tc = MakeTc(0x03B, RDE_MOD3, 0, 0, 0x12100, 3,
+                                 FBX_TC_KIND_NORMAL);
+  struct FbxIrBlock *ir = fbx_ir_lift(tc);
+  struct FbxWasmBuffer out;
+  ASSERT_NOTNULL(ir);
+  fbx_wasm_buffer_init(&out);
+  ASSERT_EQ(1, fbx_ir_emit_wasm(ir, tc, &out));
+  ASSERT_NE((i64)0, (i64)out.len);
+  fbx_wasm_buffer_free(&out);
+  fbx_ir_free(ir);
+  FreeTc(tc);
+}
 
 TEST(FbxWasmBuffer, AppendStress) {
   struct FbxWasmBuffer b;

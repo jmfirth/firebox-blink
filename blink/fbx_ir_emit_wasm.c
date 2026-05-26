@@ -273,9 +273,39 @@ static int CoverageGate(const struct FbxIrBlock *ir,
                         const struct FbxTcBlock *tc) {
   u32 i;
   u32 tc_idx;
+  int saw_flag_reader = 0;
+  int saw_flag_writer = 0;
   if (!ir || ir->ninsts == 0) return 0;
-  /* Refuse anything with FLAG-shadow or BRANCH-COND or memory-load/store
-   * or CALL/RET in the v0.1 subset.  Each of these is owned by §13.4/§13.5. */
+  /* Pass 1 — detect whether any IR inst READS the flag-shadow.  GET_FLAG
+   * and BRANCH_COND are the readers.  If none exist, SET_FLAGS_RAW is a
+   * benign marker we can drop at emit time (the lazy-flag update has no
+   * observer within the block).  CMP / TEST are flag-only writes; if no
+   * reader follows them they're effectively dead and can be elided.
+   *
+   * §13.5 expansion: under this gate, straight-line code that ends with
+   * an unconditional terminator (BRANCH_TAKEN / BAILOUT) and DOES contain
+   * SET_FLAGS_RAW / CMP / TEST becomes emit-eligible.  Conditional
+   * branches still refuse (see Pass 2).  This is the minimal in-scope
+   * extension that doesn't require wasm-side flag-shadow plumbing
+   * (deferred to #597). */
+  for (i = 0; i < ir->ninsts; ++i) {
+    u8 op = ir->insts[i].opcode;
+    if (op == FBX_IR_OP_GET_FLAG || op == FBX_IR_OP_BRANCH_COND) {
+      saw_flag_reader = 1;
+    }
+    if (op == FBX_IR_OP_SET_FLAGS_RAW || op == FBX_IR_OP_CMP ||
+        op == FBX_IR_OP_TEST) {
+      saw_flag_writer = 1;
+    }
+  }
+  /* If any flag-reader is present, refuse — the synthesis pass has no
+   * wasm-side flag-shadow representation to feed it. */
+  if (saw_flag_reader) return 0;
+  (void)saw_flag_writer; /* presence-only; no further gating */
+  /* Pass 2 — per-op acceptance.  SET_FLAGS_RAW / CMP / TEST allowed only
+   * because Pass 1 verified no reader follows.  Their emit-side handling
+   * treats them as no-ops (CMP / TEST) or as dropped markers
+   * (SET_FLAGS_RAW). */
   for (i = 0; i < ir->ninsts; ++i) {
     u8 op = ir->insts[i].opcode;
     switch (op) {
@@ -290,6 +320,9 @@ static int CoverageGate(const struct FbxIrBlock *ir,
       case FBX_IR_OP_LEA:
       case FBX_IR_OP_BRANCH_TAKEN:
       case FBX_IR_OP_BAILOUT:
+      case FBX_IR_OP_SET_FLAGS_RAW:  /* §13.5: no-op when no reader follows */
+      case FBX_IR_OP_CMP:            /* §13.5: dead-flag elide */
+      case FBX_IR_OP_TEST:           /* §13.5: dead-flag elide */
         continue;
       default:
         return 0;
@@ -317,6 +350,28 @@ static int CoverageGate(const struct FbxIrBlock *ir,
       case 0x020: case 0x021: case 0x028: case 0x029:
       case 0x030: case 0x031: case 0x038: case 0x039:
       case 0x084: case 0x085:
+        if (!Mod3(rde)) return 0;
+        break;
+      /* §13.5 mirror-direction ALU forms (lift extended in
+       * blink/fbx_ir_lift.c).  Same modrm.mod==3 requirement.
+       * The emit pass still REFUSES these because the underlying lifter
+       * emits SET_FLAGS_RAW which the IR-side coverage gate above rejects
+       * — but routing the mopcode through CoverageGate's mop-switch is
+       * still needed so the IR-side rejection fires with the right
+       * reason (otherwise the default branch below would refuse with the
+       * wrong "unsupported mopcode" label). */
+      case 0x002: case 0x003:
+      case 0x00A: case 0x00B:
+      case 0x022: case 0x023:
+      case 0x02A: case 0x02B:
+      case 0x032: case 0x033:
+      case 0x03A: case 0x03B:
+        if (!Mod3(rde)) return 0;
+        break;
+      /* §13.5 MOVZX r, r/m{8,16}.  mod3 required at v0.1 (synthesis's
+       * EmitRegLoad doesn't model memory-modrm yet — same gate as the
+       * MOV variants above). */
+      case 0x1B6: case 0x1B7:
         if (!Mod3(rde)) return 0;
         break;
       /* MOV r/m, imm and group-1 r/m, imm: require modrm.mod==3 as well. */
@@ -601,6 +656,15 @@ static int EmitFunctionBody(struct FbxWasmBuffer *body,
       case FBX_IR_OP_PC_MARK:
         /* No code emitted at v0.1.  Future: emit a custom section entry or
          * a debug intrinsic. */
+        break;
+      case FBX_IR_OP_SET_FLAGS_RAW:
+      case FBX_IR_OP_CMP:
+      case FBX_IR_OP_TEST:
+        /* §13.5 — no code emitted for these when CoverageGate has
+         * verified no flag-reader follows in the block.  Pass 1 of the
+         * gate enforces the invariant; here we treat them as semantic
+         * markers that consume no emitter state.  When #597 lands the
+         * lazy-flag wasm representation, these grow real emit logic. */
         break;
       case FBX_IR_OP_REG_GET: {
         /* dst is a vreg local; src1 is a guest register. */

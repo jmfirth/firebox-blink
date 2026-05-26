@@ -534,9 +534,29 @@ static int LiftAlui(struct LiftCtx *ctx, u64 rde, u64 uimm0, int byte_op) {
 /* Lift ALU group r/m, r (mopcode 0x01 = OpAluAdd, 0x29 = OpAluSub, 0x21 =
  * OpAluAnd, 0x09 = OpAluOr, 0x31 = OpAluXor, 0x39 = OpAluCmp, 0x85 =
  * OpAluTest).  Approximate as two REG_GETs + ALU + (REG_SET unless
- * cmp/test) + SET_FLAGS_RAW. */
-static int LiftAluRR(struct LiftCtx *ctx, u64 rde, u8 op, int byte_op) {
+ * cmp/test) + SET_FLAGS_RAW.
+ *
+ * `op_dir` selects the operand-direction encoding:
+ *   FBX_ALU_DIR_RM_R: r/m is destination (mopcode 0x01/0x09/0x21/0x29/...).
+ *     lhs = RexbRm, rhs = RexrReg, dst = RexbRm.
+ *   FBX_ALU_DIR_R_RM: r is destination (mopcode 0x03/0x0B/0x23/0x2B/...).
+ *     lhs = RexrReg, rhs = RexbRm, dst = RexrReg.
+ *
+ * #596 §13.5 added FBX_ALU_DIR_R_RM to lift the mirror-direction variants
+ * (0x002/0x003/0x00A/0x00B/0x022/0x023/0x02A/0x02B/0x032/0x033/0x03A/0x03B).
+ * The emitted IR shape is byte-identical to the RM_R case once the lhs/rhs
+ * vregs are populated — only the source greg ids differ.  TEST has no
+ * mirror form in x86 (single encoding 0x84/0x85), so the dir flag is only
+ * meaningful for ADD/OR/AND/SUB/XOR/CMP. */
+#define FBX_ALU_DIR_RM_R 0
+#define FBX_ALU_DIR_R_RM 1
+
+static int LiftAluRR(struct LiftCtx *ctx, u64 rde, u8 op, int byte_op,
+                     int op_dir) {
   u8 width = WidthFromRde(rde, byte_op);
+  u32 lhs_greg;
+  u32 rhs_greg;
+  u32 dst_greg;
   u32 lhs_vreg;
   u32 rhs_vreg;
   u32 res_vreg;
@@ -545,6 +565,15 @@ static int LiftAluRR(struct LiftCtx *ctx, u64 rde, u8 op, int byte_op) {
   struct FbxIrInst *alu;
   struct FbxIrInst *set_res;
   struct FbxIrInst *flags;
+  if (op_dir == FBX_ALU_DIR_RM_R) {
+    lhs_greg = (u32)RexbRm(rde);
+    rhs_greg = (u32)RexrReg(rde);
+    dst_greg = (u32)RexbRm(rde);
+  } else {
+    lhs_greg = (u32)RexrReg(rde);
+    rhs_greg = (u32)RexbRm(rde);
+    dst_greg = (u32)RexrReg(rde);
+  }
   get_lhs = CtxEmit(ctx);
   if (!get_lhs) return 0;
   lhs_vreg = CtxAllocVreg(ctx);
@@ -553,7 +582,7 @@ static int LiftAluRR(struct LiftCtx *ctx, u64 rde, u8 op, int byte_op) {
   get_lhs->dst_kind = FBX_IR_KIND_VREG;
   get_lhs->dst = lhs_vreg;
   get_lhs->src1_kind = FBX_IR_KIND_GREG;
-  get_lhs->src1 = (u32)RexbRm(rde);
+  get_lhs->src1 = lhs_greg;
   get_rhs = CtxEmit(ctx);
   if (!get_rhs) return 0;
   rhs_vreg = CtxAllocVreg(ctx);
@@ -562,7 +591,7 @@ static int LiftAluRR(struct LiftCtx *ctx, u64 rde, u8 op, int byte_op) {
   get_rhs->dst_kind = FBX_IR_KIND_VREG;
   get_rhs->dst = rhs_vreg;
   get_rhs->src1_kind = FBX_IR_KIND_GREG;
-  get_rhs->src1 = (u32)RexrReg(rde);
+  get_rhs->src1 = rhs_greg;
   alu = CtxEmit(ctx);
   if (!alu) return 0;
   res_vreg = (op == FBX_IR_OP_CMP || op == FBX_IR_OP_TEST)
@@ -584,7 +613,7 @@ static int LiftAluRR(struct LiftCtx *ctx, u64 rde, u8 op, int byte_op) {
     set_res->opcode = FBX_IR_OP_REG_SET;
     set_res->width = width;
     set_res->dst_kind = FBX_IR_KIND_GREG;
-    set_res->dst = (u32)RexbRm(rde);
+    set_res->dst = dst_greg;
     set_res->src1_kind = FBX_IR_KIND_VREG;
     set_res->src1 = res_vreg;
   }
@@ -593,6 +622,50 @@ static int LiftAluRR(struct LiftCtx *ctx, u64 rde, u8 op, int byte_op) {
   flags->opcode = FBX_IR_OP_SET_FLAGS_RAW;
   flags->width = width;
   flags->imm = op;
+  return 1;
+}
+
+/* Lift MOVZX r, r/m {byte,word} — zero-extending move (mopcode 0x1B6 =
+ * MOVZX r, r/m8; mopcode 0x1B7 = MOVZX r, r/m16).
+ *
+ * mod3-only at v0.1 (see comment on the call site in LiftOne).  The IR
+ * shape is REG_GET (narrow width) + REG_SET (wide width).  The synthesis
+ * pass's existing i64.load{8,16}_u path is unsigned — the implicit zero-
+ * extension of the wasm load matches MOVZX semantics exactly.  No new IR
+ * opcode and no new emit-side machinery needed.
+ *
+ * `src_width` is 1 or 2 (byte vs word source).  Destination width comes
+ * from REX.W / operand-size prefix per the wider operand (Word vs Dword vs
+ * Qword), determined by WidthFromRde(byte_op=0). */
+static int LiftMovzx(struct LiftCtx *ctx, u64 rde, u8 src_width) {
+  u8 dst_width = WidthFromRde(rde, 0);
+  u32 src_vreg;
+  struct FbxIrInst *get;
+  struct FbxIrInst *set;
+  /* Defensive: dst must be at least as wide as src.  WidthFromRde with
+   * byte_op=0 always returns 2/4/8 (depending on prefix/REX.W); src_width
+   * passed in is 1 (for MOVZX r/m8) or 2 (for MOVZX r/m16).  Refuse the
+   * pathological case where source is wider than destination — the IR
+   * wouldn't be well-defined and a real compiler-emitted x86 wouldn't
+   * produce that encoding. */
+  if (src_width > dst_width) return -1;
+  get = CtxEmit(ctx);
+  if (!get) return 0;
+  src_vreg = CtxAllocVreg(ctx);
+  get->opcode = FBX_IR_OP_REG_GET;
+  get->width = src_width;
+  get->dst_kind = FBX_IR_KIND_VREG;
+  get->dst = src_vreg;
+  get->src1_kind = FBX_IR_KIND_GREG;
+  get->src1 = (u32)RexbRm(rde);
+  set = CtxEmit(ctx);
+  if (!set) return 0;
+  set->opcode = FBX_IR_OP_REG_SET;
+  set->width = dst_width;
+  set->dst_kind = FBX_IR_KIND_GREG;
+  set->dst = (u32)RexrReg(rde);
+  set->src1_kind = FBX_IR_KIND_VREG;
+  set->src1 = src_vreg;
   return 1;
 }
 
@@ -655,22 +728,52 @@ static int LiftOne(struct LiftCtx *ctx, const struct FbxTcEntry *e,
     /* MOV r/m, imm — opcode 0xC6 (byte) / 0xC7 (word). */
     case 0x0C6:
     case 0x0C7: return LiftMovImm(ctx, rde, e->uimm0);
-    /* ALU group r/m, r — ADD/OR/AND/SUB/XOR/CMP at 0x00/01, 0x08/09, etc. */
-    case 0x000: return LiftAluRR(ctx, rde, FBX_IR_OP_ADD, 1);
-    case 0x001: return LiftAluRR(ctx, rde, FBX_IR_OP_ADD, 0);
-    case 0x008: return LiftAluRR(ctx, rde, FBX_IR_OP_OR, 1);
-    case 0x009: return LiftAluRR(ctx, rde, FBX_IR_OP_OR, 0);
-    case 0x020: return LiftAluRR(ctx, rde, FBX_IR_OP_AND, 1);
-    case 0x021: return LiftAluRR(ctx, rde, FBX_IR_OP_AND, 0);
-    case 0x028: return LiftAluRR(ctx, rde, FBX_IR_OP_SUB, 1);
-    case 0x029: return LiftAluRR(ctx, rde, FBX_IR_OP_SUB, 0);
-    case 0x030: return LiftAluRR(ctx, rde, FBX_IR_OP_XOR, 1);
-    case 0x031: return LiftAluRR(ctx, rde, FBX_IR_OP_XOR, 0);
-    case 0x038: return LiftAluRR(ctx, rde, FBX_IR_OP_CMP, 1);
-    case 0x039: return LiftAluRR(ctx, rde, FBX_IR_OP_CMP, 0);
-    /* TEST r/m, r — 0x84 / 0x85. */
-    case 0x084: return LiftAluRR(ctx, rde, FBX_IR_OP_TEST, 1);
-    case 0x085: return LiftAluRR(ctx, rde, FBX_IR_OP_TEST, 0);
+    /* ALU group r/m, r — ADD/OR/AND/SUB/XOR/CMP at 0x00/01, 0x08/09, etc.
+     * Operand-direction = r/m is destination (op_dir=RM_R). */
+    case 0x000: return LiftAluRR(ctx, rde, FBX_IR_OP_ADD, 1, FBX_ALU_DIR_RM_R);
+    case 0x001: return LiftAluRR(ctx, rde, FBX_IR_OP_ADD, 0, FBX_ALU_DIR_RM_R);
+    case 0x008: return LiftAluRR(ctx, rde, FBX_IR_OP_OR,  1, FBX_ALU_DIR_RM_R);
+    case 0x009: return LiftAluRR(ctx, rde, FBX_IR_OP_OR,  0, FBX_ALU_DIR_RM_R);
+    case 0x020: return LiftAluRR(ctx, rde, FBX_IR_OP_AND, 1, FBX_ALU_DIR_RM_R);
+    case 0x021: return LiftAluRR(ctx, rde, FBX_IR_OP_AND, 0, FBX_ALU_DIR_RM_R);
+    case 0x028: return LiftAluRR(ctx, rde, FBX_IR_OP_SUB, 1, FBX_ALU_DIR_RM_R);
+    case 0x029: return LiftAluRR(ctx, rde, FBX_IR_OP_SUB, 0, FBX_ALU_DIR_RM_R);
+    case 0x030: return LiftAluRR(ctx, rde, FBX_IR_OP_XOR, 1, FBX_ALU_DIR_RM_R);
+    case 0x031: return LiftAluRR(ctx, rde, FBX_IR_OP_XOR, 0, FBX_ALU_DIR_RM_R);
+    case 0x038: return LiftAluRR(ctx, rde, FBX_IR_OP_CMP, 1, FBX_ALU_DIR_RM_R);
+    case 0x039: return LiftAluRR(ctx, rde, FBX_IR_OP_CMP, 0, FBX_ALU_DIR_RM_R);
+    /* §13.5 mirror-direction ALU group r, r/m — same ops, swapped operand
+     * direction (r is destination, r/m is the second source).  Mopcodes
+     * 0x02/0x03 (ADD), 0x0A/0x0B (OR), 0x22/0x23 (AND), 0x2A/0x2B (SUB),
+     * 0x32/0x33 (XOR), 0x3A/0x3B (CMP).  These show up in the §Q7
+     * ranking (top-30: 0x003 at rank 23, 0x03B at rank 19, 0x02B at rank
+     * 43, etc.) — lifting them collapses ~4-5% of total host time from
+     * "lift-side bailout" to "synthesis-side refused" (the BAILOUT slot
+     * was preventing escalation entirely; refusing-after-lift lets
+     * Phase 4 reachability still log the IR shape, and lets #597's
+     * lazy-flag work pick them up automatically when it lands). */
+    case 0x002: return LiftAluRR(ctx, rde, FBX_IR_OP_ADD, 1, FBX_ALU_DIR_R_RM);
+    case 0x003: return LiftAluRR(ctx, rde, FBX_IR_OP_ADD, 0, FBX_ALU_DIR_R_RM);
+    case 0x00A: return LiftAluRR(ctx, rde, FBX_IR_OP_OR,  1, FBX_ALU_DIR_R_RM);
+    case 0x00B: return LiftAluRR(ctx, rde, FBX_IR_OP_OR,  0, FBX_ALU_DIR_R_RM);
+    case 0x022: return LiftAluRR(ctx, rde, FBX_IR_OP_AND, 1, FBX_ALU_DIR_R_RM);
+    case 0x023: return LiftAluRR(ctx, rde, FBX_IR_OP_AND, 0, FBX_ALU_DIR_R_RM);
+    case 0x02A: return LiftAluRR(ctx, rde, FBX_IR_OP_SUB, 1, FBX_ALU_DIR_R_RM);
+    case 0x02B: return LiftAluRR(ctx, rde, FBX_IR_OP_SUB, 0, FBX_ALU_DIR_R_RM);
+    case 0x032: return LiftAluRR(ctx, rde, FBX_IR_OP_XOR, 1, FBX_ALU_DIR_R_RM);
+    case 0x033: return LiftAluRR(ctx, rde, FBX_IR_OP_XOR, 0, FBX_ALU_DIR_R_RM);
+    case 0x03A: return LiftAluRR(ctx, rde, FBX_IR_OP_CMP, 1, FBX_ALU_DIR_R_RM);
+    case 0x03B: return LiftAluRR(ctx, rde, FBX_IR_OP_CMP, 0, FBX_ALU_DIR_R_RM);
+    /* TEST r/m, r — 0x84 / 0x85.  No mirror variant in x86 (TEST is
+     * symmetric in its operand encoding). */
+    case 0x084: return LiftAluRR(ctx, rde, FBX_IR_OP_TEST, 1, FBX_ALU_DIR_RM_R);
+    case 0x085: return LiftAluRR(ctx, rde, FBX_IR_OP_TEST, 0, FBX_ALU_DIR_RM_R);
+    /* §13.5 MOVZX — zero-extending move.  Top-30 rank 15 (0x1B6) +
+     * rank 34 (0x1B7) per §Q7 measurement.  IR shape matches existing
+     * REG_GET (narrow) + REG_SET (wide); the synthesis pass's
+     * i64.load{8,16}_u is unsigned, matching MOVZX semantics. */
+    case 0x1B6: return LiftMovzx(ctx, rde, 1);
+    case 0x1B7: return LiftMovzx(ctx, rde, 2);
     /* ALU group r/m, imm — 0x80 (byte imm), 0x81 (imm32), 0x83 (imm8 sx). */
     case 0x080: return LiftAlui(ctx, rde, e->uimm0, 1);
     case 0x081:

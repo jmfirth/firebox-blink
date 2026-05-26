@@ -303,6 +303,78 @@ static int DumpBailout(const char *dir) {
   return rc;
 }
 
+/* §13.5 — MOVZX r/m8 → r32.  Emits a module with i64.load8_u + i64.store. */
+static int DumpMovzx(const char *dir) {
+  struct FbxIrBlock ir;
+  struct FbxIrInst insts[3];
+  struct FbxTcBlock *tc;
+  struct FbxWasmBuffer out;
+  char path[1024];
+  int rc;
+  memset(&ir, 0, sizeof ir);
+  memset(insts, 0, sizeof insts);
+  insts[0].opcode = FBX_IR_OP_PC_MARK;
+  insts[0].imm = 0x8000;
+  insts[1].opcode = FBX_IR_OP_REG_GET;
+  insts[1].width = 1;
+  insts[1].dst_kind = FBX_IR_KIND_VREG;
+  insts[1].dst = 0;
+  insts[1].src1_kind = FBX_IR_KIND_GREG;
+  insts[1].src1 = 2;
+  insts[2].opcode = FBX_IR_OP_REG_SET;
+  insts[2].width = 4;
+  insts[2].dst_kind = FBX_IR_KIND_GREG;
+  insts[2].dst = 0;
+  insts[2].src1_kind = FBX_IR_KIND_VREG;
+  insts[2].src1 = 0;
+  ir.insts = insts;
+  ir.ninsts = 3;
+  ir.nvregs = 1;
+  ir.start_pc = 0x8000;
+  ir.end_pc = 0x8004;
+  tc = MakeTc(0x1B6, RDE_MOD3, 0, 0, 0x8000, 4);
+  fbx_wasm_buffer_init(&out);
+  if (!fbx_ir_emit_wasm(&ir, tc, &out)) {
+    fprintf(stderr, "movzx: synthesis refused\n");
+    FreeTc(tc);
+    return 0;
+  }
+  snprintf(path, sizeof path, "%s/movzx_8_to_32.wasm", dir);
+  rc = WriteFile(path, out.data, out.len);
+  fbx_wasm_buffer_free(&out);
+  FreeTc(tc);
+  return rc;
+}
+
+/* §13.5 — ADD r/m, r lifted end-to-end (SET_FLAGS_RAW elided as benign). */
+static int DumpAluAddFromLift(const char *dir) {
+  struct FbxTcBlock *tc;
+  struct FbxIrBlock *ir;
+  struct FbxWasmBuffer out;
+  char path[1024];
+  int rc;
+  tc = MakeTc(0x001, RDE_MOD3, 0, 0, 0x9000, 3);
+  ir = fbx_ir_lift(tc);
+  if (!ir) {
+    fprintf(stderr, "alu_add_from_lift: lift failed\n");
+    FreeTc(tc);
+    return 0;
+  }
+  fbx_wasm_buffer_init(&out);
+  if (!fbx_ir_emit_wasm(ir, tc, &out)) {
+    fprintf(stderr, "alu_add_from_lift: synthesis refused\n");
+    fbx_ir_free(ir);
+    FreeTc(tc);
+    return 0;
+  }
+  snprintf(path, sizeof path, "%s/alu_add_from_lift.wasm", dir);
+  rc = WriteFile(path, out.data, out.len);
+  fbx_wasm_buffer_free(&out);
+  fbx_ir_free(ir);
+  FreeTc(tc);
+  return rc;
+}
+
 int main(int argc, char **argv) {
   const char *dir;
   if (argc < 2) {
@@ -316,6 +388,9 @@ int main(int argc, char **argv) {
   if (!DumpLea(dir)) return 1;
   if (!DumpBranchTaken(dir)) return 1;
   if (!DumpBailout(dir)) return 1;
-  fprintf(stdout, "wrote 6 modules to %s\n", dir);
+  /* §13.5 additions */
+  if (!DumpMovzx(dir)) return 1;
+  if (!DumpAluAddFromLift(dir)) return 1;
+  fprintf(stdout, "wrote 8 modules to %s\n", dir);
   return 0;
 }

@@ -16,6 +16,7 @@
 ╚─────────────────────────────────────────────────────────────────────────────*/
 #include "blink/threadedcode.h"
 
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -228,12 +229,30 @@ static bool TcParseEnabled(void) {
   return true;
 }
 
+/* SIGTERM/SIGINT handler — emits the §Q7 profile dump before terminating.
+ * Without this, a bench wrapped in `timeout` sends SIGTERM, the process dies
+ * without running atexit handlers, and the ranking data is lost.  Async-signal
+ * safety: FbxTcProfileDump uses only snprintf into stack buffers + write(2);
+ * both are AS-safe.  After dumping we restore the default handler and re-raise
+ * so the parent sees the original termination semantics. */
+static void FbxTcSignalDump(int sig) {
+  FbxTcProfileDump();
+  signal(sig, SIG_DFL);
+  raise(sig);
+}
+
 void FbxTcInit(struct System *sys) {
   EnsureTcTraceFlag();
   /* Register the §Q7 profile dump exactly once.  We can't use a static
-   * initialiser because atexit() isn't constexpr; gate on a flag. */
+   * initialiser because atexit() isn't constexpr; gate on a flag.  We also
+   * install SIGTERM/SIGINT handlers so a `timeout`-wrapped run still dumps
+   * the ranking before terminating.  SIGQUIT/SIGABRT/SIGSEGV are NOT trapped
+   * — those carry information (core dump, abort message) the developer needs
+   * to see uncorrupted by the dump's writes. */
   if (g_tc_trace == 2 && !g_op_dump_registered) {
     atexit(FbxTcProfileDump);
+    signal(SIGTERM, FbxTcSignalDump);
+    signal(SIGINT, FbxTcSignalDump);
     g_op_dump_registered = 1;
   }
   if (sys->tc.initialised) return;
