@@ -62,6 +62,51 @@
 #include "blink/types.h"
 
 /* ────────────────────────────────────────────────────────────────────────── */
+/* #668 — Synth-failure plumbing.                                             */
+/*                                                                            */
+/* `FbxEmitFailCtx` is the threadable accumulator that the bailout sites       */
+/* populate.  It is plumbed as a pointer through CoverageGate + EmitCodeSection*/
+/* + EmitFunctionBody.  Purity-contract holds: no file-scope globals; the      */
+/* pointer is a stack-allocated struct owned by the public entry point.        */
+/*                                                                            */
+/* SetFail() is sticky-first: only the FIRST rejection wins so the trace      */
+/* line corresponds to the IR site that actually caused the bailout, not a    */
+/* downstream cascade.  Pass NULL to skip — callers that don't care about the */
+/* reason (the legacy fbx_ir_emit_wasm() wrapper) pay zero overhead.          */
+/* ────────────────────────────────────────────────────────────────────────── */
+
+struct FbxEmitFailCtx {
+  enum FbxIrEmitFailReason reason;
+  u8 opcode;
+};
+
+static void SetFail(struct FbxEmitFailCtx *f, enum FbxIrEmitFailReason r,
+                    u8 opcode) {
+  if (!f) return;
+  if (f->reason != FBX_IR_EMIT_OK) return; /* sticky-first */
+  f->reason = r;
+  f->opcode = opcode;
+}
+
+const char *fbx_ir_fail_reason_name(enum FbxIrEmitFailReason r) {
+  switch (r) {
+    case FBX_IR_EMIT_OK: return "ok";
+    case FBX_IR_EMIT_UNSUPPORTED_OPCODE: return "unsupported_opcode";
+    case FBX_IR_EMIT_KIND_MISMATCH: return "kind_mismatch";
+    case FBX_IR_EMIT_FLAG_READER_DEFERRED: return "flag_reader_deferred";
+    case FBX_IR_EMIT_SET_FLAGS_RAW_BAD: return "set_flags_raw_bad";
+    case FBX_IR_EMIT_LEA_SIB_FORM: return "lea_sib_form";
+    case FBX_IR_EMIT_JCC_PREDICATE_DEFERRED: return "jcc_predicate_deferred";
+    case FBX_IR_EMIT_TC_KIND_NON_NORMAL: return "tc_kind_non_normal";
+    case FBX_IR_EMIT_MOD3_REQUIRED: return "mod3_required";
+    case FBX_IR_EMIT_UNSUPPORTED_MOPCODE: return "unsupported_mopcode";
+    case FBX_IR_EMIT_BUFFER_OOM: return "buffer_oom";
+    case FBX_IR_EMIT_EMPTY_IR: return "empty_ir";
+  }
+  return "unknown";
+}
+
+/* ────────────────────────────────────────────────────────────────────────── */
 /* Buffer primitives.                                                         */
 /* ────────────────────────────────────────────────────────────────────────── */
 
@@ -303,12 +348,16 @@ static int Mod3(u64 rde) {
 }
 
 static int CoverageGate(const struct FbxIrBlock *ir,
-                        const struct FbxTcBlock *tc) {
+                        const struct FbxTcBlock *tc,
+                        struct FbxEmitFailCtx *fail) {
   u32 i;
   u32 tc_idx;
   int saw_flag_reader = 0;
   int saw_flag_writer = 0;
-  if (!ir || ir->ninsts == 0) return 0;
+  if (!ir || ir->ninsts == 0) {
+    SetFail(fail, FBX_IR_EMIT_EMPTY_IR, 0);
+    return 0;
+  }
   /* Pass 1 — detect whether any IR inst READS the flag-shadow.  GET_FLAG
    * and BRANCH_COND are the readers.  If none exist, SET_FLAGS_RAW is a
    * benign marker we can drop at emit time (the lazy-flag update has no
@@ -343,6 +392,7 @@ static int CoverageGate(const struct FbxIrBlock *ir,
   for (i = 0; i < ir->ninsts; ++i) {
     u8 op = ir->insts[i].opcode;
     if (op == FBX_IR_OP_GET_FLAG) {
+      SetFail(fail, FBX_IR_EMIT_FLAG_READER_DEFERRED, op);
       return 0; /* deferred — no consumer at v0.1 */
     }
   }
@@ -356,11 +406,13 @@ static int CoverageGate(const struct FbxIrBlock *ir,
         if (p->src1_kind != FBX_IR_KIND_VREG ||
             p->src2_kind != FBX_IR_KIND_VREG) {
           /* Stale v1 lift output without operand encoding — refuse. */
+          SetFail(fail, FBX_IR_EMIT_SET_FLAGS_RAW_BAD, p->opcode);
           return 0;
         }
         /* Width must be 1/2/4/8 (we use it as i64 shift amount). */
         if (p->width != 1 && p->width != 2 &&
             p->width != 4 && p->width != 8) {
+          SetFail(fail, FBX_IR_EMIT_SET_FLAGS_RAW_BAD, p->opcode);
           return 0;
         }
         /* op_kind in imm must be one of the supported flag-emitters. */
@@ -374,6 +426,7 @@ static int CoverageGate(const struct FbxIrBlock *ir,
           case FBX_IR_OP_TEST:
             break;
           default:
+            SetFail(fail, FBX_IR_EMIT_SET_FLAGS_RAW_BAD, p->opcode);
             return 0;
         }
       }
@@ -405,6 +458,7 @@ static int CoverageGate(const struct FbxIrBlock *ir,
       case FBX_IR_OP_POP:          /* #602 */
         continue;
       default:
+        SetFail(fail, FBX_IR_EMIT_UNSUPPORTED_OPCODE, op);
         return 0;
     }
   }
@@ -414,12 +468,18 @@ static int CoverageGate(const struct FbxIrBlock *ir,
    * be a reg-form instruction.  We do not enforce a 1:1 mapping (the
    * lifter can emit several IR insts per x86 op); only the operand-shape
    * is checked. */
-  if (!tc || tc->nentries == 0) return 0;
+  if (!tc || tc->nentries == 0) {
+    SetFail(fail, FBX_IR_EMIT_EMPTY_IR, 0);
+    return 0;
+  }
   for (tc_idx = 0; tc_idx < tc->nentries; ++tc_idx) {
     const struct FbxTcEntry *e = &tc->entries[tc_idx];
     u64 rde;
     u64 mop;
-    if (e->kind != FBX_TC_KIND_NORMAL) return 0;
+    if (e->kind != FBX_TC_KIND_NORMAL) {
+      SetFail(fail, FBX_IR_EMIT_TC_KIND_NON_NORMAL, 0);
+      return 0;
+    }
     rde = e->rde;
     mop = Mopcode(rde);
     /* MOV r/m, r and MOV r, r/m and ALU-RR and TEST: require modrm.mod==3. */
@@ -430,7 +490,10 @@ static int CoverageGate(const struct FbxIrBlock *ir,
       case 0x020: case 0x021: case 0x028: case 0x029:
       case 0x030: case 0x031: case 0x038: case 0x039:
       case 0x084: case 0x085:
-        if (!Mod3(rde)) return 0;
+        if (!Mod3(rde)) {
+          SetFail(fail, FBX_IR_EMIT_MOD3_REQUIRED, (u8)(mop & 0xFF));
+          return 0;
+        }
         break;
       /* §13.5 mirror-direction ALU forms (lift extended in
        * blink/fbx_ir_lift.c).  Same modrm.mod==3 requirement.
@@ -446,18 +509,27 @@ static int CoverageGate(const struct FbxIrBlock *ir,
       case 0x02A: case 0x02B:
       case 0x032: case 0x033:
       case 0x03A: case 0x03B:
-        if (!Mod3(rde)) return 0;
+        if (!Mod3(rde)) {
+          SetFail(fail, FBX_IR_EMIT_MOD3_REQUIRED, (u8)(mop & 0xFF));
+          return 0;
+        }
         break;
       /* §13.5 MOVZX r, r/m{8,16}.  mod3 required at v0.1 (synthesis's
        * EmitRegLoad doesn't model memory-modrm yet — same gate as the
        * MOV variants above). */
       case 0x1B6: case 0x1B7:
-        if (!Mod3(rde)) return 0;
+        if (!Mod3(rde)) {
+          SetFail(fail, FBX_IR_EMIT_MOD3_REQUIRED, (u8)(mop & 0xFF));
+          return 0;
+        }
         break;
       /* MOV r/m, imm and group-1 r/m, imm: require modrm.mod==3 as well. */
       case 0x0C6: case 0x0C7:
       case 0x080: case 0x081: case 0x083:
-        if (!Mod3(rde)) return 0;
+        if (!Mod3(rde)) {
+          SetFail(fail, FBX_IR_EMIT_MOD3_REQUIRED, (u8)(mop & 0xFF));
+          return 0;
+        }
         break;
       /* LEA: tolerate the simple disp-only form; reject if SIB index used.
        * Without a full disassembler we conservatively reject when any
@@ -505,6 +577,7 @@ static int CoverageGate(const struct FbxIrBlock *ir,
       default:
         /* The lifter would have bailed for anything outside the top-10 set;
          * if we reach here with an unsupported mopcode, refuse. */
+        SetFail(fail, FBX_IR_EMIT_UNSUPPORTED_MOPCODE, (u8)(mop & 0xFF));
         return 0;
     }
   }
@@ -515,9 +588,15 @@ static int CoverageGate(const struct FbxIrBlock *ir,
       /* v0.1: accept LEA with src1=GREG (base) + imm (disp).  Anything else
        * (e.g. src2_kind != FBX_IR_KIND_NONE && != FBX_IR_KIND_IMM) is a SIB
        * form the v0.1 emitter doesn't model. */
-      if (p->src1_kind != FBX_IR_KIND_GREG) return 0;
+      if (p->src1_kind != FBX_IR_KIND_GREG) {
+        SetFail(fail, FBX_IR_EMIT_LEA_SIB_FORM, p->opcode);
+        return 0;
+      }
       if (p->src2_kind != FBX_IR_KIND_NONE &&
-          p->src2_kind != FBX_IR_KIND_IMM) return 0;
+          p->src2_kind != FBX_IR_KIND_IMM) {
+        SetFail(fail, FBX_IR_EMIT_LEA_SIB_FORM, p->opcode);
+        return 0;
+      }
     }
     if (p->opcode == FBX_IR_OP_REG_GET || p->opcode == FBX_IR_OP_REG_SET) {
       /* REG_GET/SET must read/write a guest register; the lifter emits IMM
@@ -525,9 +604,15 @@ static int CoverageGate(const struct FbxIrBlock *ir,
        * pattern is part of the SET_FLAGS_RAW chain which we already refused
        * above, but defend regardless. */
       if (p->opcode == FBX_IR_OP_REG_GET &&
-          p->src1_kind != FBX_IR_KIND_GREG) return 0;
+          p->src1_kind != FBX_IR_KIND_GREG) {
+        SetFail(fail, FBX_IR_EMIT_KIND_MISMATCH, p->opcode);
+        return 0;
+      }
       if (p->opcode == FBX_IR_OP_REG_SET &&
-          p->dst_kind != FBX_IR_KIND_GREG) return 0;
+          p->dst_kind != FBX_IR_KIND_GREG) {
+        SetFail(fail, FBX_IR_EMIT_KIND_MISMATCH, p->opcode);
+        return 0;
+      }
     }
   }
   return 1;
@@ -1988,7 +2073,8 @@ static int BlockNeedsScratchLocals(const struct FbxIrBlock *ir) {
  * the same absolute slot indices — guaranteeing the bridge-side consts[]
  * table aligns with the wasm offsets the body emits. */
 static int EmitFunctionBody(struct FbxWasmBuffer *body,
-                            const struct FbxIrBlock *ir) {
+                            const struct FbxIrBlock *ir,
+                            struct FbxEmitFailCtx *fail) {
   u32 i;
   int terminated = 0;
   int needs_scratch = BlockNeedsScratchLocals(ir);
@@ -2034,6 +2120,7 @@ static int EmitFunctionBody(struct FbxWasmBuffer *body,
         if (!needs_scratch) break; /* dead-flag elision path */
         if (p->src1_kind != FBX_IR_KIND_VREG ||
             p->src2_kind != FBX_IR_KIND_VREG) {
+          SetFail(fail, FBX_IR_EMIT_SET_FLAGS_RAW_BAD, p->opcode);
           return 0; /* malformed IR */
         }
         EmitFlagsAfterAlu(body, ir->nvregs, (u8)p->imm,
@@ -2050,8 +2137,17 @@ static int EmitFunctionBody(struct FbxWasmBuffer *body,
         break;
       case FBX_IR_OP_BRANCH_COND: {
         struct BranchCondSlots s;
-        if (!AllocBranchCondSlots(&ctx_b, p, &s)) return 0;
-        if (!EmitBranchCond(body, p, &s)) return 0;
+        if (!AllocBranchCondSlots(&ctx_b, p, &s)) {
+          SetFail(fail, FBX_IR_EMIT_KIND_MISMATCH, p->opcode);
+          return 0;
+        }
+        if (!EmitBranchCond(body, p, &s)) {
+          /* EmitBranchCond's sole failure path is EmitJccPredicate refusal
+           * (Jcc PF/NP and unrecognised predicates).  Other shape errors are
+           * caught by the coverage gate above. */
+          SetFail(fail, FBX_IR_EMIT_JCC_PREDICATE_DEFERRED, p->opcode);
+          return 0;
+        }
         terminated = 1;
         break;
       }
@@ -2060,31 +2156,45 @@ static int EmitFunctionBody(struct FbxWasmBuffer *body,
         /* dst is a vreg local; src1 is a guest register. */
         if (p->dst_kind != FBX_IR_KIND_VREG ||
             p->src1_kind != FBX_IR_KIND_GREG) {
+          SetFail(fail, FBX_IR_EMIT_KIND_MISMATCH, p->opcode);
           return 0;
         }
         greg_slot = AllocRegGetSlot(&ctx_b, p);
-        if (ctx_b.overflow) return 0;
+        if (ctx_b.overflow) {
+          SetFail(fail, FBX_IR_EMIT_KIND_MISMATCH, p->opcode);
+          return 0;
+        }
         EmitRegLoad(body, greg_slot, p->width ? p->width : 8u);
         fbx_wasm_buffer_u8(body, WASM_OP_LOCAL_SET);
         fbx_wasm_buffer_uleb(body, VregLocal(p->dst));
         break;
       }
       case FBX_IR_OP_REG_SET: {
-        if (p->dst_kind != FBX_IR_KIND_GREG) return 0;
+        if (p->dst_kind != FBX_IR_KIND_GREG) {
+          SetFail(fail, FBX_IR_EMIT_KIND_MISMATCH, p->opcode);
+          return 0;
+        }
         if (p->src1_kind == FBX_IR_KIND_VREG) {
           /* allocator order MUST match AllocSlotsForInst: imm slot first   */
           /* (skipped here — no imm), then greg slot. */
           u32 greg_slot = AllocRegSetGregSlot(&ctx_b, p);
-          if (ctx_b.overflow) return 0;
+          if (ctx_b.overflow) {
+            SetFail(fail, FBX_IR_EMIT_KIND_MISMATCH, p->opcode);
+            return 0;
+          }
           EmitRegStoreFromLocal(body, greg_slot, VregLocal(p->src1),
                                 p->width ? p->width : 8u);
         } else if (p->src1_kind == FBX_IR_KIND_IMM) {
           u32 imm_slot = AllocRegSetImmSlot(&ctx_b, p);
           u32 greg_slot = AllocRegSetGregSlot(&ctx_b, p);
-          if (ctx_b.overflow) return 0;
+          if (ctx_b.overflow) {
+            SetFail(fail, FBX_IR_EMIT_KIND_MISMATCH, p->opcode);
+            return 0;
+          }
           EmitRegStoreImm(body, greg_slot, imm_slot,
                           p->width ? p->width : 8u);
         } else {
+          SetFail(fail, FBX_IR_EMIT_KIND_MISMATCH, p->opcode);
           return 0;
         }
         break;
@@ -2094,18 +2204,30 @@ static int EmitFunctionBody(struct FbxWasmBuffer *body,
       case FBX_IR_OP_AND:
       case FBX_IR_OP_OR:
       case FBX_IR_OP_XOR:
-        if (!EmitAlu(body, p)) return 0;
+        if (!EmitAlu(body, p)) {
+          SetFail(fail, FBX_IR_EMIT_KIND_MISMATCH, p->opcode);
+          return 0;
+        }
         break;
       case FBX_IR_OP_LEA: {
         struct LeaSlots s;
-        if (!AllocLeaSlots(&ctx_b, p, &s)) return 0;
-        if (!EmitLea(body, p, &s)) return 0;
+        if (!AllocLeaSlots(&ctx_b, p, &s)) {
+          SetFail(fail, FBX_IR_EMIT_KIND_MISMATCH, p->opcode);
+          return 0;
+        }
+        if (!EmitLea(body, p, &s)) {
+          SetFail(fail, FBX_IR_EMIT_KIND_MISMATCH, p->opcode);
+          return 0;
+        }
         break;
       }
       case FBX_IR_OP_BRANCH_TAKEN: {
         /* Update m->ip (from ctx PC slot) and exit normally.  Terminator. */
         u32 pc_slot = AllocBranchTakenSlot(&ctx_b, p);
-        if (ctx_b.overflow) return 0;
+        if (ctx_b.overflow) {
+          SetFail(fail, FBX_IR_EMIT_KIND_MISMATCH, p->opcode);
+          return 0;
+        }
         EmitStoreIp(body, pc_slot);
         fbx_wasm_buffer_u8(body, WASM_OP_I32_CONST);
         fbx_wasm_buffer_sleb(body, 0);
@@ -2116,7 +2238,10 @@ static int EmitFunctionBody(struct FbxWasmBuffer *body,
       case FBX_IR_OP_BAILOUT: {
         /* Update m->ip to the bailout PC (ctx slot) and return exit=1. */
         u32 pc_slot = AllocBailoutSlot(&ctx_b, p);
-        if (ctx_b.overflow) return 0;
+        if (ctx_b.overflow) {
+          SetFail(fail, FBX_IR_EMIT_KIND_MISMATCH, p->opcode);
+          return 0;
+        }
         EmitStoreIp(body, pc_slot);
         fbx_wasm_buffer_u8(body, WASM_OP_I32_CONST);
         fbx_wasm_buffer_sleb(body, 1);
@@ -2126,36 +2251,61 @@ static int EmitFunctionBody(struct FbxWasmBuffer *body,
       }
       case FBX_IR_OP_CALL_DIRECT: {
         struct CallDirectSlots s;
-        if (!AllocCallDirectSlots(&ctx_b, p, &s)) return 0;
+        if (!AllocCallDirectSlots(&ctx_b, p, &s)) {
+          SetFail(fail, FBX_IR_EMIT_KIND_MISMATCH, p->opcode);
+          return 0;
+        }
         /* #602 — push return_pc onto guest stack; jump to target_pc. */
-        if (!EmitCallDirect(body, p, &s)) return 0;
+        if (!EmitCallDirect(body, p, &s)) {
+          SetFail(fail, FBX_IR_EMIT_KIND_MISMATCH, p->opcode);
+          return 0;
+        }
         terminated = 1;
         break;
       }
       case FBX_IR_OP_RET: {
         u32 rsp_slot = AllocRetRspSlot(&ctx_b);
-        if (ctx_b.overflow) return 0;
+        if (ctx_b.overflow) {
+          SetFail(fail, FBX_IR_EMIT_KIND_MISMATCH, p->opcode);
+          return 0;
+        }
         /* #602 — pop guest stack into m->ip; bump RSP. */
-        if (!EmitRet(body, ir->nvregs, rsp_slot)) return 0;
+        if (!EmitRet(body, ir->nvregs, rsp_slot)) {
+          SetFail(fail, FBX_IR_EMIT_KIND_MISMATCH, p->opcode);
+          return 0;
+        }
         terminated = 1;
         break;
       }
       case FBX_IR_OP_PUSH: {
         struct PushPopSlots s;
-        if (!AllocPushSlots(&ctx_b, p, &s)) return 0;
+        if (!AllocPushSlots(&ctx_b, p, &s)) {
+          SetFail(fail, FBX_IR_EMIT_KIND_MISMATCH, p->opcode);
+          return 0;
+        }
         /* #602 — stash greg, decrement RSP, store. */
-        if (!EmitPush(body, p, ir->nvregs, &s)) return 0;
+        if (!EmitPush(body, p, ir->nvregs, &s)) {
+          SetFail(fail, FBX_IR_EMIT_KIND_MISMATCH, p->opcode);
+          return 0;
+        }
         break;
       }
       case FBX_IR_OP_POP: {
         struct PushPopSlots s;
-        if (!AllocPopSlots(&ctx_b, p, &s)) return 0;
+        if (!AllocPopSlots(&ctx_b, p, &s)) {
+          SetFail(fail, FBX_IR_EMIT_KIND_MISMATCH, p->opcode);
+          return 0;
+        }
         /* #602 — load from RSP, increment RSP, write greg. */
-        if (!EmitPop(body, p, ir->nvregs, &s)) return 0;
+        if (!EmitPop(body, p, ir->nvregs, &s)) {
+          SetFail(fail, FBX_IR_EMIT_KIND_MISMATCH, p->opcode);
+          return 0;
+        }
         break;
       }
       default:
         /* Coverage gate should have rejected this. */
+        SetFail(fail, FBX_IR_EMIT_UNSUPPORTED_OPCODE, p->opcode);
         return 0;
     }
     if (terminated) break;
@@ -2272,12 +2422,13 @@ static void EmitExportSection(struct FbxWasmBuffer *out) {
 }
 
 static int EmitCodeSection(struct FbxWasmBuffer *out,
-                           const struct FbxIrBlock *ir) {
+                           const struct FbxIrBlock *ir,
+                           struct FbxEmitFailCtx *fail) {
   struct FbxWasmBuffer body;
   struct FbxWasmBuffer fn_body;
   fbx_wasm_buffer_init(&body);
   fbx_wasm_buffer_init(&fn_body);
-  if (!EmitFunctionBody(&fn_body, ir)) {
+  if (!EmitFunctionBody(&fn_body, ir, fail)) {
     fbx_wasm_buffer_free(&body);
     fbx_wasm_buffer_free(&fn_body);
     return 0;
@@ -2292,13 +2443,22 @@ static int EmitCodeSection(struct FbxWasmBuffer *out,
 }
 
 /* ────────────────────────────────────────────────────────────────────────── */
-/* Public entry point.                                                        */
+/* Public entry points.                                                       */
 /* ────────────────────────────────────────────────────────────────────────── */
 
-int fbx_ir_emit_wasm(const struct FbxIrBlock *ir, const struct FbxTcBlock *tc,
-                     struct FbxWasmBuffer *out) {
-  if (!ir || !tc || !out) return 0;
-  if (!CoverageGate(ir, tc)) return 0;
+int fbx_ir_emit_wasm_with_reason(const struct FbxIrBlock *ir,
+                                 const struct FbxTcBlock *tc,
+                                 struct FbxWasmBuffer *out,
+                                 enum FbxIrEmitFailReason *out_reason,
+                                 u8 *out_opcode) {
+  struct FbxEmitFailCtx fail;
+  fail.reason = FBX_IR_EMIT_OK;
+  fail.opcode = 0;
+  if (!ir || !tc || !out) {
+    fail.reason = FBX_IR_EMIT_EMPTY_IR;
+    goto emit_fail;
+  }
+  if (!CoverageGate(ir, tc, &fail)) goto emit_fail;
   /* The synthesis pass MUST be pure: clear the output buffer before
    * emitting so a same-input call produces the same bytes. */
   fbx_wasm_buffer_free(out);
@@ -2310,13 +2470,25 @@ int fbx_ir_emit_wasm(const struct FbxIrBlock *ir, const struct FbxTcBlock *tc,
   EmitImportSection(out);
   EmitFunctionSection(out);
   EmitExportSection(out);
-  if (!EmitCodeSection(out, ir)) {
+  if (!EmitCodeSection(out, ir, &fail)) {
     fbx_wasm_buffer_free(out);
-    return 0;
+    goto emit_fail;
   }
   if (out->oom) {
     fbx_wasm_buffer_free(out);
-    return 0;
+    fail.reason = FBX_IR_EMIT_BUFFER_OOM;
+    goto emit_fail;
   }
+  if (out_reason) *out_reason = FBX_IR_EMIT_OK;
+  if (out_opcode) *out_opcode = 0;
   return 1;
+emit_fail:
+  if (out_reason) *out_reason = fail.reason;
+  if (out_opcode) *out_opcode = fail.opcode;
+  return 0;
+}
+
+int fbx_ir_emit_wasm(const struct FbxIrBlock *ir, const struct FbxTcBlock *tc,
+                     struct FbxWasmBuffer *out) {
+  return fbx_ir_emit_wasm_with_reason(ir, tc, out, NULL, NULL);
 }

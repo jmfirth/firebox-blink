@@ -144,6 +144,55 @@ int fbx_ir_emit_wasm(const struct FbxIrBlock *ir, const struct FbxTcBlock *tc,
                      struct FbxWasmBuffer *out);
 
 /* ────────────────────────────────────────────────────────────────────────── */
+/* #668 — Synth-failure reason instrumentation.                               */
+/*                                                                            */
+/* When fbx_ir_emit_wasm() returns 0, the caller can opt in to a more         */
+/* specific diagnostic by routing through fbx_ir_emit_wasm_with_reason()      */
+/* and inspecting the out-params.  Used by fbx_t2_glue.c's verbose channel    */
+/* to emit per-opcode [t2 synth-fail] lines that #667 / #669 enumerate.       */
+/*                                                                            */
+/* On a non-zero return, *out_reason == FBX_IR_EMIT_OK and *out_opcode is     */
+/* unspecified.  On a zero return, *out_reason holds the bailout class +      */
+/* *out_opcode holds either the offending IR opcode (FBX_IR_OP_*) or the low  */
+/* 8 bits of the x86 mopcode that triggered the TC-side rejection; the       */
+/* reason variant disambiguates which space the opcode lives in.              */
+/*                                                                            */
+/* Refines `class_lesson_trace_silence_can_be_category_omission` at the      */
+/* per-opcode-distribution layer: prior to #668 every synth bailout looked   */
+/* identical from `outcome=synth_failed`, hiding the per-class distribution. */
+/* ────────────────────────────────────────────────────────────────────────── */
+
+enum FbxIrEmitFailReason {
+  FBX_IR_EMIT_OK = 0,
+  /* IR-side rejections (out_opcode = FBX_IR_OP_*) */
+  FBX_IR_EMIT_UNSUPPORTED_OPCODE = 1,      /* IR op outside v0.1 coverage set */
+  FBX_IR_EMIT_KIND_MISMATCH = 2,           /* operand-kind != expected (VREG/GREG/IMM) */
+  FBX_IR_EMIT_FLAG_READER_DEFERRED = 3,    /* GET_FLAG present; deferred at v0.1 */
+  FBX_IR_EMIT_SET_FLAGS_RAW_BAD = 4,       /* SET_FLAGS_RAW with bad width or op_kind */
+  FBX_IR_EMIT_LEA_SIB_FORM = 5,            /* LEA with src2 != NONE/IMM (SIB index) */
+  FBX_IR_EMIT_JCC_PREDICATE_DEFERRED = 6,  /* Jcc PF/NP — emit-time refusal */
+  /* TC-side rejections (out_opcode = mop & 0xFF) */
+  FBX_IR_EMIT_TC_KIND_NON_NORMAL = 7,      /* TC entry kind != FBX_TC_KIND_NORMAL */
+  FBX_IR_EMIT_MOD3_REQUIRED = 8,           /* memory-form variant where reg-form required */
+  FBX_IR_EMIT_UNSUPPORTED_MOPCODE = 9,     /* x86 mopcode outside v0.1 coverage */
+  /* Structural */
+  FBX_IR_EMIT_BUFFER_OOM = 10,             /* growable buffer realloc failed */
+  FBX_IR_EMIT_EMPTY_IR = 11,               /* ir is NULL or ninsts == 0 */
+};
+
+/* Human-readable name for a reason variant; suitable for trace lines. */
+const char *fbx_ir_fail_reason_name(enum FbxIrEmitFailReason r);
+
+/* Same as fbx_ir_emit_wasm() but plumbs the failure reason + offending */
+/* opcode out to the caller for instrumentation purposes.  On success,  */
+/* *out_reason == FBX_IR_EMIT_OK.  Either out-param may be NULL.        */
+int fbx_ir_emit_wasm_with_reason(const struct FbxIrBlock *ir,
+                                 const struct FbxTcBlock *tc,
+                                 struct FbxWasmBuffer *out,
+                                 enum FbxIrEmitFailReason *out_reason,
+                                 u8 *out_opcode);
+
+/* ────────────────────────────────────────────────────────────────────────── */
 /* #635 — const-table builder.                                                */
 /*                                                                            */
 /* Walks `ir` with the SAME encounter-order policy that the emit pass uses   */

@@ -43,14 +43,20 @@
 #include "blink/threadedcode.h"
 
 /* ────────────────────────────────────────────────────────────────────────── */
-/* Trace flag — `FIREBOX_T2_TRACE=escalations,bailouts,dispatches,all` per   */
+/* Trace flag — `FIREBOX_T2_TRACE=escalations,bailouts,verbose,all` per      */
 /* spec §11.2 table.  Categories not in that table are silently dropped       */
 /* (see `class_lesson_trace_silence_can_be_category_omission`).               */
+/*                                                                            */
+/* #668 closes the `verbose`-token silent-drop recurrence: previously the     */
+/* token fell through to the silent-drop branch with no flag wired, so the    */
+/* new [t2 synth-fail] line had no observer.  Also removes the dead toklen==12*/
+/* compare-against-11-chars branch (always false, leftover from #667 probe).  */
 /* ────────────────────────────────────────────────────────────────────────── */
 
 static int g_t2_trace_init = 0;
 static int g_t2_trace_escalations = 0;
 static int g_t2_trace_bailouts = 0;
+static int g_t2_trace_verbose = 0;
 /* `dispatches` not currently used by this file — would fire on every Tier 2
  * dispatch, voluminous.  Bridge-side `t2_bridge.rs` owns that category. */
 
@@ -69,15 +75,16 @@ static void T2EnsureTraceFlags(void) {
     toklen = (size_t)(raw - tok);
     while (toklen && (tok[0] == ' ' || tok[0] == '\t')) { ++tok; --toklen; }
     while (toklen && (tok[toklen - 1] == ' ' || tok[toklen - 1] == '\t')) --toklen;
-    if (toklen == 12 && !strncmp(tok, "escalations", 11)) {
-      g_t2_trace_escalations = 1;
-    } else if (toklen == 11 && !strncmp(tok, "escalations", 11)) {
+    if (toklen == 11 && !strncmp(tok, "escalations", 11)) {
       g_t2_trace_escalations = 1;
     } else if (toklen == 8 && !strncmp(tok, "bailouts", 8)) {
       g_t2_trace_bailouts = 1;
+    } else if (toklen == 7 && !strncmp(tok, "verbose", 7)) {
+      g_t2_trace_verbose = 1;
     } else if (toklen == 3 && !strncmp(tok, "all", 3)) {
       g_t2_trace_escalations = 1;
       g_t2_trace_bailouts = 1;
+      g_t2_trace_verbose = 1;
     }
     /* Unknown tokens silently dropped — matches the bridge-side parser. */
     if (*raw == ',') ++raw;
@@ -142,6 +149,7 @@ void Fbxt2ResetEnvCacheForTest(void) {
   g_t2_trace_init = 0;
   g_t2_trace_escalations = 0;
   g_t2_trace_bailouts = 0;
+  g_t2_trace_verbose = 0;
 }
 
 /* ────────────────────────────────────────────────────────────────────────── */
@@ -195,15 +203,32 @@ void Fbxt2TryEscalate(struct Machine *m, struct FbxTcBlock *b) {
     return;
   }
 
-  /* Step 2b — synthesise wasm bytes (constant-free at hoisted sites). */
+  /* Step 2b — synthesise wasm bytes (constant-free at hoisted sites).
+   *
+   * #668: route through the with_reason variant so the verbose channel can
+   * emit a per-opcode [t2 synth-fail] line.  The legacy [t2 escalate]
+   * outcome=synth_failed line is preserved on the escalations channel for
+   * back-compat with #667's raw logs + grep-pipelines.  Reason+opcode are
+   * meaningful only on a 0 return; the with_reason API guarantees they fall
+   * back to OK/0 on success. */
   fbx_wasm_buffer_init(&buf);
-  if (!fbx_ir_emit_wasm(ir, b, &buf)) {
-    fbx_ir_free(ir);
-    fbx_wasm_buffer_free(&buf);
-    T2TraceLine(g_t2_trace_escalations,
-                "[t2 escalate] sys=%p pc=%#llx outcome=synth_failed\n",
-                (void *)m->system, (unsigned long long)b->start_pc);
-    return;
+  {
+    enum FbxIrEmitFailReason ir_fail_reason = FBX_IR_EMIT_OK;
+    u8 ir_fail_opcode = 0;
+    if (!fbx_ir_emit_wasm_with_reason(ir, b, &buf, &ir_fail_reason,
+                                      &ir_fail_opcode)) {
+      fbx_ir_free(ir);
+      fbx_wasm_buffer_free(&buf);
+      T2TraceLine(g_t2_trace_verbose,
+                  "[t2 synth-fail] sys=%p pc=%#llx opcode=0x%02x reason=%s\n",
+                  (void *)m->system, (unsigned long long)b->start_pc,
+                  (unsigned)ir_fail_opcode,
+                  fbx_ir_fail_reason_name(ir_fail_reason));
+      T2TraceLine(g_t2_trace_escalations,
+                  "[t2 escalate] sys=%p pc=%#llx outcome=synth_failed\n",
+                  (void *)m->system, (unsigned long long)b->start_pc);
+      return;
+    }
   }
 
   /* Step 3 — instantiate via host import; pass consts[] alongside wasm. */
