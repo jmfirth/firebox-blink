@@ -37,6 +37,7 @@
 #include <unistd.h>
 
 #include "blink/fbx_ir.h"
+#include "blink/fbx_t2_block_ctx.h"
 #include "blink/fbx_wasm_emit.h"
 #include "blink/machine.h"
 #include "blink/threadedcode.h"
@@ -152,6 +153,12 @@ void Fbxt2TryEscalate(struct Machine *m, struct FbxTcBlock *b) {
   struct FbxWasmBuffer buf;
   u64 sys_id;
   int funcref;
+  /* #635: per-block constants table.  Built from a one-shot walk of the IR
+   * BEFORE emit (the emit walker dispatches through the same allocation
+   * helpers, getting the same slot indices).  The bridge copies these into
+   * the per-block FbxT2BlockCtx at instantiate time. */
+  u64 consts[FBX_T2_BLOCK_CTX_MAX_CONSTS];
+  u32 nconsts = 0;
   /* The latch — spec §6.1 idempotence.  Set FIRST so a racing thread that
    * also sees `hits >= threshold` short-circuits without re-running the
    * pipeline.  The leak-on-race is harmless per spec (the loser's funcref
@@ -177,7 +184,18 @@ void Fbxt2TryEscalate(struct Machine *m, struct FbxTcBlock *b) {
     return;
   }
 
-  /* Step 2 — synthesise wasm bytes. */
+  /* Step 2a — build the per-block consts[] table (#635). */
+  if (!fbx_ir_build_block_ctx_consts(ir, consts,
+                                     FBX_T2_BLOCK_CTX_MAX_CONSTS,
+                                     &nconsts)) {
+    fbx_ir_free(ir);
+    T2TraceLine(g_t2_trace_escalations,
+                "[t2 escalate] sys=%p pc=%#llx outcome=ctx_overflow\n",
+                (void *)m->system, (unsigned long long)b->start_pc);
+    return;
+  }
+
+  /* Step 2b — synthesise wasm bytes (constant-free at hoisted sites). */
   fbx_wasm_buffer_init(&buf);
   if (!fbx_ir_emit_wasm(ir, b, &buf)) {
     fbx_ir_free(ir);
@@ -188,9 +206,10 @@ void Fbxt2TryEscalate(struct Machine *m, struct FbxTcBlock *b) {
     return;
   }
 
-  /* Step 3 — instantiate via host import. */
+  /* Step 3 — instantiate via host import; pass consts[] alongside wasm. */
   sys_id = (u64)(uintptr_t)m->system; /* spec §11.3: sys_id = host-side &System */
-  funcref = fbx_t2_instantiate(sys_id, buf.data, (u32)buf.len);
+  funcref = fbx_t2_instantiate(sys_id, buf.data, (u32)buf.len,
+                               consts, nconsts);
   fbx_ir_free(ir);
   fbx_wasm_buffer_free(&buf);
   if (funcref < 0) {
@@ -256,10 +275,13 @@ int Fbxt2Dispatch(struct Machine *m, struct FbxTcBlock *b) {
 #ifndef __wasm__
 
 __attribute__((weak))
-int fbx_t2_instantiate(u64 sys_id, const u8 *wasm_bytes, u32 wasm_len) {
+int fbx_t2_instantiate(u64 sys_id, const u8 *wasm_bytes, u32 wasm_len,
+                       const u64 *consts, u32 nconsts) {
   (void)sys_id;
   (void)wasm_bytes;
   (void)wasm_len;
+  (void)consts;
+  (void)nconsts;
   return -1; /* T2 disabled — no engine wired in */
 }
 

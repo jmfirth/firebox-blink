@@ -114,13 +114,56 @@ void fbx_wasm_buffer_u32_le(struct FbxWasmBuffer *b, u32 v);
 /* on Tier 1 dispatch).  On bailout, *out is left untouched (zero bytes).    */
 /*                                                                            */
 /* Purity contract (LOAD-BEARING): no globals, no clocks, no TLS, no         */
-/* random sources.  Two calls with the same (ir, tc) MUST produce            */
-/* byte-identical wasm bytes — required by spec §Q5 (cache-key stability)    */
-/* and Phase 4 reachability (Decision 7 + reachability constraint doc).      */
+/* random sources.  Two calls with the same (ir, tc, fbx_t2_block_ctx layout */
+/* version) MUST produce byte-identical wasm bytes — required by spec §Q5    */
+/* (cache-key stability) and Phase 4 reachability (Decision 7 + reachability */
+/* constraint doc).                                                           */
+/*                                                                            */
+/* #635 ABI redesign — constant-free template guarantee                       */
+/*                                                                            */
+/* Per-block constants (PCs, x86 immediates, guest-register byte-offsets)    */
+/* are NO LONGER baked into the emitted wasm.  Instead the emit pass         */
+/* references them through `local.get $block_ctx; <load> offset=<idx*8>`    */
+/* where `$block_ctx` is the second wasm parameter to                         */
+/* `translated_block(i32 m_ptr, i32 block_ctx_ptr) -> i32` and the offsets    */
+/* are byte positions inside `struct FbxT2BlockCtx` (see                      */
+/* `blink/fbx_t2_block_ctx.h`).                                               */
+/*                                                                            */
+/* This means: two structurally-identical-but-constant-different IR blocks   */
+/* emit byte-identical wasm.  The bridge-side compiled-Module cache hits     */
+/* on shared shapes; per-block constants are supplied at dispatch time via   */
+/* the block_ctx_ptr second arg.                                              */
+/*                                                                            */
+/* Intra-block invariants (width masks 0xFF/0xFFFF/0xFFFFFFFF, sign-bit      */
+/* positions 7/15/31/63, EFLAGS bit positions CF/ZF/SF/OF/AF, M_OFF_IP /     */
+/* M_OFF_FLAGS, exit-code literals 0/1, RSP ±8 for PUSH/POP/CALL/RET) stay   */
+/* baked — they're structural, not per-block.  See `abi-redesign.md` §2.3.   */
 /* ────────────────────────────────────────────────────────────────────────── */
 
 int fbx_ir_emit_wasm(const struct FbxIrBlock *ir, const struct FbxTcBlock *tc,
                      struct FbxWasmBuffer *out);
+
+/* ────────────────────────────────────────────────────────────────────────── */
+/* #635 — const-table builder.                                                */
+/*                                                                            */
+/* Walks `ir` with the SAME encounter-order policy that the emit pass uses   */
+/* internally (see `AllocateBlockCtx` in fbx_ir_emit_wasm.c) and writes the  */
+/* per-block constants into `out_consts`.  `out_nconsts` is set to the       */
+/* count of slots used (≤ FBX_T2_BLOCK_CTX_MAX_CONSTS).                       */
+/*                                                                            */
+/* PURITY: the index assignment is a deterministic function of               */
+/* `(opcode, operand-kinds, encounter-order)` ONLY — NOT of the constant     */
+/* VALUES.  Two IRs differing only in immediate values produce the same     */
+/* slot assignment (and therefore the same wasm bytes from the emit pass).  */
+/*                                                                            */
+/* Returns 1 on success, 0 if the block exceeds FBX_T2_BLOCK_CTX_MAX_CONSTS  */
+/* in any sub-range (PC / immediate / greg).  On failure the caller must    */
+/* NOT escalate the block — the emit pass would have refused too.            */
+/* ────────────────────────────────────────────────────────────────────────── */
+
+int fbx_ir_build_block_ctx_consts(const struct FbxIrBlock *ir,
+                                  u64 *out_consts, u32 out_consts_cap,
+                                  u32 *out_nconsts);
 
 /* Diagnostic: which host imports does a synthesised module declare?  Used by
  * tests + future cache-invariant checks.  Returns the count (currently 4);

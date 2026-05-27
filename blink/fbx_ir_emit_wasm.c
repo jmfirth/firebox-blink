@@ -55,6 +55,7 @@
 #include <string.h>
 
 #include "blink/fbx_ir.h"
+#include "blink/fbx_t2_block_ctx.h"
 #include "blink/machine.h"
 #include "blink/rde.h"
 #include "blink/threadedcode.h"
@@ -599,6 +600,386 @@ static int CoverageGate(const struct FbxIrBlock *ir,
 #define EMIT_LOCAL_OFF_SCRATCH_FLAGS  1u  /* i32 */
 #define EMIT_NUM_SCRATCH_LOCALS       2u
 
+/* ────────────────────────────────────────────────────────────────────────── */
+/* #635 ABI redesign — local-index layout                                     */
+/*                                                                            */
+/* Local 0 = m_ptr (i32)            ← function param 0                        */
+/* Local 1 = block_ctx_ptr (i32)    ← function param 1 (#635 new)             */
+/* Locals 2..nvregs+1 = vreg locals (i64)                                     */
+/* Locals nvregs+2..nvregs+3 = scratch_z (i64), scratch_flags (i32)           */
+/* ────────────────────────────────────────────────────────────────────────── */
+
+#define EMIT_LOCAL_M_PTR        0u
+#define EMIT_LOCAL_BLOCK_CTX    1u
+#define EMIT_LOCAL_VREG_BASE    2u
+
+/* ────────────────────────────────────────────────────────────────────────── */
+/* #635 — per-block constant index allocator.                                 */
+/*                                                                            */
+/* Three partitioned sub-ranges (PCs / immediates / greg-offsets) within the */
+/* shared `consts[]` slot space defined by fbx_t2_block_ctx.h.  The allocator */
+/* runs ONCE per block — first to build the `consts[]` table the bridge      */
+/* fills the FbxT2BlockCtx with, and second (with identical input → identical */
+/* allocation sequence) implicitly as the emit pass walks the IR and pulls   */
+/* slot indices from the builder.                                            */
+/*                                                                            */
+/* PURITY (LOAD-BEARING): the allocator's decisions depend ONLY on the IR    */
+/* shape (opcode, operand-kinds, encounter order).  They do NOT depend on    */
+/* the constant VALUES.  Two IRs differing only in immediate values produce  */
+/* the same slot indices → the same wasm bytes.                              │
+* ────────────────────────────────────────────────────────────────────────── */
+
+struct BlockCtxBuilder {
+  u32 next_pc_idx;     /* relative within [0, FBX_T2_CTX_PC_COUNT) */
+  u32 next_imm_idx;    /* relative within [0, FBX_T2_CTX_IMM_COUNT) */
+  u32 next_greg_idx;   /* relative within [0, FBX_T2_CTX_GREG_COUNT) */
+  /* greg dedupe: greg_slot_plus1[g] == 0 → not yet allocated; otherwise
+   * slot_within_greg_range = greg_slot_plus1[g] - 1. */
+  u8 greg_slot_plus1[16];
+  int overflow;        /* sticky: set on any sub-range overflow */
+  /* High-water mark used by EmitFunctionBody to populate the FbxT2BlockCtx
+   * nconsts field analogue (the emit pass doesn't write this; the bridge   │
+* does — but we still compute it to validate against the cap).             │
+*/
+  u32 high_water;  /* one-past-last absolute slot index used */
+  /* When `consts` is non-NULL, allocator writes the const VALUE into the   │
+* assigned slot.  When NULL (emit-time re-walk), it just allocates.        │
+*/
+  u64 *consts;
+  u32 consts_cap;
+};
+
+static void BcInit(struct BlockCtxBuilder *b, u64 *consts, u32 consts_cap) {
+  memset(b, 0, sizeof(*b));
+  b->consts = consts;
+  b->consts_cap = consts_cap;
+}
+
+/* Allocate the next PC slot.  Returns absolute slot index, or sets overflow  */
+/* and returns 0xFFFFFFFFu.  Writes `value` into consts[slot] if consts is    */
+/* non-NULL.                                                                  */
+static u32 BcAllocPc(struct BlockCtxBuilder *b, u64 value) {
+  u32 slot;
+  if (b->overflow || b->next_pc_idx >= FBX_T2_CTX_PC_COUNT) {
+    b->overflow = 1;
+    return 0xFFFFFFFFu;
+  }
+  slot = FBX_T2_CTX_PC_BASE + b->next_pc_idx++;
+  if (slot >= b->high_water) b->high_water = slot + 1u;
+  if (b->consts && slot < b->consts_cap) b->consts[slot] = value;
+  return slot;
+}
+
+/* Allocate the next IMM slot. */
+static u32 BcAllocImm(struct BlockCtxBuilder *b, u64 value) {
+  u32 slot;
+  if (b->overflow || b->next_imm_idx >= FBX_T2_CTX_IMM_COUNT) {
+    b->overflow = 1;
+    return 0xFFFFFFFFu;
+  }
+  slot = FBX_T2_CTX_IMM_BASE + b->next_imm_idx++;
+  if (slot >= b->high_water) b->high_water = slot + 1u;
+  if (b->consts && slot < b->consts_cap) b->consts[slot] = value;
+  return slot;
+}
+
+/* Allocate / lookup a greg-offset slot.  Same greg id → same slot within a  */
+/* block.  Returns absolute slot index, or 0xFFFFFFFFu on overflow.  Writes  */
+/* `M_OFF_WEG + greg_id*8` into consts[slot] on first allocation only.       */
+static u32 BcAllocGreg(struct BlockCtxBuilder *b, u32 greg_id) {
+  u32 slot;
+  if (b->overflow || greg_id >= 16u) {
+    b->overflow = 1;
+    return 0xFFFFFFFFu;
+  }
+  if (b->greg_slot_plus1[greg_id] != 0) {
+    return FBX_T2_CTX_GREG_BASE + (u32)(b->greg_slot_plus1[greg_id] - 1u);
+  }
+  if (b->next_greg_idx >= FBX_T2_CTX_GREG_COUNT) {
+    b->overflow = 1;
+    return 0xFFFFFFFFu;
+  }
+  slot = FBX_T2_CTX_GREG_BASE + b->next_greg_idx;
+  b->greg_slot_plus1[greg_id] = (u8)(b->next_greg_idx + 1u);
+  b->next_greg_idx++;
+  if (slot >= b->high_water) b->high_water = slot + 1u;
+  if (b->consts && slot < b->consts_cap) {
+    b->consts[slot] = (u64)(M_OFF_WEG + greg_id * 8u);
+  }
+  return slot;
+}
+
+/* Forward decl: walks the IR allocating slots in encounter order.  Used by  */
+/* both `fbx_ir_build_block_ctx_consts` (build mode: writes values) and the  */
+/* emit pass's prep step (allocate mode: just establishes high-water mark).  */
+/* The emit body then re-allocates as it walks, getting the same indices    */
+/* by virtue of identical encounter order.                                   */
+static void WalkAllocateAllSlots(const struct FbxIrBlock *ir,
+                                 struct BlockCtxBuilder *b);
+
+/* ────────────────────────────────────────────────────────────────────────── */
+/* Per-instruction slot allocations.  Two walks (the up-front consts-table   */
+/* builder and the emit-pass body walker) call these in identical sequence; */
+/* the deterministic encounter-order policy from abi-redesign.md §6.1       */
+/* yields the same slot indices in both.                                     */
+/*                                                                            */
+/* Each helper:                                                               */
+/*   - Returns 1 on success, 0 on overflow (caller must abort escalation).  */
+/*   - For build mode (`b->consts != NULL`), writes the constant VALUE into */
+/*     consts[slot] at the same time it allocates the slot.                  */
+/*                                                                            */
+/* The helpers are called UNCONDITIONALLY for any inst that may carry per-  */
+/* block constants in v0.1 coverage.  Their internal logic decides whether  */
+/* a given operand actually consumes a slot (e.g. REG_SET only consumes an  */
+/* IMM slot when src1_kind == IMM; LEA only consumes IMM if imm != 0; etc.) */
+/* ────────────────────────────────────────────────────────────────────────── */
+
+static u32 AllocRegGetSlot(struct BlockCtxBuilder *b,
+                           const struct FbxIrInst *p) {
+  /* REG_GET reads guest greg src1 — one greg-offset slot (deduped). */
+  return BcAllocGreg(b, p->src1);
+}
+
+static u32 AllocRegSetGregSlot(struct BlockCtxBuilder *b,
+                               const struct FbxIrInst *p) {
+  return BcAllocGreg(b, p->dst);
+}
+
+/* REG_SET with IMM src: needs one IMM slot for p->imm.  Returns the slot. */
+static u32 AllocRegSetImmSlot(struct BlockCtxBuilder *b,
+                              const struct FbxIrInst *p) {
+  return BcAllocImm(b, p->imm);
+}
+
+/* LEA: greg base slot + greg dst slot + (when imm != 0) an IMM slot.       */
+struct LeaSlots {
+  u32 base_slot;
+  u32 dst_slot;
+  u32 imm_slot;       /* 0xFFFFFFFFu when imm == 0 (no slot needed) */
+  int has_imm;
+};
+
+static int AllocLeaSlots(struct BlockCtxBuilder *b,
+                         const struct FbxIrInst *p, struct LeaSlots *out) {
+  out->base_slot = BcAllocGreg(b, p->src1);
+  out->dst_slot = BcAllocGreg(b, p->dst);
+  if (p->imm != 0) {
+    out->imm_slot = BcAllocImm(b, p->imm);
+    out->has_imm = 1;
+  } else {
+    out->imm_slot = 0xFFFFFFFFu;
+    out->has_imm = 0;
+  }
+  return !b->overflow;
+}
+
+/* BRANCH_TAKEN: one PC slot for imm (target). */
+static u32 AllocBranchTakenSlot(struct BlockCtxBuilder *b,
+                                const struct FbxIrInst *p) {
+  return BcAllocPc(b, p->imm);
+}
+
+/* BAILOUT: one PC slot for imm. */
+static u32 AllocBailoutSlot(struct BlockCtxBuilder *b,
+                            const struct FbxIrInst *p) {
+  return BcAllocPc(b, p->imm);
+}
+
+/* BRANCH_COND: two PC slots — taken_pc (imm), fallthrough_pc (src2). */
+struct BranchCondSlots {
+  u32 taken_pc_slot;
+  u32 fallthrough_pc_slot;
+};
+
+static int AllocBranchCondSlots(struct BlockCtxBuilder *b,
+                                const struct FbxIrInst *p,
+                                struct BranchCondSlots *out) {
+  out->taken_pc_slot = BcAllocPc(b, p->imm);
+  out->fallthrough_pc_slot = BcAllocPc(b, (u64)(u32)p->src2);
+  return !b->overflow;
+}
+
+/* CALL_DIRECT: PC slot for return_pc (the immediate pushed to guest stack), */
+/* PC slot for target_pc (imm, the new IP).  RSP greg slot for stack ops.   */
+struct CallDirectSlots {
+  u32 rsp_slot;
+  u32 return_pc_slot;
+  u32 target_pc_slot;
+};
+
+static int AllocCallDirectSlots(struct BlockCtxBuilder *b,
+                                const struct FbxIrInst *p,
+                                struct CallDirectSlots *out) {
+  out->rsp_slot = BcAllocGreg(b, FBX_GREG_RSP);
+  out->return_pc_slot = BcAllocPc(b, (u64)(u32)p->src2);
+  out->target_pc_slot = BcAllocPc(b, p->imm);
+  return !b->overflow;
+}
+
+/* RET: only an RSP greg slot. */
+static u32 AllocRetRspSlot(struct BlockCtxBuilder *b) {
+  return BcAllocGreg(b, FBX_GREG_RSP);
+}
+
+/* PUSH: greg slot for the src greg + RSP slot. */
+struct PushPopSlots {
+  u32 rsp_slot;
+  u32 reg_slot;
+};
+
+static int AllocPushSlots(struct BlockCtxBuilder *b,
+                          const struct FbxIrInst *p,
+                          struct PushPopSlots *out) {
+  out->reg_slot = BcAllocGreg(b, p->src1);
+  out->rsp_slot = BcAllocGreg(b, FBX_GREG_RSP);
+  return !b->overflow;
+}
+
+static int AllocPopSlots(struct BlockCtxBuilder *b,
+                         const struct FbxIrInst *p,
+                         struct PushPopSlots *out) {
+  out->rsp_slot = BcAllocGreg(b, FBX_GREG_RSP);
+  out->reg_slot = BcAllocGreg(b, p->dst);
+  return !b->overflow;
+}
+
+/* Per-inst dispatch: invoke whichever Alloc* helper(s) the inst opcode needs.
+ * Used by both the consts-table-build pass (`fbx_ir_build_block_ctx_consts`) */
+/* and the emit-pass body walker.  The two walkers therefore allocate slots */
+/* in identical order. */
+static void AllocSlotsForInst(struct BlockCtxBuilder *b,
+                              const struct FbxIrInst *p) {
+  if (b->overflow) return;
+  switch (p->opcode) {
+    case FBX_IR_OP_PC_MARK:
+    case FBX_IR_OP_CMP:
+    case FBX_IR_OP_TEST:
+    case FBX_IR_OP_ADD:
+    case FBX_IR_OP_SUB:
+    case FBX_IR_OP_AND:
+    case FBX_IR_OP_OR:
+    case FBX_IR_OP_XOR:
+    case FBX_IR_OP_SET_FLAGS_RAW:
+    case FBX_IR_OP_GET_FLAG:
+      /* No per-block constants. */
+      break;
+    case FBX_IR_OP_REG_GET:
+      (void)AllocRegGetSlot(b, p);
+      break;
+    case FBX_IR_OP_REG_SET:
+      if (p->src1_kind == FBX_IR_KIND_IMM) {
+        (void)AllocRegSetImmSlot(b, p);
+      }
+      (void)AllocRegSetGregSlot(b, p);
+      break;
+    case FBX_IR_OP_LEA: {
+      struct LeaSlots s;
+      (void)AllocLeaSlots(b, p, &s);
+      break;
+    }
+    case FBX_IR_OP_BRANCH_TAKEN:
+      (void)AllocBranchTakenSlot(b, p);
+      break;
+    case FBX_IR_OP_BAILOUT:
+      (void)AllocBailoutSlot(b, p);
+      break;
+    case FBX_IR_OP_BRANCH_COND: {
+      struct BranchCondSlots s;
+      (void)AllocBranchCondSlots(b, p, &s);
+      break;
+    }
+    case FBX_IR_OP_CALL_DIRECT: {
+      struct CallDirectSlots s;
+      (void)AllocCallDirectSlots(b, p, &s);
+      break;
+    }
+    case FBX_IR_OP_RET:
+      (void)AllocRetRspSlot(b);
+      break;
+    case FBX_IR_OP_PUSH: {
+      struct PushPopSlots s;
+      (void)AllocPushSlots(b, p, &s);
+      break;
+    }
+    case FBX_IR_OP_POP: {
+      struct PushPopSlots s;
+      (void)AllocPopSlots(b, p, &s);
+      break;
+    }
+    default:
+      b->overflow = 1;
+      break;
+  }
+}
+
+static void WalkAllocateAllSlots(const struct FbxIrBlock *ir,
+                                 struct BlockCtxBuilder *b) {
+  u32 i;
+  for (i = 0; i < ir->ninsts; ++i) {
+    AllocSlotsForInst(b, &ir->insts[i]);
+    if (b->overflow) break;
+  }
+}
+
+int fbx_ir_build_block_ctx_consts(const struct FbxIrBlock *ir,
+                                  u64 *out_consts, u32 out_consts_cap,
+                                  u32 *out_nconsts) {
+  struct BlockCtxBuilder b;
+  u32 i;
+  if (!ir || !out_consts || !out_nconsts) return 0;
+  if (out_consts_cap < FBX_T2_BLOCK_CTX_MAX_CONSTS) return 0;
+  for (i = 0; i < out_consts_cap; ++i) out_consts[i] = 0;
+  BcInit(&b, out_consts, out_consts_cap);
+  WalkAllocateAllSlots(ir, &b);
+  if (b.overflow) return 0;
+  *out_nconsts = b.high_water;
+  return 1;
+}
+
+/* ────────────────────────────────────────────────────────────────────────── */
+/* Block-ctx-aware load helpers.                                              */
+/*                                                                            */
+/* The bridge fills consts[slot] with a u64 value.  The emit pass reads it   */
+/* with either i64.load (for full PCs / immediates) or i32.load (for          */
+/* greg-offset values that fit in u32 — wasm linear memory is little-endian, */
+/* so the low 32 bits live at the same byte offset).                          */
+/* ────────────────────────────────────────────────────────────────────────── */
+
+/* Emit `local.get $block_ctx; i64.load offset=<consts[slot]> align=3`.       */
+/* Leaves an i64 on the wasm stack.                                           */
+static void EmitLoadCtxI64(struct FbxWasmBuffer *body, u32 slot) {
+  fbx_wasm_buffer_u8(body, WASM_OP_LOCAL_GET);
+  fbx_wasm_buffer_uleb(body, EMIT_LOCAL_BLOCK_CTX);
+  fbx_wasm_buffer_u8(body, WASM_OP_I64_LOAD);
+  fbx_wasm_buffer_uleb(body, 3); /* align log2 = 3 (8-byte) */
+  fbx_wasm_buffer_uleb(body, FBX_T2_CTX_OFF_CONST(slot));
+}
+
+/* Emit `local.get $block_ctx; i32.load offset=<consts[slot]> align=2`.       */
+/* Leaves the low 32 bits of consts[slot] on the wasm stack as i32.           */
+static void EmitLoadCtxI32(struct FbxWasmBuffer *body, u32 slot) {
+  fbx_wasm_buffer_u8(body, WASM_OP_LOCAL_GET);
+  fbx_wasm_buffer_uleb(body, EMIT_LOCAL_BLOCK_CTX);
+  fbx_wasm_buffer_u8(body, WASM_OP_I32_LOAD);
+  fbx_wasm_buffer_uleb(body, 2); /* align log2 = 2 (4-byte) */
+  fbx_wasm_buffer_uleb(body, FBX_T2_CTX_OFF_CONST(slot));
+}
+
+/* Emit code that pushes the effective i32 host-memory address (m_ptr +     */
+/* greg_offset) onto the stack, where greg_offset is read from the block_ctx */
+/* slot.  Pattern:                                                            */
+/*   local.get $m_ptr                                                          */
+/*   local.get $block_ctx                                                      */
+/*   i32.load offset=<ctx_off>                                                 */
+/*   i32.add                                                                   */
+/* Used as the base address for greg loads/stores in Class 1 sites. */
+static void EmitPushGregBaseAddr(struct FbxWasmBuffer *body, u32 greg_slot) {
+  fbx_wasm_buffer_u8(body, WASM_OP_LOCAL_GET);
+  fbx_wasm_buffer_uleb(body, EMIT_LOCAL_M_PTR);
+  EmitLoadCtxI32(body, greg_slot);
+  fbx_wasm_buffer_u8(body, WASM_OP_I32_ADD);
+}
+
 /* Width → sign-bit position (width*8 - 1). */
 static u32 SignBitPos(u8 width) {
   switch (width) {
@@ -623,34 +1004,36 @@ static u64 WidthMask(u8 width) {
   }
 }
 
-/* Emit `local.get m_ptr; i32.const reg_offset; i32.add; load.WIDTH` to leave
- * the guest register value on the stack as an i64. */
-static void EmitRegLoad(struct FbxWasmBuffer *body, u32 reg_id, u8 width) {
-  u32 reg_off = M_OFF_WEG + reg_id * 8u;
-  fbx_wasm_buffer_u8(body, WASM_OP_LOCAL_GET);
-  fbx_wasm_buffer_uleb(body, 0); /* m_ptr is local 0 */
-  /* Memarg: align + offset.  Use natural alignment per width. */
+/* Emit `<push effective addr m_ptr + ctx[greg_slot]>; load.WIDTH offset=0`  */
+/* to leave the guest register value on the stack as an i64.                  */
+/*                                                                            */
+/* #635 ABI redesign: the guest-register byte offset is read from the         */
+/* per-block context slot at runtime, NOT baked into the wasm `offset=` ULEB. */
+/* This is a Class 1 site (M1) per `abi-redesign.md` §2.2.                    */
+static void EmitRegLoad(struct FbxWasmBuffer *body, u32 greg_slot, u8 width) {
+  EmitPushGregBaseAddr(body, greg_slot);
+  /* Memarg: align + offset=0 (effective address already computed). */
   switch (width) {
     case 1:
       fbx_wasm_buffer_u8(body, WASM_OP_I64_LOAD8U);
       fbx_wasm_buffer_uleb(body, 0); /* align (log2) */
-      fbx_wasm_buffer_uleb(body, reg_off);
+      fbx_wasm_buffer_uleb(body, 0); /* offset */
       break;
     case 2:
       fbx_wasm_buffer_u8(body, WASM_OP_I64_LOAD16U);
       fbx_wasm_buffer_uleb(body, 1);
-      fbx_wasm_buffer_uleb(body, reg_off);
+      fbx_wasm_buffer_uleb(body, 0);
       break;
     case 4:
       fbx_wasm_buffer_u8(body, WASM_OP_I64_LOAD32U);
       fbx_wasm_buffer_uleb(body, 2);
-      fbx_wasm_buffer_uleb(body, reg_off);
+      fbx_wasm_buffer_uleb(body, 0);
       break;
     case 8:
     default:
       fbx_wasm_buffer_u8(body, WASM_OP_I64_LOAD);
       fbx_wasm_buffer_uleb(body, 3);
-      fbx_wasm_buffer_uleb(body, reg_off);
+      fbx_wasm_buffer_uleb(body, 0);
       break;
   }
 }
@@ -667,89 +1050,94 @@ static void EmitRegStorePrep(struct FbxWasmBuffer *body) {
 }
 
 /* Emit a complete REG_SET: take a vreg local index, store it into the
- * guest register at greg_id, width-truncated. */
-static void EmitRegStoreFromLocal(struct FbxWasmBuffer *body, u32 greg_id,
+ * guest register at greg_slot, width-truncated.
+ *
+ * #635: greg_slot is the per-block context slot holding the
+ * (M_OFF_WEG + greg_id*8) byte offset.  Class 1 site M2. */
+static void EmitRegStoreFromLocal(struct FbxWasmBuffer *body, u32 greg_slot,
                                   u32 src_local, u8 width) {
-  u32 reg_off = M_OFF_WEG + greg_id * 8u;
-  /* Push m_ptr. */
-  fbx_wasm_buffer_u8(body, WASM_OP_LOCAL_GET);
-  fbx_wasm_buffer_uleb(body, 0);
+  /* Push effective address (m_ptr + ctx[greg_slot]). */
+  EmitPushGregBaseAddr(body, greg_slot);
   /* Push value. */
   fbx_wasm_buffer_u8(body, WASM_OP_LOCAL_GET);
   fbx_wasm_buffer_uleb(body, src_local);
-  /* Width-truncated i64 store. */
+  /* Width-truncated i64 store at offset=0. */
   switch (width) {
     case 1:
       fbx_wasm_buffer_u8(body, WASM_OP_I64_STORE8);
       fbx_wasm_buffer_uleb(body, 0);
-      fbx_wasm_buffer_uleb(body, reg_off);
+      fbx_wasm_buffer_uleb(body, 0);
       break;
     case 2:
       fbx_wasm_buffer_u8(body, WASM_OP_I64_STORE16);
       fbx_wasm_buffer_uleb(body, 1);
-      fbx_wasm_buffer_uleb(body, reg_off);
+      fbx_wasm_buffer_uleb(body, 0);
       break;
     case 4:
       fbx_wasm_buffer_u8(body, WASM_OP_I64_STORE32);
       fbx_wasm_buffer_uleb(body, 2);
-      fbx_wasm_buffer_uleb(body, reg_off);
+      fbx_wasm_buffer_uleb(body, 0);
       break;
     case 8:
     default:
       fbx_wasm_buffer_u8(body, WASM_OP_I64_STORE);
       fbx_wasm_buffer_uleb(body, 3);
-      fbx_wasm_buffer_uleb(body, reg_off);
+      fbx_wasm_buffer_uleb(body, 0);
       break;
   }
 }
 
-/* Emit a REG_SET when the source is an immediate. */
-static void EmitRegStoreImm(struct FbxWasmBuffer *body, u32 greg_id, u64 imm,
-                            u8 width) {
-  u32 reg_off = M_OFF_WEG + greg_id * 8u;
-  fbx_wasm_buffer_u8(body, WASM_OP_LOCAL_GET);
-  fbx_wasm_buffer_uleb(body, 0);
-  fbx_wasm_buffer_u8(body, WASM_OP_I64_CONST);
-  fbx_wasm_buffer_sleb(body, (i64)imm);
+/* Emit a REG_SET when the source is an immediate.
+ *
+ * #635: BOTH the greg-base address AND the immediate value are now hoisted.
+ * Class 1 site M3 (greg_slot) + Class 2 site #1 (imm_slot). */
+static void EmitRegStoreImm(struct FbxWasmBuffer *body, u32 greg_slot,
+                            u32 imm_slot, u8 width) {
+  /* Push effective address (m_ptr + ctx[greg_slot]). */
+  EmitPushGregBaseAddr(body, greg_slot);
+  /* Push immediate value from block_ctx[imm_slot]. */
+  EmitLoadCtxI64(body, imm_slot);
   switch (width) {
     case 1:
       fbx_wasm_buffer_u8(body, WASM_OP_I64_STORE8);
       fbx_wasm_buffer_uleb(body, 0);
-      fbx_wasm_buffer_uleb(body, reg_off);
+      fbx_wasm_buffer_uleb(body, 0);
       break;
     case 2:
       fbx_wasm_buffer_u8(body, WASM_OP_I64_STORE16);
       fbx_wasm_buffer_uleb(body, 1);
-      fbx_wasm_buffer_uleb(body, reg_off);
+      fbx_wasm_buffer_uleb(body, 0);
       break;
     case 4:
       fbx_wasm_buffer_u8(body, WASM_OP_I64_STORE32);
       fbx_wasm_buffer_uleb(body, 2);
-      fbx_wasm_buffer_uleb(body, reg_off);
+      fbx_wasm_buffer_uleb(body, 0);
       break;
     case 8:
     default:
       fbx_wasm_buffer_u8(body, WASM_OP_I64_STORE);
       fbx_wasm_buffer_uleb(body, 3);
-      fbx_wasm_buffer_uleb(body, reg_off);
+      fbx_wasm_buffer_uleb(body, 0);
       break;
   }
 }
 
-/* Emit a store of a u64 immediate into Machine.ip. */
-static void EmitStoreIp(struct FbxWasmBuffer *body, u64 pc) {
+/* Emit a store of `block_ctx[pc_slot]` (i64) into Machine.ip.
+ *
+ * #635: PC value is hoisted into the block_ctx slot.  Class 2 site #2.
+ * The M_OFF_IP offset remains baked — it is an intra-block invariant. */
+static void EmitStoreIp(struct FbxWasmBuffer *body, u32 pc_slot) {
   fbx_wasm_buffer_u8(body, WASM_OP_LOCAL_GET);
-  fbx_wasm_buffer_uleb(body, 0);
-  fbx_wasm_buffer_u8(body, WASM_OP_I64_CONST);
-  fbx_wasm_buffer_sleb(body, (i64)pc);
+  fbx_wasm_buffer_uleb(body, EMIT_LOCAL_M_PTR);
+  EmitLoadCtxI64(body, pc_slot);
   fbx_wasm_buffer_u8(body, WASM_OP_I64_STORE);
   fbx_wasm_buffer_uleb(body, 3);
   fbx_wasm_buffer_uleb(body, M_OFF_IP);
 }
 
-/* Map an IR vreg index to a wasm local index.  Local 0 is m_ptr; locals
- * 1..nvregs are the vregs. */
-static u32 VregLocal(u32 vreg) { return vreg + 1u; }
+/* Map an IR vreg index to a wasm local index.  Local 0 is m_ptr,
+ * local 1 is block_ctx_ptr (#635), locals 2..nvregs+1 are the vregs. */
+static u32 VregLocal(u32 vreg) { return vreg + EMIT_LOCAL_VREG_BASE; }
 
 /* Lower an ALU op (ADD/SUB/AND/OR/XOR) — both operands are VREG-kind. */
 static int EmitAlu(struct FbxWasmBuffer *body, const struct FbxIrInst *p) {
@@ -777,33 +1165,36 @@ static int EmitAlu(struct FbxWasmBuffer *body, const struct FbxIrInst *p) {
   return 1;
 }
 
-/* Lower a LEA with base greg + immediate displacement (no index). */
-static int EmitLea(struct FbxWasmBuffer *body, const struct FbxIrInst *p) {
-  /* result = greg[src1] + imm; stored back into greg[dst]. */
-  u32 base_off;
-  u32 dst_off;
+/* Lower a LEA with base greg + immediate displacement (no index).
+ *
+ * #635: base greg byte-offset (Class 1, M5 src1), dst greg byte-offset
+ * (Class 1, M5 dst), and the immediate (Class 2, site #3) are all hoisted
+ * into the block_ctx.  Width-stamp on the store is structural (LEAVE).
+ *
+ * The `slots` argument carries the slot indices the up-front allocator
+ * assigned for THIS LEA inst; the emit-pass walker passes them through. */
+static int EmitLea(struct FbxWasmBuffer *body, const struct FbxIrInst *p,
+                   const struct LeaSlots *slots) {
   if (p->src1_kind != FBX_IR_KIND_GREG || p->dst_kind != FBX_IR_KIND_GREG) {
     return 0;
   }
   if (p->src2_kind != FBX_IR_KIND_NONE && p->src2_kind != FBX_IR_KIND_IMM) {
     return 0;
   }
-  base_off = M_OFF_WEG + p->src1 * 8u;
-  dst_off = M_OFF_WEG + p->dst * 8u;
-  /* Push m_ptr for the eventual store. */
-  fbx_wasm_buffer_u8(body, WASM_OP_LOCAL_GET);
-  fbx_wasm_buffer_uleb(body, 0);
-  /* Load base register (always 8-byte for LEA in v0.1 — x86_64 default). */
-  fbx_wasm_buffer_u8(body, WASM_OP_LOCAL_GET);
-  fbx_wasm_buffer_uleb(body, 0);
+  /* Push effective dst address for the eventual store. */
+  EmitPushGregBaseAddr(body, slots->dst_slot);
+  /* Load base register value (always 8-byte for LEA in v0.1). */
+  EmitPushGregBaseAddr(body, slots->base_slot);
   fbx_wasm_buffer_u8(body, WASM_OP_I64_LOAD);
   fbx_wasm_buffer_uleb(body, 3);
-  fbx_wasm_buffer_uleb(body, base_off);
-  /* Add immediate. */
-  fbx_wasm_buffer_u8(body, WASM_OP_I64_CONST);
-  fbx_wasm_buffer_sleb(body, (i64)p->imm);
-  fbx_wasm_buffer_u8(body, WASM_OP_I64_ADD);
-  /* Store into dst. */
+  fbx_wasm_buffer_uleb(body, 0);
+  /* Add immediate (only if non-zero — zero is invariant and the allocator
+   * skipped reserving a slot for it). */
+  if (slots->has_imm) {
+    EmitLoadCtxI64(body, slots->imm_slot);
+    fbx_wasm_buffer_u8(body, WASM_OP_I64_ADD);
+  }
+  /* Store into dst (offset=0; effective address already on stack). */
   if (p->width == 4) {
     fbx_wasm_buffer_u8(body, WASM_OP_I64_STORE32);
     fbx_wasm_buffer_uleb(body, 2);
@@ -811,7 +1202,7 @@ static int EmitLea(struct FbxWasmBuffer *body, const struct FbxIrInst *p) {
     fbx_wasm_buffer_u8(body, WASM_OP_I64_STORE);
     fbx_wasm_buffer_uleb(body, 3);
   }
-  fbx_wasm_buffer_uleb(body, dst_off);
+  fbx_wasm_buffer_uleb(body, 0);
   return 1;
 }
 
@@ -856,14 +1247,16 @@ static int EmitLea(struct FbxWasmBuffer *body, const struct FbxIrInst *p) {
 /* helper handles all four widths.                                            */
 /* ────────────────────────────────────────────────────────────────────────── */
 
-/* Get the local index of the i64 scratch_z, given nvregs. */
+/* Get the local index of the i64 scratch_z, given nvregs.
+ * #635: locals 0 (m_ptr) and 1 (block_ctx_ptr) precede the vregs; scratch
+ * locals sit at index `EMIT_LOCAL_VREG_BASE + nvregs + OFFSET`. */
 static u32 ScratchZLocal(u16 nvregs) {
-  return 1u + (u32)nvregs + EMIT_LOCAL_OFF_SCRATCH_Z;
+  return EMIT_LOCAL_VREG_BASE + (u32)nvregs + EMIT_LOCAL_OFF_SCRATCH_Z;
 }
 
 /* Get the local index of the i32 scratch_flags, given nvregs. */
 static u32 ScratchFlagsLocal(u16 nvregs) {
-  return 1u + (u32)nvregs + EMIT_LOCAL_OFF_SCRATCH_FLAGS;
+  return EMIT_LOCAL_VREG_BASE + (u32)nvregs + EMIT_LOCAL_OFF_SCRATCH_FLAGS;
 }
 
 /* Emit code that pushes (vreg_local & width_mask) on the stack as i64.
@@ -1210,24 +1603,22 @@ static int EmitJccPredicate(struct FbxWasmBuffer *body, u32 cond_id) {
 }
 
 /* Lower a BRANCH_COND IR inst.  Returns 1 on success, 0 if the predicate
- * isn't synthesisable (Jcc PF/NP at v0.1). */
+ * isn't synthesisable (Jcc PF/NP at v0.1).
+ *
+ * #635: taken_pc + fallthrough_pc are hoisted to the block_ctx (Class 2
+ * sites #13 and #14).  cond_id is intra-block invariant (encoded in IR
+ * inst shape, not a constant the bridge needs to supply). */
 static int EmitBranchCond(struct FbxWasmBuffer *body,
-                          const struct FbxIrInst *p) {
-  u64 taken_pc = p->imm;
-  /* fallthrough_pc is encoded as the low 32 bits of src2 (per the lifter
-   * in LiftJcc).  Sign-extension is irrelevant — we treat it as unsigned
-   * absolute PC. */
-  u64 fallthrough_pc = (u64)(u32)p->src2;
+                          const struct FbxIrInst *p,
+                          const struct BranchCondSlots *slots) {
   u32 cond_id = p->src1; /* low nibble of mopcode */
   /* Push m_ptr for the eventual i64.store at m->ip. */
   fbx_wasm_buffer_u8(body, WASM_OP_LOCAL_GET);
-  fbx_wasm_buffer_uleb(body, 0);
+  fbx_wasm_buffer_uleb(body, EMIT_LOCAL_M_PTR);
   /* Push taken_pc (operand 1 of select). */
-  fbx_wasm_buffer_u8(body, WASM_OP_I64_CONST);
-  fbx_wasm_buffer_sleb(body, (i64)taken_pc);
+  EmitLoadCtxI64(body, slots->taken_pc_slot);
   /* Push fallthrough_pc (operand 2 of select). */
-  fbx_wasm_buffer_u8(body, WASM_OP_I64_CONST);
-  fbx_wasm_buffer_sleb(body, (i64)fallthrough_pc);
+  EmitLoadCtxI64(body, slots->fallthrough_pc_slot);
   /* Push predicate (cond, i32; non-zero ⇒ taken_pc). */
   if (!EmitJccPredicate(body, cond_id)) {
     return 0;
@@ -1298,17 +1689,20 @@ static int EmitBranchCond(struct FbxWasmBuffer *body,
  * carries the i64 value to store.  Callers stash the value in a vreg
  * local first (CALL/PUSH stash a constant or greg value into scratch_z;
  * RET/POP read the value back into a local before the helper runs). */
+/* #635: base_slot is the per-block ctx slot holding (M_OFF_WEG + greg*8).
+ * disp is invariant 0 in v0.1 (all callers pass 0); when v0.2 enables
+ * variable disp, the caller must reserve an IMM slot via BcAllocImm and
+ * thread the slot through here.  Site #15 / M10 of abi-redesign.md §2. */
 static void EmitGuestMemStoreFromLocal(struct FbxWasmBuffer *body,
-                                       u32 base_reg, i64 disp,
+                                       u32 base_slot, i64 disp,
                                        u32 src_local, u8 width) {
-  u32 base_off = M_OFF_WEG + base_reg * 8u;
   /* Compute the wasm i32 address = i32.wrap_i64(m->weg[base_reg] + disp). */
-  fbx_wasm_buffer_u8(body, WASM_OP_LOCAL_GET);
-  fbx_wasm_buffer_uleb(body, 0);              /* m_ptr (i32 base) */
-  fbx_wasm_buffer_u8(body, WASM_OP_I64_LOAD); /* read base reg as i64 */
+  EmitPushGregBaseAddr(body, base_slot);       /* effective addr to base reg */
+  fbx_wasm_buffer_u8(body, WASM_OP_I64_LOAD);  /* read base reg as i64 */
   fbx_wasm_buffer_uleb(body, 3);
-  fbx_wasm_buffer_uleb(body, base_off);
+  fbx_wasm_buffer_uleb(body, 0);
   if (disp != 0) {
+    /* v0.1 unreachable; placeholder for v0.2 disp lighting up. */
     fbx_wasm_buffer_u8(body, WASM_OP_I64_CONST);
     fbx_wasm_buffer_sleb(body, disp);
     fbx_wasm_buffer_u8(body, WASM_OP_I64_ADD);
@@ -1343,25 +1737,26 @@ static void EmitGuestMemStoreFromLocal(struct FbxWasmBuffer *body,
   }
 }
 
-/* Emit code that stores the immediate `imm` (i64) to guest memory at
+/* Emit code that stores ctx[imm_slot] (i64) to guest memory at
  * (m->weg[base_reg] + disp).  Helper for CALL_DIRECT (which stores
- * return_pc — a constant determined at lift time). */
-static void EmitGuestMemStoreImm(struct FbxWasmBuffer *body, u32 base_reg,
-                                 i64 disp, u64 imm, u8 width) {
-  u32 base_off = M_OFF_WEG + base_reg * 8u;
-  fbx_wasm_buffer_u8(body, WASM_OP_LOCAL_GET);
-  fbx_wasm_buffer_uleb(body, 0);
+ * return_pc).
+ *
+ * #635: base_slot (Class 1, M11) + imm_slot (Class 2, site #17) are
+ * hoisted.  disp invariant zero in v0.1 (only caller is EmitCallDirect
+ * with disp=0). */
+static void EmitGuestMemStoreImm(struct FbxWasmBuffer *body, u32 base_slot,
+                                 i64 disp, u32 imm_slot, u8 width) {
+  EmitPushGregBaseAddr(body, base_slot);
   fbx_wasm_buffer_u8(body, WASM_OP_I64_LOAD);
   fbx_wasm_buffer_uleb(body, 3);
-  fbx_wasm_buffer_uleb(body, base_off);
+  fbx_wasm_buffer_uleb(body, 0);
   if (disp != 0) {
     fbx_wasm_buffer_u8(body, WASM_OP_I64_CONST);
     fbx_wasm_buffer_sleb(body, disp);
     fbx_wasm_buffer_u8(body, WASM_OP_I64_ADD);
   }
   fbx_wasm_buffer_u8(body, WASM_OP_I32_WRAP_I64);
-  fbx_wasm_buffer_u8(body, WASM_OP_I64_CONST);
-  fbx_wasm_buffer_sleb(body, (i64)imm);
+  EmitLoadCtxI64(body, imm_slot);
   switch (width) {
     case 1:
       fbx_wasm_buffer_u8(body, WASM_OP_I64_STORE8);
@@ -1389,15 +1784,15 @@ static void EmitGuestMemStoreImm(struct FbxWasmBuffer *body, u32 base_reg,
 
 /* Emit code that loads `width` bytes from guest memory at
  * (m->weg[base_reg] + disp) and leaves the value as i64 on the wasm
- * stack.  Width-tagged (zero-extending for narrow widths). */
-static void EmitGuestMemLoad(struct FbxWasmBuffer *body, u32 base_reg,
+ * stack.  Width-tagged (zero-extending for narrow widths).
+ *
+ * #635: base_slot (Class 1, M12) hoisted.  disp invariant zero in v0.1. */
+static void EmitGuestMemLoad(struct FbxWasmBuffer *body, u32 base_slot,
                              i64 disp, u8 width) {
-  u32 base_off = M_OFF_WEG + base_reg * 8u;
-  fbx_wasm_buffer_u8(body, WASM_OP_LOCAL_GET);
-  fbx_wasm_buffer_uleb(body, 0);
+  EmitPushGregBaseAddr(body, base_slot);
   fbx_wasm_buffer_u8(body, WASM_OP_I64_LOAD);
   fbx_wasm_buffer_uleb(body, 3);
-  fbx_wasm_buffer_uleb(body, base_off);
+  fbx_wasm_buffer_uleb(body, 0);
   if (disp != 0) {
     fbx_wasm_buffer_u8(body, WASM_OP_I64_CONST);
     fbx_wasm_buffer_sleb(body, disp);
@@ -1430,23 +1825,27 @@ static void EmitGuestMemLoad(struct FbxWasmBuffer *body, u32 base_reg,
 }
 
 /* Emit `m->weg[base_reg] += delta` as an in-place i64 add.  Wraps natively
- * (x86-64 RSP is u64; modular arithmetic matches). */
-static void EmitGregAddImm(struct FbxWasmBuffer *body, u32 base_reg,
+ * (x86-64 RSP is u64; modular arithmetic matches).
+ *
+ * #635: base_slot (Class 1, M13) hoisted.  delta is invariant literal ±8
+ * (PUSH/POP/CALL/RET) in v0.1 → stays baked as i64.const per design §2.1
+ * site #19.  If PUSH/POP grows variable-width support in v0.2, delta
+ * needs an IMM slot. */
+static void EmitGregAddImm(struct FbxWasmBuffer *body, u32 base_slot,
                            i64 delta) {
-  u32 base_off = M_OFF_WEG + base_reg * 8u;
-  fbx_wasm_buffer_u8(body, WASM_OP_LOCAL_GET);
-  fbx_wasm_buffer_uleb(body, 0); /* m_ptr (i32 base for the store) */
-  fbx_wasm_buffer_u8(body, WASM_OP_LOCAL_GET);
-  fbx_wasm_buffer_uleb(body, 0); /* m_ptr (i32 base for the load) */
+  /* Push effective dst address for the store. */
+  EmitPushGregBaseAddr(body, base_slot);
+  /* Re-push effective addr for the load (same slot; same value). */
+  EmitPushGregBaseAddr(body, base_slot);
   fbx_wasm_buffer_u8(body, WASM_OP_I64_LOAD);
   fbx_wasm_buffer_uleb(body, 3);
-  fbx_wasm_buffer_uleb(body, base_off);
+  fbx_wasm_buffer_uleb(body, 0);
   fbx_wasm_buffer_u8(body, WASM_OP_I64_CONST);
   fbx_wasm_buffer_sleb(body, delta);
   fbx_wasm_buffer_u8(body, WASM_OP_I64_ADD);
   fbx_wasm_buffer_u8(body, WASM_OP_I64_STORE);
   fbx_wasm_buffer_uleb(body, 3);
-  fbx_wasm_buffer_uleb(body, base_off);
+  fbx_wasm_buffer_uleb(body, 0);
 }
 
 /* Lower a CALL_DIRECT IR inst.
@@ -1458,18 +1857,15 @@ static void EmitGregAddImm(struct FbxWasmBuffer *body, u32 base_reg,
  *
  * Block-terminating.  Returns 1 on success. */
 static int EmitCallDirect(struct FbxWasmBuffer *body,
-                          const struct FbxIrInst *p) {
-  u64 target_pc = p->imm;
-  /* fallthrough/return PC is encoded as low 32 bits of src2 (matches
-   * LiftCallJvds in fbx_ir_lift.c:706-715).  Treat as unsigned absolute
-   * PC; sign-extension irrelevant since bench-corpus PCs are < 4 GiB. */
-  u64 return_pc = (u64)(u32)p->src2;
+                          const struct FbxIrInst *p,
+                          const struct CallDirectSlots *slots) {
+  (void)p;
   /* Step 1: RSP -= 8. */
-  EmitGregAddImm(body, FBX_GREG_RSP, -8);
-  /* Step 2: mem[RSP] = return_pc. */
-  EmitGuestMemStoreImm(body, FBX_GREG_RSP, 0, return_pc, 8);
+  EmitGregAddImm(body, slots->rsp_slot, -8);
+  /* Step 2: mem[RSP] = return_pc (from block_ctx). */
+  EmitGuestMemStoreImm(body, slots->rsp_slot, 0, slots->return_pc_slot, 8);
   /* Step 3: m->ip = target_pc and return exit=0. */
-  EmitStoreIp(body, target_pc);
+  EmitStoreIp(body, slots->target_pc_slot);
   fbx_wasm_buffer_u8(body, WASM_OP_I32_CONST);
   fbx_wasm_buffer_sleb(body, 0);
   fbx_wasm_buffer_u8(body, WASM_OP_RETURN);
@@ -1484,22 +1880,22 @@ static int EmitCallDirect(struct FbxWasmBuffer *body,
  *
  * Block-terminating.  Uses scratch_z (i64) to stash the popped PC across
  * the wasm-stack-emptying boundary required by the i64.store to m->ip. */
-static int EmitRet(struct FbxWasmBuffer *body, u16 nvregs) {
+static int EmitRet(struct FbxWasmBuffer *body, u16 nvregs, u32 rsp_slot) {
   u32 scratch_z = ScratchZLocal(nvregs);
   /* Step 1: load *RSP into scratch_z. */
-  EmitGuestMemLoad(body, FBX_GREG_RSP, 0, 8);
+  EmitGuestMemLoad(body, rsp_slot, 0, 8);
   fbx_wasm_buffer_u8(body, WASM_OP_LOCAL_SET);
   fbx_wasm_buffer_uleb(body, scratch_z);
   /* Step 2: m->ip = scratch_z. */
   fbx_wasm_buffer_u8(body, WASM_OP_LOCAL_GET);
-  fbx_wasm_buffer_uleb(body, 0); /* m_ptr */
+  fbx_wasm_buffer_uleb(body, EMIT_LOCAL_M_PTR);
   fbx_wasm_buffer_u8(body, WASM_OP_LOCAL_GET);
   fbx_wasm_buffer_uleb(body, scratch_z);
   fbx_wasm_buffer_u8(body, WASM_OP_I64_STORE);
   fbx_wasm_buffer_uleb(body, 3);
   fbx_wasm_buffer_uleb(body, M_OFF_IP);
   /* Step 3: RSP += 8. */
-  EmitGregAddImm(body, FBX_GREG_RSP, 8);
+  EmitGregAddImm(body, rsp_slot, 8);
   /* Step 4: return exit=0. */
   fbx_wasm_buffer_u8(body, WASM_OP_I32_CONST);
   fbx_wasm_buffer_sleb(body, 0);
@@ -1519,18 +1915,18 @@ static int EmitRet(struct FbxWasmBuffer *body, u16 nvregs) {
  * 1/2/4/8 generically for forward-compatibility.  PUSH with 8-byte
  * width is the §Q7 top-30 ranking case. */
 static int EmitPush(struct FbxWasmBuffer *body, const struct FbxIrInst *p,
-                    u16 nvregs) {
+                    u16 nvregs, const struct PushPopSlots *slots) {
   u32 scratch_z = ScratchZLocal(nvregs);
   u8 width = p->width ? p->width : 8u;
   if (p->src1_kind != FBX_IR_KIND_GREG) return 0;
   /* Step 1: stash greg[reg_id] into scratch_z. */
-  EmitRegLoad(body, p->src1, width);
+  EmitRegLoad(body, slots->reg_slot, width);
   fbx_wasm_buffer_u8(body, WASM_OP_LOCAL_SET);
   fbx_wasm_buffer_uleb(body, scratch_z);
   /* Step 2: RSP -= width. */
-  EmitGregAddImm(body, FBX_GREG_RSP, -(i64)width);
+  EmitGregAddImm(body, slots->rsp_slot, -(i64)width);
   /* Step 3: *RSP = scratch_z. */
-  EmitGuestMemStoreFromLocal(body, FBX_GREG_RSP, 0, scratch_z, width);
+  EmitGuestMemStoreFromLocal(body, slots->rsp_slot, 0, scratch_z, width);
   return 1;
 }
 
@@ -1542,18 +1938,18 @@ static int EmitPush(struct FbxWasmBuffer *body, const struct FbxIrInst *p,
  * NOT block-terminating.  Uses scratch_z to stash the popped value
  * across the load-then-RSP-bump-then-store sequence. */
 static int EmitPop(struct FbxWasmBuffer *body, const struct FbxIrInst *p,
-                   u16 nvregs) {
+                   u16 nvregs, const struct PushPopSlots *slots) {
   u32 scratch_z = ScratchZLocal(nvregs);
   u8 width = p->width ? p->width : 8u;
   if (p->dst_kind != FBX_IR_KIND_GREG) return 0;
   /* Step 1: load *RSP into scratch_z. */
-  EmitGuestMemLoad(body, FBX_GREG_RSP, 0, width);
+  EmitGuestMemLoad(body, slots->rsp_slot, 0, width);
   fbx_wasm_buffer_u8(body, WASM_OP_LOCAL_SET);
   fbx_wasm_buffer_uleb(body, scratch_z);
   /* Step 2: RSP += width. */
-  EmitGregAddImm(body, FBX_GREG_RSP, (i64)width);
+  EmitGregAddImm(body, slots->rsp_slot, (i64)width);
   /* Step 3: greg[dst] = scratch_z. */
-  EmitRegStoreFromLocal(body, p->dst, scratch_z, width);
+  EmitRegStoreFromLocal(body, slots->reg_slot, scratch_z, width);
   return 1;
 }
 
@@ -1584,12 +1980,20 @@ static int BlockNeedsScratchLocals(const struct FbxIrBlock *ir) {
 }
 
 /* Emit the function body for one IR block.  Returns 1 on success, 0 on
- * unsupported op encountered mid-emission (caller frees scratch). */
+ * unsupported op encountered mid-emission (caller frees scratch).
+ *
+ * #635: the emit-pass walks the IR allocating per-block-ctx slots in the
+ * same order the up-front consts-table builder uses.  Because both walkers
+ * dispatch through `AllocSlotsForInst` with identical inputs, they assign
+ * the same absolute slot indices — guaranteeing the bridge-side consts[]
+ * table aligns with the wasm offsets the body emits. */
 static int EmitFunctionBody(struct FbxWasmBuffer *body,
                             const struct FbxIrBlock *ir) {
   u32 i;
   int terminated = 0;
   int needs_scratch = BlockNeedsScratchLocals(ir);
+  struct BlockCtxBuilder ctx_b;
+  BcInit(&ctx_b, NULL, 0); /* emit-time re-walk: just allocate, don't store */
   /* Locals declaration.  When the block needs scratch locals (#599 path),
    * emit two groups: vregs as i64, then a pair (i64 scratch_z, i32
    * scratch_flags).  Wasm encodes per-group as (count, valtype); separate
@@ -1644,17 +2048,23 @@ static int EmitFunctionBody(struct FbxWasmBuffer *body,
          * itself — the flag computation re-derives the result from
          * lhs/rhs/op_kind in EmitFlagsAfterAlu. */
         break;
-      case FBX_IR_OP_BRANCH_COND:
-        if (!EmitBranchCond(body, p)) return 0;
+      case FBX_IR_OP_BRANCH_COND: {
+        struct BranchCondSlots s;
+        if (!AllocBranchCondSlots(&ctx_b, p, &s)) return 0;
+        if (!EmitBranchCond(body, p, &s)) return 0;
         terminated = 1;
         break;
+      }
       case FBX_IR_OP_REG_GET: {
+        u32 greg_slot;
         /* dst is a vreg local; src1 is a guest register. */
         if (p->dst_kind != FBX_IR_KIND_VREG ||
             p->src1_kind != FBX_IR_KIND_GREG) {
           return 0;
         }
-        EmitRegLoad(body, p->src1, p->width ? p->width : 8u);
+        greg_slot = AllocRegGetSlot(&ctx_b, p);
+        if (ctx_b.overflow) return 0;
+        EmitRegLoad(body, greg_slot, p->width ? p->width : 8u);
         fbx_wasm_buffer_u8(body, WASM_OP_LOCAL_SET);
         fbx_wasm_buffer_uleb(body, VregLocal(p->dst));
         break;
@@ -1662,10 +2072,18 @@ static int EmitFunctionBody(struct FbxWasmBuffer *body,
       case FBX_IR_OP_REG_SET: {
         if (p->dst_kind != FBX_IR_KIND_GREG) return 0;
         if (p->src1_kind == FBX_IR_KIND_VREG) {
-          EmitRegStoreFromLocal(body, p->dst, VregLocal(p->src1),
+          /* allocator order MUST match AllocSlotsForInst: imm slot first   */
+          /* (skipped here — no imm), then greg slot. */
+          u32 greg_slot = AllocRegSetGregSlot(&ctx_b, p);
+          if (ctx_b.overflow) return 0;
+          EmitRegStoreFromLocal(body, greg_slot, VregLocal(p->src1),
                                 p->width ? p->width : 8u);
         } else if (p->src1_kind == FBX_IR_KIND_IMM) {
-          EmitRegStoreImm(body, p->dst, p->imm, p->width ? p->width : 8u);
+          u32 imm_slot = AllocRegSetImmSlot(&ctx_b, p);
+          u32 greg_slot = AllocRegSetGregSlot(&ctx_b, p);
+          if (ctx_b.overflow) return 0;
+          EmitRegStoreImm(body, greg_slot, imm_slot,
+                          p->width ? p->width : 8u);
         } else {
           return 0;
         }
@@ -1678,43 +2096,64 @@ static int EmitFunctionBody(struct FbxWasmBuffer *body,
       case FBX_IR_OP_XOR:
         if (!EmitAlu(body, p)) return 0;
         break;
-      case FBX_IR_OP_LEA:
-        if (!EmitLea(body, p)) return 0;
+      case FBX_IR_OP_LEA: {
+        struct LeaSlots s;
+        if (!AllocLeaSlots(&ctx_b, p, &s)) return 0;
+        if (!EmitLea(body, p, &s)) return 0;
         break;
-      case FBX_IR_OP_BRANCH_TAKEN:
-        /* Update m->ip and exit normally.  Block terminator. */
-        EmitStoreIp(body, p->imm);
+      }
+      case FBX_IR_OP_BRANCH_TAKEN: {
+        /* Update m->ip (from ctx PC slot) and exit normally.  Terminator. */
+        u32 pc_slot = AllocBranchTakenSlot(&ctx_b, p);
+        if (ctx_b.overflow) return 0;
+        EmitStoreIp(body, pc_slot);
         fbx_wasm_buffer_u8(body, WASM_OP_I32_CONST);
         fbx_wasm_buffer_sleb(body, 0);
         fbx_wasm_buffer_u8(body, WASM_OP_RETURN);
         terminated = 1;
         break;
-      case FBX_IR_OP_BAILOUT:
-        /* Update m->ip to the bailout PC and return exit=1. */
-        EmitStoreIp(body, p->imm);
+      }
+      case FBX_IR_OP_BAILOUT: {
+        /* Update m->ip to the bailout PC (ctx slot) and return exit=1. */
+        u32 pc_slot = AllocBailoutSlot(&ctx_b, p);
+        if (ctx_b.overflow) return 0;
+        EmitStoreIp(body, pc_slot);
         fbx_wasm_buffer_u8(body, WASM_OP_I32_CONST);
         fbx_wasm_buffer_sleb(body, 1);
         fbx_wasm_buffer_u8(body, WASM_OP_RETURN);
         terminated = 1;
         break;
-      case FBX_IR_OP_CALL_DIRECT:
+      }
+      case FBX_IR_OP_CALL_DIRECT: {
+        struct CallDirectSlots s;
+        if (!AllocCallDirectSlots(&ctx_b, p, &s)) return 0;
         /* #602 — push return_pc onto guest stack; jump to target_pc. */
-        if (!EmitCallDirect(body, p)) return 0;
+        if (!EmitCallDirect(body, p, &s)) return 0;
         terminated = 1;
         break;
-      case FBX_IR_OP_RET:
+      }
+      case FBX_IR_OP_RET: {
+        u32 rsp_slot = AllocRetRspSlot(&ctx_b);
+        if (ctx_b.overflow) return 0;
         /* #602 — pop guest stack into m->ip; bump RSP. */
-        if (!EmitRet(body, ir->nvregs)) return 0;
+        if (!EmitRet(body, ir->nvregs, rsp_slot)) return 0;
         terminated = 1;
         break;
-      case FBX_IR_OP_PUSH:
+      }
+      case FBX_IR_OP_PUSH: {
+        struct PushPopSlots s;
+        if (!AllocPushSlots(&ctx_b, p, &s)) return 0;
         /* #602 — stash greg, decrement RSP, store. */
-        if (!EmitPush(body, p, ir->nvregs)) return 0;
+        if (!EmitPush(body, p, ir->nvregs, &s)) return 0;
         break;
-      case FBX_IR_OP_POP:
+      }
+      case FBX_IR_OP_POP: {
+        struct PushPopSlots s;
+        if (!AllocPopSlots(&ctx_b, p, &s)) return 0;
         /* #602 — load from RSP, increment RSP, write greg. */
-        if (!EmitPop(body, p, ir->nvregs)) return 0;
+        if (!EmitPop(body, p, ir->nvregs, &s)) return 0;
         break;
+      }
       default:
         /* Coverage gate should have rejected this. */
         return 0;
@@ -1752,9 +2191,12 @@ static void EmitTypeSection(struct FbxWasmBuffer *out) {
   struct FbxWasmBuffer body;
   fbx_wasm_buffer_init(&body);
   fbx_wasm_buffer_uleb(&body, WASM_TYPE_COUNT);
-  /* type 0: (i32) -> (i32). */
+  /* type 0: (i32, i32) -> (i32).  #635 ABI: param 0 = m_ptr, param 1 =
+   * block_ctx_ptr.  Coincides with type 1 by signature shape; emit as a
+   * distinct entry to keep WASM_TYPE_IDX_BLOCK == 0 stable. */
   fbx_wasm_buffer_u8(&body, WASM_TYPE_FUNC);
-  fbx_wasm_buffer_uleb(&body, 1);
+  fbx_wasm_buffer_uleb(&body, 2);
+  fbx_wasm_buffer_u8(&body, WASM_VALTYPE_I32);
   fbx_wasm_buffer_u8(&body, WASM_VALTYPE_I32);
   fbx_wasm_buffer_uleb(&body, 1);
   fbx_wasm_buffer_u8(&body, WASM_VALTYPE_I32);

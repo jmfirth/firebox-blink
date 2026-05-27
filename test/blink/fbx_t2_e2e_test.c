@@ -108,8 +108,11 @@ static int g_t2_next_funcref = 0;
 static int g_t2_next_dispatch_exit = 0;     /* what the next dispatch returns */
 static int g_t2_force_instantiate_fail = 0; /* if 1, instantiate returns -1 */
 
-int fbx_t2_instantiate(u64 sys_id, const u8 *wasm_bytes, u32 wasm_len) {
+int fbx_t2_instantiate(u64 sys_id, const u8 *wasm_bytes, u32 wasm_len,
+                       const u64 *consts, u32 nconsts) {
   (void)sys_id;
+  (void)consts;
+  (void)nconsts;
   ++g_t2_instantiate_calls;
   if (g_t2_force_instantiate_fail) return -1;
   if (!wasm_bytes || wasm_len == 0) return -1;
