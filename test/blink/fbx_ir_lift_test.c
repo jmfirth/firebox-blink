@@ -132,28 +132,108 @@ static int BlockHas(const struct FbxIrBlock *ir, u8 opcode) {
 /* Per-opcode lifting tests.                                                  */
 /* ────────────────────────────────────────────────────────────────────────── */
 
-TEST(FbxIrLift, MovEvqpGvqp) {
-  /* opcode 0x89: MOV r/m64, r64.  Expect REG_GET + REG_SET. */
-  struct FbxTcBlock *tc = MakeTc(0x089, 0, 0, 0, 0x400000, 3,
+/* RDE encoding helpers for the MOV memory-form lift tests (#677).
+ *   ModrmMod(x) = (x & 0o000060000000) >> 0o026 → bits 22-23.
+ *   ModrmRm(x)  = (x & 0o000001600) >> 0o007    → bits 7-9.
+ * mod==3 → reg-to-reg form; mod∈{0,1,2} → memory form. */
+#define LIFT_RDE_MOD3 ((u64)0x00C00000ull)  /* mod=3 (reg form) */
+/* mod=1 (disp8), ModrmRm=0 (base=rax, no SIB) → `[rax + disp8]`. */
+#define LIFT_RDE_MEM_BASE_DISP8 ((u64)0x00400000ull)
+
+TEST(FbxIrLift, MovEvqpGvqpRegForm) {
+  /* opcode 0x89, modrm.mod==3: MOV r/m64, r64 reg-to-reg form.
+   * Expect REG_GET + REG_SET (the register-store path, unchanged). */
+  struct FbxTcBlock *tc = MakeTc(0x089, LIFT_RDE_MOD3, 0, 0, 0x400000, 3,
                                  FBX_TC_KIND_NORMAL);
   struct FbxIrBlock *ir = fbx_ir_lift(tc);
   ASSERT_NOTNULL(ir);
   EXPECT_NE(0, BlockHas(ir, FBX_IR_OP_PC_MARK));
   EXPECT_NE(0, BlockHas(ir, FBX_IR_OP_REG_GET));
   EXPECT_NE(0, BlockHas(ir, FBX_IR_OP_REG_SET));
+  EXPECT_EQ(0, BlockHas(ir, FBX_IR_OP_STORE));
   EXPECT_EQ(0, BlockHas(ir, FBX_IR_OP_BAILOUT));
   fbx_ir_free(ir);
   FreeTc(tc);
 }
 
-TEST(FbxIrLift, MovGvqpEvqp) {
-  /* opcode 0x8B: MOV r64, r/m64. */
-  struct FbxTcBlock *tc = MakeTc(0x08B, 0, 0, 0, 0x400000, 3,
+TEST(FbxIrLift, MovEvqpGvqpMemForm) {
+  /* opcode 0x89, modrm.mod==1 + base reg + disp8: MOV [rax+disp8], r64.
+   * #677: expect REG_GET (source reg) + STORE to mem[base+disp], no
+   * REG_SET (the dest is memory), no BAILOUT (form is supported). */
+  struct FbxTcBlock *tc = MakeTc(0x089, LIFT_RDE_MEM_BASE_DISP8, 0,
+                                 0x18, 0x400000, 3, FBX_TC_KIND_NORMAL);
+  struct FbxIrBlock *ir = fbx_ir_lift(tc);
+  u32 i;
+  int saw_store = 0;
+  ASSERT_NOTNULL(ir);
+  EXPECT_NE(0, BlockHas(ir, FBX_IR_OP_REG_GET));
+  EXPECT_NE(0, BlockHas(ir, FBX_IR_OP_STORE));
+  EXPECT_EQ(0, BlockHas(ir, FBX_IR_OP_REG_SET));
+  EXPECT_EQ(0, BlockHas(ir, FBX_IR_OP_BAILOUT));
+  /* STORE must carry: GREG base in src1, VREG value in src2, disp in imm. */
+  for (i = 0; i < ir->ninsts; ++i) {
+    const struct FbxIrInst *p = &ir->insts[i];
+    if (p->opcode == FBX_IR_OP_STORE) {
+      saw_store = 1;
+      EXPECT_EQ((i64)FBX_IR_KIND_GREG, (i64)p->src1_kind);
+      EXPECT_EQ((i64)FBX_IR_KIND_VREG, (i64)p->src2_kind);
+      EXPECT_EQ((i64)0x18, (i64)p->imm);
+    }
+  }
+  EXPECT_EQ(1, saw_store);
+  fbx_ir_free(ir);
+  FreeTc(tc);
+}
+
+TEST(FbxIrLift, MovGvqpEvqpRegForm) {
+  /* opcode 0x8B, modrm.mod==3: MOV r64, r/m64 reg-to-reg form. */
+  struct FbxTcBlock *tc = MakeTc(0x08B, LIFT_RDE_MOD3, 0, 0, 0x400000, 3,
                                  FBX_TC_KIND_NORMAL);
   struct FbxIrBlock *ir = fbx_ir_lift(tc);
   ASSERT_NOTNULL(ir);
   EXPECT_NE(0, BlockHas(ir, FBX_IR_OP_REG_GET));
   EXPECT_NE(0, BlockHas(ir, FBX_IR_OP_REG_SET));
+  EXPECT_EQ(0, BlockHas(ir, FBX_IR_OP_LOAD));
+  fbx_ir_free(ir);
+  FreeTc(tc);
+}
+
+TEST(FbxIrLift, MovGvqpEvqpMemForm) {
+  /* opcode 0x8B, modrm.mod==1 + base + disp8: MOV r64, [rax+disp8].
+   * #677: expect LOAD from mem[base+disp] + REG_SET (dest reg). */
+  struct FbxTcBlock *tc = MakeTc(0x08B, LIFT_RDE_MEM_BASE_DISP8, 0,
+                                 0x20, 0x400000, 3, FBX_TC_KIND_NORMAL);
+  struct FbxIrBlock *ir = fbx_ir_lift(tc);
+  u32 i;
+  int saw_load = 0;
+  ASSERT_NOTNULL(ir);
+  EXPECT_NE(0, BlockHas(ir, FBX_IR_OP_LOAD));
+  EXPECT_NE(0, BlockHas(ir, FBX_IR_OP_REG_SET));
+  EXPECT_EQ(0, BlockHas(ir, FBX_IR_OP_BAILOUT));
+  for (i = 0; i < ir->ninsts; ++i) {
+    const struct FbxIrInst *p = &ir->insts[i];
+    if (p->opcode == FBX_IR_OP_LOAD) {
+      saw_load = 1;
+      EXPECT_EQ((i64)FBX_IR_KIND_VREG, (i64)p->dst_kind);
+      EXPECT_EQ((i64)FBX_IR_KIND_GREG, (i64)p->src1_kind);
+      EXPECT_EQ((i64)0x20, (i64)p->imm);
+    }
+  }
+  EXPECT_EQ(1, saw_load);
+  fbx_ir_free(ir);
+  FreeTc(tc);
+}
+
+TEST(FbxIrLift, MovMemFormRipRelativeBailsOut) {
+  /* opcode 0x8B, modrm.mod==0 + ModrmRm==5 → RIP-relative.  #677 refuses
+   * this addressing form: the lift must emit BAILOUT (no LOAD). */
+  u64 rde_riprel = (u64)((5ull) << 007); /* ModrmRm=5, mod=0 */
+  struct FbxTcBlock *tc = MakeTc(0x08B, rde_riprel, 0, 0x100, 0x400000, 7,
+                                 FBX_TC_KIND_NORMAL);
+  struct FbxIrBlock *ir = fbx_ir_lift(tc);
+  ASSERT_NOTNULL(ir);
+  EXPECT_NE(0, BlockHas(ir, FBX_IR_OP_BAILOUT));
+  EXPECT_EQ(0, BlockHas(ir, FBX_IR_OP_LOAD));
   fbx_ir_free(ir);
   FreeTc(tc);
 }
@@ -400,7 +480,7 @@ TEST(FbxIrLift, DeterminismSameInputSameSha) {
 
 TEST(FbxIrLift, DifferentInputDifferentSha) {
   /* Pick two opcodes whose IR shapes differ:
-   *   MOV r/m, r (0x089)  → REG_GET + REG_SET (2 ALU-side insts)
+   *   MOV r/m, r (0x089) at mod==0 (mem-form) → REG_GET + STORE (#677)
    *   ADD r/m, r (0x001)  → REG_GET x2 + ADD + REG_SET + SET_FLAGS_RAW
    * The lifted byte streams differ → SHAs MUST differ. */
   struct FbxTcBlock *tc1 = MakeTc(0x089, 0, 0, 0, 0x400000, 3,

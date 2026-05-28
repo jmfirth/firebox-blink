@@ -354,6 +354,106 @@ static u8 WidthFromRde(u64 rde, int byte_op) {
   return 4;
 }
 
+/* ────────────────────────────────────────────────────────────────────────── */
+/* Memory-form addressing classification (#677).                              */
+/*                                                                            */
+/* The v0.1 memory-form MOV emit (§13.5d) lowers exactly ONE addressing      */
+/* shape: `[base + disp]` — a single guest base register plus a signed       */
+/* displacement, with NO SIB index/scale term and NOT RIP-relative.          */
+/* Empirically (work/tasks/677-* EA-form probe) this covers ~85% of the      */
+/* MOV r/m memory-form bailouts across the 6-fixture corpus; the index /     */
+/* RIP-relative tail is deferred to a later increment via correct-or-refuse  */
+/* (the lifter BAILOUTs, exactly as LEA refuses its SIB-index form).         */
+/*                                                                            */
+/* Returns 1 and writes *out_base_greg if the form is the supported          */
+/* `[base + disp]`; returns 0 otherwise (caller must BAILOUT).               */
+/*                                                                            */
+/* Base-register sourcing:                                                    */
+/*   - No SIB byte (ModrmRm != 4): base greg = RexbRm(rde).  Excludes the    */
+/*     RIP-relative encoding (mod==0 && ModrmRm==5), which has no base reg.  */
+/*   - SIB byte present (ModrmRm == 4): require a base and no index          */
+/*     (SibHasBase && !SibHasIndex); base greg = RexbBase(rde).  The         */
+/*     no-base SIB form (SibIsAbsolute / disp32-only) and any indexed form   */
+/*     are refused.                                                          */
+static int ClassifyMemBaseDisp(u64 rde, u32 *out_base_greg) {
+  if (IsModrmRegister(rde)) return 0; /* reg-form; caller handles separately */
+  if (!SibExists(rde)) {
+    /* No SIB.  RIP-relative (mod==0, ModrmRm==5) has no base register. */
+    if (ModrmMod(rde) == 0 && ModrmRm(rde) == 5) return 0;
+    *out_base_greg = (u32)RexbRm(rde);
+    return 1;
+  }
+  /* SIB byte present.  Support base-only (no index). */
+  if (SibHasBase(rde) && !SibHasIndex(rde)) {
+    *out_base_greg = (u32)RexbBase(rde);
+    return 1;
+  }
+  return 0; /* indexed or no-base SIB — refuse */
+}
+
+/* Lift MOV r/m, r in the memory-store direction (0x88/0x89, mod != 3):
+ *   REG_GET (src reg → vreg) ; STORE (mem[base+disp] = vreg).
+ * Returns 1 on success, 0 on alloc failure, -1 to request BAILOUT. */
+static int LiftMovStoreMem(struct LiftCtx *ctx, u64 rde, i64 disp,
+                           u8 width) {
+  u32 base_greg;
+  u32 val_vreg;
+  struct FbxIrInst *get;
+  struct FbxIrInst *st;
+  if (!ClassifyMemBaseDisp(rde, &base_greg)) return -1;
+  get = CtxEmit(ctx);
+  if (!get) return 0;
+  val_vreg = CtxAllocVreg(ctx);
+  get->opcode = FBX_IR_OP_REG_GET;
+  get->width = width;
+  get->dst_kind = FBX_IR_KIND_VREG;
+  get->dst = val_vreg;
+  get->src1_kind = FBX_IR_KIND_GREG;
+  get->src1 = (u32)RexrReg(rde);
+  st = CtxEmit(ctx);
+  if (!st) return 0;
+  st->opcode = FBX_IR_OP_STORE;
+  st->width = width;
+  st->dst_kind = FBX_IR_KIND_NONE;
+  st->src1_kind = FBX_IR_KIND_GREG; /* base address register */
+  st->src1 = base_greg;
+  st->src2_kind = FBX_IR_KIND_VREG; /* value to store */
+  st->src2 = val_vreg;
+  st->imm = (u64)disp; /* sign-extended displacement */
+  return 1;
+}
+
+/* Lift MOV r, r/m in the memory-load direction (0x8A/0x8B, mod != 3):
+ *   LOAD (vreg = mem[base+disp]) ; REG_SET (dst reg = vreg).
+ * Returns 1 on success, 0 on alloc failure, -1 to request BAILOUT. */
+static int LiftMovLoadMem(struct LiftCtx *ctx, u64 rde, i64 disp,
+                          u8 width) {
+  u32 base_greg;
+  u32 val_vreg;
+  struct FbxIrInst *ld;
+  struct FbxIrInst *set;
+  if (!ClassifyMemBaseDisp(rde, &base_greg)) return -1;
+  ld = CtxEmit(ctx);
+  if (!ld) return 0;
+  val_vreg = CtxAllocVreg(ctx);
+  ld->opcode = FBX_IR_OP_LOAD;
+  ld->width = width;
+  ld->dst_kind = FBX_IR_KIND_VREG;
+  ld->dst = val_vreg;
+  ld->src1_kind = FBX_IR_KIND_GREG; /* base address register */
+  ld->src1 = base_greg;
+  ld->imm = (u64)disp; /* sign-extended displacement */
+  set = CtxEmit(ctx);
+  if (!set) return 0;
+  set->opcode = FBX_IR_OP_REG_SET;
+  set->width = width;
+  set->dst_kind = FBX_IR_KIND_GREG;
+  set->dst = (u32)RexrReg(rde);
+  set->src1_kind = FBX_IR_KIND_VREG;
+  set->src1 = val_vreg;
+  return 1;
+}
+
 /* ALU sub-op decoder for OpAlui / OpAlu group:
  *   Mopcode 0x83 (OpAlui) → ModrmReg encodes the op:
  *     0=ADD  1=OR  2=ADC  3=SBB  4=AND  5=SUB  6=XOR  7=CMP
@@ -371,15 +471,24 @@ static u8 AluSubOp(u64 rde) {
   }
 }
 
-/* Lift a MOV r/m, r (opcode 0x89 / 0x88).  Treat as REG_GET + REG_SET when
- * modrm.mod==3 (reg-to-reg form), MEM_STORE when modrm.mod!=3.  v0.1
- * approximation: emit two ops; the §13.2 synthesis handles the modrm
- * dispatch.  Returns 0 on alloc failure. */
-static int LiftMovEvqpGvqp(struct LiftCtx *ctx, u64 rde, int byte_op) {
+/* Lift a MOV r/m, r (opcode 0x89 / 0x88).
+ *
+ *   modrm.mod==3 (reg-to-reg form): REG_GET (src) + REG_SET (r/m as reg).
+ *   modrm.mod!=3 (memory-store form, #677): REG_GET (src) + STORE to
+ *     mem[base+disp], for the supported `[base+disp]` addressing shape;
+ *     unsupported addressing forms (SIB index, RIP-relative, no-base SIB)
+ *     return -1 so the caller emits BAILOUT.
+ *
+ * Returns 1 on success, 0 on alloc failure, -1 to request BAILOUT. */
+static int LiftMovEvqpGvqp(struct LiftCtx *ctx, u64 rde, i64 disp,
+                           int byte_op) {
   u8 width = WidthFromRde(rde, byte_op);
   u32 src_vreg;
   struct FbxIrInst *get;
   struct FbxIrInst *set;
+  if (!IsModrmRegister(rde)) {
+    return LiftMovStoreMem(ctx, rde, disp, width);
+  }
   get = CtxEmit(ctx);
   if (!get) return 0;
   src_vreg = CtxAllocVreg(ctx);
@@ -400,13 +509,23 @@ static int LiftMovEvqpGvqp(struct LiftCtx *ctx, u64 rde, int byte_op) {
   return 1;
 }
 
-/* Lift MOV r, r/m (opcode 0x8B / 0x8A) — register-to-register direction
- * inverted from 0x89. */
-static int LiftMovGvqpEvqp(struct LiftCtx *ctx, u64 rde, int byte_op) {
+/* Lift MOV r, r/m (opcode 0x8B / 0x8A) — direction inverted from 0x89.
+ *
+ *   modrm.mod==3 (reg-to-reg form): REG_GET (r/m as reg) + REG_SET (dst).
+ *   modrm.mod!=3 (memory-load form, #677): LOAD mem[base+disp] + REG_SET
+ *     (dst), for the supported `[base+disp]` addressing shape;
+ *     unsupported addressing forms return -1 so the caller emits BAILOUT.
+ *
+ * Returns 1 on success, 0 on alloc failure, -1 to request BAILOUT. */
+static int LiftMovGvqpEvqp(struct LiftCtx *ctx, u64 rde, i64 disp,
+                           int byte_op) {
   u8 width = WidthFromRde(rde, byte_op);
   u32 src_vreg;
   struct FbxIrInst *get;
   struct FbxIrInst *set;
+  if (!IsModrmRegister(rde)) {
+    return LiftMovLoadMem(ctx, rde, disp, width);
+  }
   get = CtxEmit(ctx);
   if (!get) return 0;
   src_vreg = CtxAllocVreg(ctx);
@@ -731,12 +850,15 @@ static int LiftOne(struct LiftCtx *ctx, const struct FbxTcEntry *e,
   u64 rde = e->rde;
   u64 mop = Mopcode(rde);
   switch (mop) {
-    /* MOV r/m, r — opcode 0x88 (byte) and 0x89 (word). */
-    case 0x088: return LiftMovEvqpGvqp(ctx, rde, 1);
-    case 0x089: return LiftMovEvqpGvqp(ctx, rde, 0);
-    /* MOV r, r/m — opcode 0x8A (byte) and 0x8B (word). */
-    case 0x08A: return LiftMovGvqpEvqp(ctx, rde, 1);
-    case 0x08B: return LiftMovGvqpEvqp(ctx, rde, 0);
+    /* MOV r/m, r — opcode 0x88 (byte) and 0x89 (word).  #677 routes the
+     * memory-store form (mod != 3) through LiftMovStoreMem; the call may
+     * return -1 (unsupported addressing) which LiftOne maps to BAILOUT. */
+    case 0x088: return LiftMovEvqpGvqp(ctx, rde, e->disp, 1);
+    case 0x089: return LiftMovEvqpGvqp(ctx, rde, e->disp, 0);
+    /* MOV r, r/m — opcode 0x8A (byte) and 0x8B (word).  #677 routes the
+     * memory-load form (mod != 3) through LiftMovLoadMem. */
+    case 0x08A: return LiftMovGvqpEvqp(ctx, rde, e->disp, 1);
+    case 0x08B: return LiftMovGvqpEvqp(ctx, rde, e->disp, 0);
     /* LEA — opcode 0x8D. */
     case 0x08D: return LiftLea(ctx, rde, e->disp);
     /* MOV reg, imm — opcodes 0xB8-0xBF. */

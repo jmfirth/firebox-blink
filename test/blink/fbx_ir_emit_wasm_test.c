@@ -698,8 +698,113 @@ TEST(FbxWasmEmit, SynthsCallDirect) {
   FreeTc(tc);
 }
 
-TEST(FbxWasmEmit, RefusesMemoryModrmMov) {
-  /* MOV r/m64, r64 with modrm.mod != 3 (memory form) — v0.1 refuses. */
+/* #677 — RDE for mod==1 (disp8) + ModrmRm==0 (base=rax, no SIB): the
+ * supported `[base + disp]` memory-form addressing shape.  Bits 22-23 =
+ * mod (1 here); bits 7-9 = ModrmRm (0 here). */
+#define RDE_MEM_BASE_DISP8 ((u64)0x00400000ull)
+
+TEST(FbxWasmEmit, EmitsMemoryFormMovStore) {
+  /* #677 — MOV [rax+disp], r64 (mop 0x089, mem-form): the lifter emits
+   * REG_GET (source reg → vreg) + STORE (mem[base+disp] = vreg).  The
+   * emit pass must SYNTHESIZE this now (previously it refused with
+   * reason=mod3_required).  Assert success + i64.store present in the
+   * emitted body. */
+  struct FbxIrBlock ir;
+  struct FbxIrInst insts[3];
+  struct FbxTcBlock *tc;
+  struct FbxWasmBuffer out;
+  unsigned j;
+  int saw_store = 0;
+  memset(&ir, 0, sizeof ir);
+  memset(insts, 0, sizeof insts);
+  insts[0].opcode = FBX_IR_OP_PC_MARK;
+  insts[0].imm = 0xB000;
+  /* REG_GET — load source reg (greg 3) into vreg 0. */
+  insts[1].opcode = FBX_IR_OP_REG_GET;
+  insts[1].width = 8;
+  insts[1].dst_kind = FBX_IR_KIND_VREG;
+  insts[1].dst = 0;
+  insts[1].src1_kind = FBX_IR_KIND_GREG;
+  insts[1].src1 = 3;
+  /* STORE — mem[greg0 + 0x18] = vreg0. */
+  insts[2].opcode = FBX_IR_OP_STORE;
+  insts[2].width = 8;
+  insts[2].dst_kind = FBX_IR_KIND_NONE;
+  insts[2].src1_kind = FBX_IR_KIND_GREG;
+  insts[2].src1 = 0;
+  insts[2].src2_kind = FBX_IR_KIND_VREG;
+  insts[2].src2 = 0;
+  insts[2].imm = 0x18;
+  ir.insts = insts;
+  ir.ninsts = 3;
+  ir.nvregs = 1;
+  ir.start_pc = 0xB000;
+  ir.end_pc = 0xB003;
+  tc = MakeTc(0x089, RDE_MEM_BASE_DISP8, 0, 0x18, 0xB000, 3,
+              FBX_TC_KIND_NORMAL);
+  fbx_wasm_buffer_init(&out);
+  ASSERT_EQ(1, fbx_ir_emit_wasm(&ir, tc, &out));
+  ASSERT_NE((i64)0, (i64)out.len);
+  /* WASM_OP_I64_STORE == 0x37. */
+  for (j = 0; j < out.len; ++j) {
+    if (out.data[j] == 0x37u) saw_store = 1;
+  }
+  EXPECT_NE(0, saw_store);
+  fbx_wasm_buffer_free(&out);
+  FreeTc(tc);
+}
+
+TEST(FbxWasmEmit, EmitsMemoryFormMovLoad) {
+  /* #677 — MOV r64, [rax+disp] (mop 0x08B, mem-form): lifter emits
+   * LOAD (vreg = mem[base+disp]) + REG_SET (dest reg = vreg).  Assert
+   * success + i64.load present. */
+  struct FbxIrBlock ir;
+  struct FbxIrInst insts[3];
+  struct FbxTcBlock *tc;
+  struct FbxWasmBuffer out;
+  unsigned j;
+  int saw_load = 0;
+  memset(&ir, 0, sizeof ir);
+  memset(insts, 0, sizeof insts);
+  insts[0].opcode = FBX_IR_OP_PC_MARK;
+  insts[0].imm = 0xB100;
+  /* LOAD — vreg0 = mem[greg0 + 0x20]. */
+  insts[1].opcode = FBX_IR_OP_LOAD;
+  insts[1].width = 8;
+  insts[1].dst_kind = FBX_IR_KIND_VREG;
+  insts[1].dst = 0;
+  insts[1].src1_kind = FBX_IR_KIND_GREG;
+  insts[1].src1 = 0;
+  insts[1].imm = 0x20;
+  /* REG_SET — dest reg (greg 3) = vreg0. */
+  insts[2].opcode = FBX_IR_OP_REG_SET;
+  insts[2].width = 8;
+  insts[2].dst_kind = FBX_IR_KIND_GREG;
+  insts[2].dst = 3;
+  insts[2].src1_kind = FBX_IR_KIND_VREG;
+  insts[2].src1 = 0;
+  ir.insts = insts;
+  ir.ninsts = 3;
+  ir.nvregs = 1;
+  ir.start_pc = 0xB100;
+  ir.end_pc = 0xB103;
+  tc = MakeTc(0x08B, RDE_MEM_BASE_DISP8, 0, 0x20, 0xB100, 3,
+              FBX_TC_KIND_NORMAL);
+  fbx_wasm_buffer_init(&out);
+  ASSERT_EQ(1, fbx_ir_emit_wasm(&ir, tc, &out));
+  ASSERT_NE((i64)0, (i64)out.len);
+  /* WASM_OP_I64_LOAD == 0x29. */
+  for (j = 0; j < out.len; ++j) {
+    if (out.data[j] == 0x29u) saw_load = 1;
+  }
+  EXPECT_NE(0, saw_load);
+  fbx_wasm_buffer_free(&out);
+  FreeTc(tc);
+}
+
+TEST(FbxWasmEmit, MemoryFormMovZeroDispEmits) {
+  /* #677 — disp==0 form: no IMM slot is consumed (disp elided), but emit
+   * still succeeds.  STORE mem[greg0] = vreg0. */
   struct FbxIrBlock ir;
   struct FbxIrInst insts[3];
   struct FbxTcBlock *tc;
@@ -712,21 +817,64 @@ TEST(FbxWasmEmit, RefusesMemoryModrmMov) {
   insts[1].dst_kind = FBX_IR_KIND_VREG;
   insts[1].dst = 0;
   insts[1].src1_kind = FBX_IR_KIND_GREG;
-  insts[1].src1 = 0;
-  insts[2].opcode = FBX_IR_OP_REG_SET;
+  insts[1].src1 = 3;
+  insts[2].opcode = FBX_IR_OP_STORE;
   insts[2].width = 8;
-  insts[2].dst_kind = FBX_IR_KIND_GREG;
-  insts[2].dst = 3;
-  insts[2].src1_kind = FBX_IR_KIND_VREG;
+  insts[2].dst_kind = FBX_IR_KIND_NONE;
+  insts[2].src1_kind = FBX_IR_KIND_GREG;
   insts[2].src1 = 0;
+  insts[2].src2_kind = FBX_IR_KIND_VREG;
+  insts[2].src2 = 0;
+  insts[2].imm = 0; /* disp == 0 */
   ir.insts = insts;
   ir.ninsts = 3;
   ir.nvregs = 1;
-  /* RDE with modrm.mod == 0 (memory). */
-  tc = MakeTc(0x089, 0, 0, 0, 0xB000, 3, FBX_TC_KIND_NORMAL);
+  tc = MakeTc(0x089, 0 /* mod==0, rm==0 → [rax] */, 0, 0, 0xB200, 3,
+              FBX_TC_KIND_NORMAL);
   fbx_wasm_buffer_init(&out);
-  ASSERT_EQ(0, fbx_ir_emit_wasm(&ir, tc, &out));
+  ASSERT_EQ(1, fbx_ir_emit_wasm(&ir, tc, &out));
+  ASSERT_NE((i64)0, (i64)out.len);
   fbx_wasm_buffer_free(&out);
+  FreeTc(tc);
+}
+
+TEST(FbxWasmEmit, MemoryFormMovStoreDeterministic) {
+  /* #677 — same mem-form STORE IR emits byte-identical wasm across two
+   * calls (spec §Q5 determinism; preserves Phase 4 reachability). */
+  struct FbxIrBlock ir;
+  struct FbxIrInst insts[3];
+  struct FbxTcBlock *tc;
+  struct FbxWasmBuffer a, b;
+  memset(&ir, 0, sizeof ir);
+  memset(insts, 0, sizeof insts);
+  insts[0].opcode = FBX_IR_OP_PC_MARK;
+  insts[1].opcode = FBX_IR_OP_REG_GET;
+  insts[1].width = 8;
+  insts[1].dst_kind = FBX_IR_KIND_VREG;
+  insts[1].dst = 0;
+  insts[1].src1_kind = FBX_IR_KIND_GREG;
+  insts[1].src1 = 3;
+  insts[2].opcode = FBX_IR_OP_STORE;
+  insts[2].width = 8;
+  insts[2].dst_kind = FBX_IR_KIND_NONE;
+  insts[2].src1_kind = FBX_IR_KIND_GREG;
+  insts[2].src1 = 0;
+  insts[2].src2_kind = FBX_IR_KIND_VREG;
+  insts[2].src2 = 0;
+  insts[2].imm = 0x18;
+  ir.insts = insts;
+  ir.ninsts = 3;
+  ir.nvregs = 1;
+  tc = MakeTc(0x089, RDE_MEM_BASE_DISP8, 0, 0x18, 0xB300, 3,
+              FBX_TC_KIND_NORMAL);
+  fbx_wasm_buffer_init(&a);
+  fbx_wasm_buffer_init(&b);
+  ASSERT_EQ(1, fbx_ir_emit_wasm(&ir, tc, &a));
+  ASSERT_EQ(1, fbx_ir_emit_wasm(&ir, tc, &b));
+  ASSERT_EQ((i64)a.len, (i64)b.len);
+  ASSERT_EQ(0, memcmp(a.data, b.data, a.len));
+  fbx_wasm_buffer_free(&a);
+  fbx_wasm_buffer_free(&b);
   FreeTc(tc);
 }
 
@@ -1252,8 +1400,13 @@ TEST(FbxWasm599, IrVersionBumped) {
    *
    * #602 (CALL_DIRECT / RET / PUSH / POP synthesis) re-bumps to 3 —
    * adds new IR opcodes (PUSH/POP) and flips CALL/RET emit from
-   * refuse to synthesize, so stale v2 sidecars must invalidate. */
-  ASSERT_EQ(3u, (u32)FBX_IR_VERSION);
+   * refuse to synthesize, so stale v2 sidecars must invalidate.
+   *
+   * #677 (MOV r/m memory-form) re-bumps to 4 — the lifter now emits
+   * FBX_IR_OP_LOAD / FBX_IR_OP_STORE for MOV 0x88/0x89/0x8A/0x8B in the
+   * `[base+disp]` form (previously bailed out at mod != 3), so stale v3
+   * sidecars must invalidate. */
+  ASSERT_EQ(4u, (u32)FBX_IR_VERSION);
 }
 
 TEST(FbxWasm599, FlagSynthDifferentOpKindProducesDifferentBytes) {

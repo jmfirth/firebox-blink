@@ -440,6 +440,8 @@ static int CoverageGate(const struct FbxIrBlock *ir,
       case FBX_IR_OP_PC_MARK:
       case FBX_IR_OP_REG_GET:
       case FBX_IR_OP_REG_SET:
+      case FBX_IR_OP_LOAD:  /* #677: MOV r/m memory-form load */
+      case FBX_IR_OP_STORE: /* #677: MOV r/m memory-form store */
       case FBX_IR_OP_ADD:
       case FBX_IR_OP_SUB:
       case FBX_IR_OP_AND:
@@ -482,10 +484,24 @@ static int CoverageGate(const struct FbxIrBlock *ir,
     }
     rde = e->rde;
     mop = Mopcode(rde);
-    /* MOV r/m, r and MOV r, r/m and ALU-RR and TEST: require modrm.mod==3. */
+    /* MOV r/m, r and MOV r, r/m and ALU-RR and TEST. */
     switch (mop) {
+      /* #677 — MOV r/m, r (0x88/0x89) and MOV r, r/m (0x8A/0x8B): the
+       * lifter (blink/fbx_ir_lift.c) is now the authority on the operand
+       * form.  For modrm.mod==3 it emits REG_GET/REG_SET (accepted by the
+       * IR-side Pass-2 above); for the supported memory form `[base+disp]`
+       * it emits LOAD/STORE (also accepted); for unsupported addressing
+       * (SIB index, RIP-relative, no-base SIB) it emits BAILOUT.  So this
+       * gate no longer rejects mem-form MOV — the IR shape it produced
+       * already encodes the correct-or-bailout decision.  Removing the
+       * mod3 refuse here is what flips these opcodes from
+       * reason=mod3_required to synthesis. */
       case 0x088: case 0x089:
       case 0x08A: case 0x08B:
+        break;
+      /* ALU-RR (0x00/0x01/0x08/0x09/...) and TEST (0x84/0x85) still require
+       * modrm.mod==3 — their lifter emits REG_GET/REG_SET unconditionally
+       * and does NOT model the memory operand form yet (a later increment). */
       case 0x000: case 0x001: case 0x008: case 0x009:
       case 0x020: case 0x021: case 0x028: case 0x029:
       case 0x030: case 0x031: case 0x038: case 0x039:
@@ -928,6 +944,31 @@ static int AllocPopSlots(struct BlockCtxBuilder *b,
   return !b->overflow;
 }
 
+/* #677 — LOAD / STORE memory-form: one greg-offset slot for the base
+ * address register, plus (only when disp != 0) one IMM slot for the
+ * sign-extended displacement.  Same disp-zero-elision policy as LEA so
+ * the scarce 4-entry IMM range isn't consumed by `[base+0]` forms. */
+struct MemAddrSlots {
+  u32 base_slot;
+  u32 disp_slot;       /* 0xFFFFFFFFu when disp == 0 (no slot needed) */
+  int has_disp;
+};
+
+static int AllocLoadStoreSlots(struct BlockCtxBuilder *b,
+                               const struct FbxIrInst *p,
+                               struct MemAddrSlots *out) {
+  /* src1 is always the base greg id for both LOAD and STORE. */
+  out->base_slot = BcAllocGreg(b, p->src1);
+  if (p->imm != 0) {
+    out->disp_slot = BcAllocImm(b, p->imm);
+    out->has_disp = 1;
+  } else {
+    out->disp_slot = 0xFFFFFFFFu;
+    out->has_disp = 0;
+  }
+  return !b->overflow;
+}
+
 /* Per-inst dispatch: invoke whichever Alloc* helper(s) the inst opcode needs.
  * Used by both the consts-table-build pass (`fbx_ir_build_block_ctx_consts`) */
 /* and the emit-pass body walker.  The two walkers therefore allocate slots */
@@ -957,6 +998,14 @@ static void AllocSlotsForInst(struct BlockCtxBuilder *b,
       }
       (void)AllocRegSetGregSlot(b, p);
       break;
+    case FBX_IR_OP_LOAD:
+    case FBX_IR_OP_STORE: {
+      /* #677 — base greg slot (+ disp IMM slot when disp != 0).  Allocated
+       * identically here and in the body walker so slot indices match. */
+      struct MemAddrSlots s;
+      (void)AllocLoadStoreSlots(b, p, &s);
+      break;
+    }
     case FBX_IR_OP_LEA: {
       struct LeaSlots s;
       (void)AllocLeaSlots(b, p, &s);
@@ -1933,6 +1982,111 @@ static void EmitGregAddImm(struct FbxWasmBuffer *body, u32 base_slot,
   fbx_wasm_buffer_uleb(body, 0);
 }
 
+/* ────────────────────────────────────────────────────────────────────────── */
+/* #677 — MOV r/m memory-form (FBX_IR_OP_LOAD / FBX_IR_OP_STORE).             */
+/*                                                                            */
+/* Lowers the `[base + disp]` addressing shape against the imported wasm      */
+/* linear memory, reusing the same guest-VA-aliases-linear-memory invariant   */
+/* the PUSH/POP/CALL/RET stack ops rely on (see the §602 block above:         */
+/* ToHost(va) = va + kSkew, kSkew == 0 in linear-mapping mode).               */
+/*                                                                            */
+/* The effective guest virtual address is computed as an i64:                 */
+/*     guest_reg[base]  (i64.load of the register value)                      */
+/*   + (i64)disp        (only when disp != 0; supplied from a hoisted ctx     */
+/*                       IMM slot — NOT baked, so two same-shape blocks with  */
+/*                       different disps share one compiled module per #635)  │
+* then narrowed via i32.wrap_i64 to a wasm linear-memory address.  An OOB    */
+/* access traps the runtime; the bridge catches it and bails to Tier 1.       */
+/*                                                                            */
+/* `base_slot` is the per-block ctx slot holding (M_OFF_WEG + base_greg*8).   */
+/* `disp_slot` is the ctx IMM slot holding the i64 displacement; valid only   */
+/* when `has_disp` is set. */
+
+/* Push the i32 wasm address for [base + disp] onto the wasm stack. */
+static void EmitMemEffectiveAddr(struct FbxWasmBuffer *body, u32 base_slot,
+                                 int has_disp, u32 disp_slot) {
+  /* Load the guest base register's value as i64 (the guest VA base). */
+  EmitPushGregBaseAddr(body, base_slot);
+  fbx_wasm_buffer_u8(body, WASM_OP_I64_LOAD);
+  fbx_wasm_buffer_uleb(body, 3);
+  fbx_wasm_buffer_uleb(body, 0);
+  if (has_disp) {
+    /* + (i64)disp, from the hoisted ctx slot. */
+    EmitLoadCtxI64(body, disp_slot);
+    fbx_wasm_buffer_u8(body, WASM_OP_I64_ADD);
+  }
+  fbx_wasm_buffer_u8(body, WASM_OP_I32_WRAP_I64); /* → wasm i32 address */
+}
+
+/* Lower FBX_IR_OP_LOAD: vreg = (zero-extended) mem[base + disp].  Width-tagged
+ * unsigned loads (matches x86 MOV/MOVZX load semantics).  Leaves nothing on
+ * the wasm stack — the loaded value is stored into the destination vreg
+ * local. */
+static void EmitLoadMem(struct FbxWasmBuffer *body, u32 dst_local,
+                        u32 base_slot, int has_disp, u32 disp_slot,
+                        u8 width) {
+  EmitMemEffectiveAddr(body, base_slot, has_disp, disp_slot);
+  switch (width) {
+    case 1:
+      fbx_wasm_buffer_u8(body, WASM_OP_I64_LOAD8U);
+      fbx_wasm_buffer_uleb(body, 0);
+      fbx_wasm_buffer_uleb(body, 0);
+      break;
+    case 2:
+      fbx_wasm_buffer_u8(body, WASM_OP_I64_LOAD16U);
+      fbx_wasm_buffer_uleb(body, 1);
+      fbx_wasm_buffer_uleb(body, 0);
+      break;
+    case 4:
+      fbx_wasm_buffer_u8(body, WASM_OP_I64_LOAD32U);
+      fbx_wasm_buffer_uleb(body, 2);
+      fbx_wasm_buffer_uleb(body, 0);
+      break;
+    case 8:
+    default:
+      fbx_wasm_buffer_u8(body, WASM_OP_I64_LOAD);
+      fbx_wasm_buffer_uleb(body, 3);
+      fbx_wasm_buffer_uleb(body, 0);
+      break;
+  }
+  fbx_wasm_buffer_u8(body, WASM_OP_LOCAL_SET);
+  fbx_wasm_buffer_uleb(body, dst_local);
+}
+
+/* Lower FBX_IR_OP_STORE: mem[base + disp] = vreg (width-truncated).
+ * The wasm store opcode consumes [addr, value]; we push the address first,
+ * then the value local, then the width-tagged store. */
+static void EmitStoreMem(struct FbxWasmBuffer *body, u32 val_local,
+                         u32 base_slot, int has_disp, u32 disp_slot,
+                         u8 width) {
+  EmitMemEffectiveAddr(body, base_slot, has_disp, disp_slot);
+  fbx_wasm_buffer_u8(body, WASM_OP_LOCAL_GET);
+  fbx_wasm_buffer_uleb(body, val_local);
+  switch (width) {
+    case 1:
+      fbx_wasm_buffer_u8(body, WASM_OP_I64_STORE8);
+      fbx_wasm_buffer_uleb(body, 0);
+      fbx_wasm_buffer_uleb(body, 0);
+      break;
+    case 2:
+      fbx_wasm_buffer_u8(body, WASM_OP_I64_STORE16);
+      fbx_wasm_buffer_uleb(body, 1);
+      fbx_wasm_buffer_uleb(body, 0);
+      break;
+    case 4:
+      fbx_wasm_buffer_u8(body, WASM_OP_I64_STORE32);
+      fbx_wasm_buffer_uleb(body, 2);
+      fbx_wasm_buffer_uleb(body, 0);
+      break;
+    case 8:
+    default:
+      fbx_wasm_buffer_u8(body, WASM_OP_I64_STORE);
+      fbx_wasm_buffer_uleb(body, 3);
+      fbx_wasm_buffer_uleb(body, 0);
+      break;
+  }
+}
+
 /* Lower a CALL_DIRECT IR inst.
  *
  *   m->weg[RSP] -= 8;
@@ -2197,6 +2351,40 @@ static int EmitFunctionBody(struct FbxWasmBuffer *body,
           SetFail(fail, FBX_IR_EMIT_KIND_MISMATCH, p->opcode);
           return 0;
         }
+        break;
+      }
+      case FBX_IR_OP_LOAD: {
+        /* #677 — vreg = mem[base+disp].  dst is a vreg local; src1 is the
+         * base guest register; imm is the (sign-extended) displacement. */
+        struct MemAddrSlots s;
+        if (p->dst_kind != FBX_IR_KIND_VREG ||
+            p->src1_kind != FBX_IR_KIND_GREG) {
+          SetFail(fail, FBX_IR_EMIT_KIND_MISMATCH, p->opcode);
+          return 0;
+        }
+        if (!AllocLoadStoreSlots(&ctx_b, p, &s)) {
+          SetFail(fail, FBX_IR_EMIT_KIND_MISMATCH, p->opcode);
+          return 0;
+        }
+        EmitLoadMem(body, VregLocal(p->dst), s.base_slot, s.has_disp,
+                    s.disp_slot, p->width ? p->width : 8u);
+        break;
+      }
+      case FBX_IR_OP_STORE: {
+        /* #677 — mem[base+disp] = vreg.  src1 is the base guest register;
+         * src2 is the value vreg; imm is the (sign-extended) displacement. */
+        struct MemAddrSlots s;
+        if (p->src1_kind != FBX_IR_KIND_GREG ||
+            p->src2_kind != FBX_IR_KIND_VREG) {
+          SetFail(fail, FBX_IR_EMIT_KIND_MISMATCH, p->opcode);
+          return 0;
+        }
+        if (!AllocLoadStoreSlots(&ctx_b, p, &s)) {
+          SetFail(fail, FBX_IR_EMIT_KIND_MISMATCH, p->opcode);
+          return 0;
+        }
+        EmitStoreMem(body, VregLocal(p->src2), s.base_slot, s.has_disp,
+                     s.disp_slot, p->width ? p->width : 8u);
         break;
       }
       case FBX_IR_OP_ADD:

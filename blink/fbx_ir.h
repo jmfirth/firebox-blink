@@ -114,8 +114,19 @@ extern "C" {
  *     flip from "refuse" to "synthesize" for these four opcodes plus
  *     the two new PUSH/POP opcodes.  Stale Phase 4 sidecars compiled
  *     against v2's refuse semantics invalidate cleanly so the new emit
- *     pass runs.  See work/tasks/602-* for closure narrative. */
-#define FBX_IR_VERSION 3u
+ *     pass runs.  See work/tasks/602-* for closure narrative.
+ * v4: §13.5d follow-on (#677) — MOV r/m memory-form emit coverage.  The
+ *     lifter now emits FBX_IR_OP_LOAD / FBX_IR_OP_STORE for MOV opcodes
+ *     0x88/0x89/0x8A/0x8B in the `[base + disp]` addressing form (no SIB
+ *     index, not RIP-relative); the emit pass synthesizes the matching
+ *     guest-memory i64.load / i64.store.  Previously these blocks bailed
+ *     out (reason=mod3_required) and stayed on Tier 1; the version bump
+ *     reflects the lifter producing NEW IR for input that previously
+ *     emitted only BAILOUT/REG_GET-REG_SET-then-refused.  Stale Phase 4
+ *     sidecars compiled against v3 invalidate cleanly.  Index/RIP-relative
+ *     forms still BAILOUT (correct-or-refuse).  See work/tasks/677-* for
+ *     the closure narrative. */
+#define FBX_IR_VERSION 4u
 
 /* ────────────────────────────────────────────────────────────────────────── */
 /* IR opcodes.                                                                */
@@ -135,9 +146,29 @@ enum FbxIrOpcode {
    * at the correct PC.  Phase 4 carries it as source-position metadata. */
   FBX_IR_OP_PC_MARK = 0,
 
-  /* Memory access against guest linear memory.  Width in `width`. */
-  FBX_IR_OP_LOAD = 1,    /* dst = mem[src1 + src2*scale + imm] */
-  FBX_IR_OP_STORE = 2,   /* mem[src1 + src2*scale + imm] = src1 actually no — see encoding */
+  /* Memory access against guest linear memory.  Width in `width`.
+   *
+   * v0.1 (#677) lowers the `[base + disp]` addressing form only — a
+   * single guest base register plus a signed displacement, no SIB
+   * index/scale, not RIP-relative.  The full `src2*scale` index term is
+   * RESERVED for a later increment (the lifter refuses index/RIP forms
+   * via BAILOUT today, so no IR carrying them is ever produced).
+   *
+   * LOAD  encoding: dst_kind=VREG  dst=dest vreg;
+   *                 src1_kind=GREG src1=base greg id;
+   *                 src2_kind=NONE (reserved for index);
+   *                 imm=signed displacement (i64, sign-extended);
+   *                 width=access width (1/2/4/8).  Narrow widths
+   *                 zero-extend (matches the x86 MOV/MOVZX load shape;
+   *                 sign-extending loads are out of scope here).
+   *
+   * STORE encoding: dst_kind=NONE;
+   *                 src1_kind=GREG src1=base greg id (address);
+   *                 src2_kind=VREG src2=value vreg to store;
+   *                 imm=signed displacement (i64, sign-extended);
+   *                 width=access width (1/2/4/8). */
+  FBX_IR_OP_LOAD = 1,    /* dst(vreg) = mem[greg(src1) + (i64)imm]    */
+  FBX_IR_OP_STORE = 2,   /* mem[greg(src1) + (i64)imm] = vreg(src2)   */
 
   /* Guest register file access. */
   FBX_IR_OP_REG_GET = 3, /* dst (vreg) = guest_reg[src1.reg_id]  (width-sized) */
