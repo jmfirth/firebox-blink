@@ -470,6 +470,29 @@ static int CoverageGate(const struct FbxIrBlock *ir,
    * sound now and emittable — no gate needed.  (The mid-block software-MMU
    * miss bailout — EmitGuestVaToHostOffsetOrBailout — relies on the SAME
    * handoff and the same no-commit-before-translation discipline.) */
+#ifdef FBX735_DIAG_REFUSE_BAILOUT_AFTER_COMMIT
+  {
+    int committed_before_bailout = 0;
+    for (i = 0; i < ir->ninsts; ++i) {
+      u8 op2 = ir->insts[i].opcode;
+      switch (op2) {
+        case FBX_IR_OP_REG_SET: case FBX_IR_OP_STORE: case FBX_IR_OP_ADD:
+        case FBX_IR_OP_SUB: case FBX_IR_OP_AND: case FBX_IR_OP_OR:
+        case FBX_IR_OP_XOR: case FBX_IR_OP_LEA: case FBX_IR_OP_PUSH:
+        case FBX_IR_OP_POP: case FBX_IR_OP_CALL_DIRECT: case FBX_IR_OP_RET:
+        case FBX_IR_OP_SET_FLAGS_RAW:
+          committed_before_bailout = 1; break;
+        case FBX_IR_OP_BAILOUT:
+          if (committed_before_bailout) {
+            SetFail(fail, FBX_IR_EMIT_BAILOUT_AFTER_COMMIT, op2);
+            return 0;
+          }
+          break;
+        default: break;
+      }
+    }
+  }
+#endif
 
   /* Pass 2 — per-op acceptance. */
   for (i = 0; i < ir->ninsts; ++i) {
@@ -502,6 +525,10 @@ static int CoverageGate(const struct FbxIrBlock *ir,
      * linear-memory C object). */
     if (!HasLinearMapping()) {
       switch (op) {
+#ifdef FBX735_DIAG_REFUSE_LOADSTORE
+        case FBX_IR_OP_LOAD:
+        case FBX_IR_OP_STORE:
+#endif
         case FBX_IR_OP_PUSH:
         case FBX_IR_OP_POP:
         case FBX_IR_OP_CALL_DIRECT:
