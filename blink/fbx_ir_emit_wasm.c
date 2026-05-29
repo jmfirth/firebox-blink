@@ -224,6 +224,7 @@ static void EmitName(struct FbxWasmBuffer *b, const char *s) {
 
 #define WASM_OP_END         0x0Bu
 #define WASM_OP_RETURN      0x0Fu
+#define WASM_OP_IF          0x04u /* firebox#735 — MMU-miss bailout guard */
 #define WASM_OP_CALL        0x10u
 /* #695 — control-flow opcodes for the self-loop chain (§4 of the chaining
  * design).  `loop` + `br_if` keep a self-targeting hot block iterating
@@ -450,85 +451,57 @@ static int CoverageGate(const struct FbxIrBlock *ir,
   }
   (void)saw_flag_writer; /* presence-only; no further gating */
 
-  /* firebox#719 — BAILOUT-after-committed-work refuse.
+  /* firebox#735 — the #719 BAILOUT-after-committed-work refuse is REMOVED.
    *
-   * THE SECOND #719 CORRUPTOR (dispatch-diag witness): a BAILOUT terminator
-   * emits `EmitStoreIp(bailout_pc); i32.const 1; return` — it sets m->ip to the
-   * bailout PC and returns exit=1.  The Tier-1 host (threadedcode.c:527-538)
-   * handles exit=1 by FALLING THROUGH to a full re-walk of `entries[]` FROM
-   * INDEX 0 — it does NOT resume at m->ip.  That re-walk re-executes every op
-   * the T2 block already committed BEFORE the bailout (REG_SET / ALU / flags /
-   * stack), so any non-idempotent prior op runs TWICE → guest state diverges →
-   * the guest SIGSEGVs (witness: rip in guest x86, rax=0, after ~hundreds of
-   * dispatches; refusing BAILOUT blocks made ok0 climb past 600k with zero
-   * traps and zero crash).
+   * #719 (root cause 2): a BAILOUT terminator emits
+   * `EmitStoreIp(bailout_pc); i32.const 1; return` (m->ip = bailout PC,
+   * exit=1).  The Tier-1 host USED to handle exit=1 by re-walking `entries[]`
+   * FROM INDEX 0 instead of resuming at m->ip, so every op the T2 block
+   * committed before the bailout (REG_SET / ALU / flags / stack) ran TWICE →
+   * guest divergence → SIGSEGV.  #719 dodged this by refusing any block whose
+   * BAILOUT followed a state-committing op.
    *
-   * The bailout contract is only sound when the T2 block committed NOTHING
-   * before the bailout (a pure "set ip, hand to T1" refusal).  Until the
-   * handoff is fixed arch-side (T1 resumes at m->ip on exit=1, OR BAILOUT
-   * commits nothing — work#733), REFUSE any block whose BAILOUT is preceded by
-   * a state-committing op.  PC_MARK / REG_GET / CMP / TEST are non-committing
-   * (CMP/TEST write only the lazy-flag shadow, which the re-walk recomputes
-   * identically); a leading run of those before a BAILOUT stays emittable. */
-  {
-    int committed_before_bailout = 0;
-    for (i = 0; i < ir->ninsts; ++i) {
-      u8 op = ir->insts[i].opcode;
-      switch (op) {
-        case FBX_IR_OP_REG_SET:
-        case FBX_IR_OP_STORE:
-        case FBX_IR_OP_ADD:
-        case FBX_IR_OP_SUB:
-        case FBX_IR_OP_AND:
-        case FBX_IR_OP_OR:
-        case FBX_IR_OP_XOR:
-        case FBX_IR_OP_LEA:
-        case FBX_IR_OP_PUSH:
-        case FBX_IR_OP_POP:
-        case FBX_IR_OP_CALL_DIRECT:
-        case FBX_IR_OP_RET:
-        case FBX_IR_OP_SET_FLAGS_RAW:
-          committed_before_bailout = 1;
-          break;
-        case FBX_IR_OP_BAILOUT:
-          if (committed_before_bailout) {
-            SetFail(fail, FBX_IR_EMIT_BAILOUT_AFTER_COMMIT, op);
-            return 0;
-          }
-          break;
-        default:
-          break;
-      }
-    }
-  }
+   * #735 fixes the HANDOFF at the source (threadedcode.c ExecuteBlock): on
+   * exit=1, Tier 1 now RESUMES at the entry whose pc == m->ip — running only
+   * the not-yet-committed suffix, never re-executing the committed prefix.
+   * The lifter always emits BAILOUT at the FIRST un-liftable entry's `e->ip`
+   * (fbx_ir_lift.c), so the committed prefix is exactly the entries at PCs
+   * strictly below the bailout PC.  A BAILOUT-after-commit block is therefore
+   * sound now and emittable — no gate needed.  (The mid-block software-MMU
+   * miss bailout — EmitGuestVaToHostOffsetOrBailout — relies on the SAME
+   * handoff and the same no-commit-before-translation discipline.) */
 
   /* Pass 2 — per-op acceptance. */
   for (i = 0; i < ir->ninsts; ++i) {
     u8 op = ir->insts[i].opcode;
-    /* firebox#719 — guest-VA memory-operand refuse under a NON-linear build.
+    /* firebox#735 — guest-VA memory-operand handling under a NON-linear
+     * (software-MMU) build.
      *
-     * LOAD / STORE (#677 mem-form MOV) and the stack-mutating control-flow ops
-     * (PUSH / POP / CALL_DIRECT / RET) compute their effective address as a
-     * guest register VALUE (+ disp) and dereference it AS A wasm linear-memory
-     * offset (EmitGuestMemLoad / EmitGuestMemStore* / the §13.5c stack helpers,
-     * `i32.wrap_i64` of `m->weg[base] + disp`).  That is only correct when
-     * `ToHost(va) == va` — i.e. HasLinearMapping() (CAN_64BIT && !FLAG_nolinear).
-     * On the wasm32 blink build CAN_64BIT==0 (builtin.h:239-245) so blink runs
-     * its software MMU: a guest VA like the stack at 0x4fffff... is NOT a linear
-     * offset — it must go through ResolveAddress/GetHostAddress.  Emitting these
-     * blocks both traps OOB (the wrapped garbage offset) AND, on the STORE side,
-     * corrupts guest memory (the partial write lands at the wrong wasm offset),
-     * crashing the guest (firebox#719 dispatch-diag witness: funcref 2/3 trap at
-     * the `i64.load (reg+disp)` site; reg-only blocks like funcref 1 succeed).
-     * REG_GET/REG_SET/LEA are NOT refused: they only touch `m_ptr + offsetof`
-     * (the Machine struct, a real linear-memory C object) or compute-into-a-reg.
+     * Background (firebox#719): LOAD/STORE/PUSH/POP/CALL_DIRECT/RET compute
+     * their effective address as a guest register VALUE (+ disp) — a guest
+     * VIRTUAL address.  When HasLinearMapping() (the native 64-bit build,
+     * CAN_64BIT && !FLAG_nolinear), `ToHost(va) == va` so the VA IS a linear
+     * offset and the emit can `i32.wrap_i64` it directly.  On the wasm32
+     * blink build CAN_64BIT==0 (builtin.h:239-245) → HasLinearMapping() is
+     * compile-time FALSE → blink runs its SOFTWARE MMU: a guest VA (e.g. the
+     * stack at 0x4fffff...) is NOT a linear offset and must be translated
+     * through the page tables (blink/memory.c LookupAddress).  #719 REFUSED
+     * all six ops here to dodge the OOB-trap-and-corrupt (dispatch-diag
+     * witness: funcref 2/3 trapped at the `i64.load (reg+disp)` site).
      *
-     * Refuse → these blocks stay on Tier 1 (correct-or-refuse, spec §13.2).
-     * Removing this gate is the work#733 MMU-translation-ABI follow-up. */
+     * #735 LIFTS the refuse for LOAD/STORE: their emit now routes the VA
+     * through EmitGuestVaToHostOffsetOrBailout, which inlines blink's TLB
+     * fast path (reading the page tables out of the shared guest memory) and
+     * BAILS OUT to Tier 1 on any miss/fault (correct-or-refuse at runtime,
+     * spec §5.5; Tier 1 resumes at the bailout PC — firebox#735
+     * threadedcode.c).  The stack-mutating ops (PUSH/POP/CALL_DIRECT/RET)
+     * STAY refused this increment: they pre-decrement/advance RSP, so making
+     * the translation no-commit-before requires reordering their emit — a
+     * follow-on (work/tasks/737).  REG_GET/REG_SET/LEA were never refused
+     * (they touch only `m_ptr + offsetof` into the Machine struct, a real
+     * linear-memory C object). */
     if (!HasLinearMapping()) {
       switch (op) {
-        case FBX_IR_OP_LOAD:
-        case FBX_IR_OP_STORE:
         case FBX_IR_OP_PUSH:
         case FBX_IR_OP_POP:
         case FBX_IR_OP_CALL_DIRECT:
@@ -762,6 +735,42 @@ static int CoverageGate(const struct FbxIrBlock *ir,
 #define FBX_GREG_RBP 5u
 #define M_OFF_RSP   (M_OFF_WEG + FBX_GREG_RSP * 8u)
 
+/* firebox#735 — software-MMU inline-translation offsets + constants.
+ *
+ * On the wasm32 Blink build CAN_64BIT==0 so HasLinearMapping() is FALSE and
+ * blink runs its software MMU (blink/memory.c): a guest VA is NOT a linear
+ * offset — it is translated through the page tables to a host pointer (which,
+ * on wasm32, IS a linear-memory offset).  The §13.5 memory-operand emit
+ * (EmitGuestVaToHostOffsetOrBailout) inlines blink's TLB FAST PATH
+ * (FindPageTableEntry's `m->tlb[(page>>12)&31]` hit branch + GetPageAddress's
+ * PAGE_HOST branch + LookupAddress2's `host + (virt & 4095)`), reading the
+ * page tables OUT OF the shared guest memory the T2 module imports.  Any case
+ * the inline path does NOT cover (TLB miss, non-PAGE_HOST entry, protection
+ * fault, metal/CPL!=3, page-crossing access) BAILS OUT to Tier 1, which runs
+ * the authoritative full walk (filling the TLB) — correct-or-refuse, spec
+ * §5.5.  These offsets/constants MUST stay in sync with blink/machine.h
+ * (struct Machine / MachineTlb layout) + the PAGE_* bits there; offsetof keeps
+ * them C-compile-time-derived (NOT hand-baked) per
+ * `class_lesson_test_fixture_replicated_the_bug_it_was_meant_to_catch`. */
+#define M_OFF_METAL ((u32)offsetof(struct Machine, metal))
+#define M_OFF_TLB   ((u32)offsetof(struct Machine, tlb))
+/* struct MachineTlb { i64 page; u64 entry; } — 16 bytes, page at +0,
+ * entry at +8.  (Static-asserted at the top of EmitGuestVaToHostOffset*.) */
+#define M_TLB_STRIDE      16u
+#define M_TLB_OFF_PAGE     0u
+#define M_TLB_OFF_ENTRY    8u
+#define M_TLB_KEY_MASK    31u  /* ARRAYLEN(m->tlb)-1 == 32-1 (machine.h tlb[32]) */
+/* PAGE_* bits — mirror blink/machine.h:84-92.  PAGE_TA is the 48-bit
+ * host-address field; on wasm32 a PAGE_HOST entry's TA bits ARE the wasm
+ * linear-memory offset of the page (AllocateAnonymousPage:
+ * `real | PAGE_HOST | PAGE_U | PAGE_RW | PAGE_V`, with real a wasm mmap
+ * offset that fits PAGE_TA — unassert(!(real & ~PAGE_TA))). */
+#define M_PAGE_V    0x0000000000000001ull
+#define M_PAGE_RW   0x0000000000000002ull
+#define M_PAGE_U    0x0000000000000004ull
+#define M_PAGE_HOST 0x0000000000000400ull
+#define M_PAGE_TA   0x0000fffffffff000ull
+
 /* x86 EFLAGS bit positions — duplicated from blink/flags.h to keep this
  * file standalone (no further include dependency).  Phase 4's offline
  * emitter uses the same constants; cross-build determinism requires they
@@ -851,6 +860,12 @@ struct BlockCtxBuilder {
 */
   u64 *consts;
   u32 consts_cap;
+  /* firebox#735 — the guest PC of the x86 instruction currently being
+   * allocated for.  Updated by every PC_MARK in AllocSlotsForInst (which
+   * BOTH walkers dispatch through in identical order), so a LOAD/STORE's
+   * MMU-miss bailout-PC slot carries the failing op's PC in both the
+   * consts-build walk and the emit re-walk. */
+  u64 cur_pc;
 };
 
 static void BcInit(struct BlockCtxBuilder *b, u64 *consts, u32 consts_cap) {
@@ -1055,6 +1070,7 @@ struct MemAddrSlots {
   u32 base_slot;
   u32 disp_slot;       /* 0xFFFFFFFFu when disp == 0 (no slot needed) */
   int has_disp;
+  u32 bailout_pc_slot; /* firebox#735 — PC to bail to on a TLB miss/fault */
 };
 
 static int AllocLoadStoreSlots(struct BlockCtxBuilder *b,
@@ -1069,6 +1085,10 @@ static int AllocLoadStoreSlots(struct BlockCtxBuilder *b,
     out->disp_slot = 0xFFFFFFFFu;
     out->has_disp = 0;
   }
+  /* firebox#735 — bailout PC for the software-MMU miss path.  Allocation
+   * order (greg → imm → pc) is identical in both walkers; the PC VALUE is
+   * b->cur_pc (the most recent PC_MARK, i.e. this op's x86 instruction PC). */
+  out->bailout_pc_slot = BcAllocPc(b, b->cur_pc);
   return !b->overflow;
 }
 
@@ -1079,6 +1099,13 @@ static int AllocLoadStoreSlots(struct BlockCtxBuilder *b,
 static void AllocSlotsForInst(struct BlockCtxBuilder *b,
                               const struct FbxIrInst *p) {
   if (b->overflow) return;
+  /* firebox#735 — track the current x86 PC for the LOAD/STORE bailout slot.
+   * PC_MARK precedes every lifted op (fbx_ir_lift.c), carrying the op's PC in
+   * imm.  Both the consts-build walk and the emit re-walk update cur_pc here
+   * in identical order → matching bailout-PC slot values/indices. */
+  if (p->opcode == FBX_IR_OP_PC_MARK) {
+    b->cur_pc = p->imm;
+  }
   switch (p->opcode) {
     case FBX_IR_OP_PC_MARK:
     case FBX_IR_OP_CMP:
@@ -1514,6 +1541,43 @@ static u32 NextIpLocal(u16 nvregs) {
 }
 static u32 IterBudgetLocal(u16 nvregs) {
   return EMIT_LOCAL_VREG_BASE + (u32)nvregs + EMIT_LOCAL_OFF_ITER_BUDGET;
+}
+
+/* firebox#735 — software-MMU scratch locals (i64 mmu_va, i64 mmu_entry).
+ * Declared as the LAST locals group when the block contains a memory operand
+ * (BlockNeedsMmuLocals).  Their base index follows ALL conditional prior
+ * locals — vregs, the scratch pair (needs_scratch), and the self-loop trio
+ * (self_loop) — so EmitGuestVaToHostOffsetOrBailout can address them.  Both
+ * the locals-declaration site and the use sites compute the base from the
+ * same (needs_scratch, self_loop) flags (deterministic over the IR), keeping
+ * the index identical at declare and use. */
+#define EMIT_MMU_LOCAL_COUNT 2u
+static u32 MmuLocalsBase(const struct FbxIrBlock *ir, int needs_scratch,
+                         int self_loop) {
+  u32 base = EMIT_LOCAL_VREG_BASE + (u32)ir->nvregs;
+  if (needs_scratch) base += EMIT_NUM_SCRATCH_LOCALS; /* scratch_z + scratch_flags */
+  if (self_loop) base += 3u;                          /* entry_ip,next_ip,iter_budget */
+  return base;
+}
+static u32 MmuVaLocal(const struct FbxIrBlock *ir, int needs_scratch,
+                      int self_loop) {
+  return MmuLocalsBase(ir, needs_scratch, self_loop) + 0u;
+}
+static u32 MmuEntryLocal(const struct FbxIrBlock *ir, int needs_scratch,
+                         int self_loop) {
+  return MmuLocalsBase(ir, needs_scratch, self_loop) + 1u;
+}
+
+/* True iff the block contains a memory-operand op needing inline MMU
+ * translation (LOAD/STORE in this increment; stack ops PUSH/POP/CALL/RET are
+ * a follow-on once LOAD/STORE proves out). */
+static int BlockNeedsMmuLocals(const struct FbxIrBlock *ir) {
+  u32 i;
+  for (i = 0; i < ir->ninsts; ++i) {
+    u8 op = ir->insts[i].opcode;
+    if (op == FBX_IR_OP_LOAD || op == FBX_IR_OP_STORE) return 1;
+  }
+  return 0;
 }
 
 /* Emit code that pushes (vreg_local & width_mask) on the stack as i64.
@@ -1996,6 +2060,171 @@ static int EmitBranchCondSelfLoop(struct FbxWasmBuffer *body,
 /* 8-byte default).                                                          */
 /* ────────────────────────────────────────────────────────────────────────── */
 
+/* firebox#735 — inline software-MMU translation: guest VA → host linear
+ * offset, with a TLB-miss / fault BAILOUT.
+ *
+ * CONSUMES the guest VA (i64) currently on top of the wasm stack; LEAVES an
+ * i32 wasm-linear-memory offset on the stack (the host pointer the access
+ * should use).  When the inline fast path can't safely resolve the VA it
+ * stores `m->ip = bailout_pc` (from ctx slot `bailout_pc_slot`) and `return
+ * 1` (exit=1 → Tier 1 resumes at that PC, firebox#735 threadedcode.c).
+ *
+ * This mirrors blink's own resolution path for the CPL-3 user case
+ * (LookupAddress → LookupAddress2 → FindPageTableEntry's TLB-hit branch →
+ * GetPageAddress's PAGE_HOST branch).  It DERIVES from blink's code, it does
+ * not re-implement the fault path: anything the fast path doesn't cover bails
+ * to Tier 1's authoritative walk.  Conditions that BAIL OUT:
+ *   - TLB miss (m->tlb[(va>>12)&31].page != (va & ~4095))
+ *   - entry lacks PAGE_V|PAGE_U (+ PAGE_RW for writes)  → not present /
+ *     protection fault / kernel-only page
+ *   - entry is not PAGE_HOST (file-backed `s->real`-region page — rarer; the
+ *     host-offset there is `s->real + (entry & PAGE_TA)`, deferred)
+ *   - m->metal != 0 (CPL may be != 3; the baked `need` assumes CPL-3 user)
+ *   - page-crossing access ((va & 4095) + width > 4096)
+ * The Tier-1 walk on bailout FILLS the TLB (FindPageTableEntry), so the very
+ * next dispatch of this funcref hits the inline fast path.
+ *
+ * SOUNDNESS / NO-COMMIT-BEFORE: callers MUST emit this translation BEFORE any
+ * state mutation of the memory op (RSP adjust, value store), so a bailout
+ * re-runs the whole x86 instruction on Tier 1 with nothing double-committed.
+ *
+ * `need_rw`: 1 → require PAGE_RW (a write); 0 → read-only.
+ * `width`:   access width in bytes (page-cross check).
+ * `mmu_va` / `mmu_entry`: i64 scratch locals (see MmuVaLocal/MmuEntryLocal).
+ * `bailout_pc_slot`: ctx PC slot holding the failing op's guest PC.
+ */
+static void EmitGuestVaToHostOffsetOrBailout(struct FbxWasmBuffer *body,
+                                             int need_rw, u8 width,
+                                             u32 mmu_va, u32 mmu_entry,
+                                             u32 bailout_pc_slot) {
+  u64 need = M_PAGE_V | M_PAGE_U | (need_rw ? M_PAGE_RW : 0ull);
+
+  /* Stash the VA (consume the value the caller left on the stack). */
+  fbx_wasm_buffer_u8(body, WASM_OP_LOCAL_SET);
+  fbx_wasm_buffer_uleb(body, mmu_va);
+
+  /* mmu_entry = m->tlb[(va>>12)&31].entry.  Compute the i32 slot byte
+   * address = m_ptr + M_OFF_TLB + ((va>>12)&31)*16, then i64.load +8. */
+  fbx_wasm_buffer_u8(body, WASM_OP_LOCAL_GET);
+  fbx_wasm_buffer_uleb(body, EMIT_LOCAL_M_PTR);          /* i32 m_ptr */
+  fbx_wasm_buffer_u8(body, WASM_OP_LOCAL_GET);
+  fbx_wasm_buffer_uleb(body, mmu_va);                    /* i64 va */
+  fbx_wasm_buffer_u8(body, WASM_OP_I64_CONST);
+  fbx_wasm_buffer_sleb(body, 12);
+  fbx_wasm_buffer_u8(body, WASM_OP_I64_SHR_U);           /* va>>12 (i64) */
+  fbx_wasm_buffer_u8(body, WASM_OP_I64_CONST);
+  fbx_wasm_buffer_sleb(body, (i64)M_TLB_KEY_MASK);
+  fbx_wasm_buffer_u8(body, WASM_OP_I64_AND);             /* &31 (i64) */
+  fbx_wasm_buffer_u8(body, WASM_OP_I32_WRAP_I64);        /* → i32 key */
+  fbx_wasm_buffer_u8(body, WASM_OP_I32_CONST);
+  fbx_wasm_buffer_sleb(body, (i64)M_TLB_STRIDE);
+  /* i32.mul (0x6C). */
+  fbx_wasm_buffer_u8(body, 0x6Cu);                       /* key*16 */
+  fbx_wasm_buffer_u8(body, WASM_OP_I32_ADD);             /* m_ptr + key*16 */
+  fbx_wasm_buffer_u8(body, WASM_OP_I64_LOAD);            /* entry @ +ENTRY */
+  fbx_wasm_buffer_uleb(body, 3);
+  fbx_wasm_buffer_uleb(body, M_OFF_TLB + M_TLB_OFF_ENTRY);
+  fbx_wasm_buffer_u8(body, WASM_OP_LOCAL_SET);
+  fbx_wasm_buffer_uleb(body, mmu_entry);
+
+  /* Build the i32 FAIL predicate (1 = bail).  Accumulate via i32.or. */
+  /* (a) tlb.page != (va & ~4095). */
+  fbx_wasm_buffer_u8(body, WASM_OP_LOCAL_GET);
+  fbx_wasm_buffer_uleb(body, EMIT_LOCAL_M_PTR);
+  fbx_wasm_buffer_u8(body, WASM_OP_LOCAL_GET);
+  fbx_wasm_buffer_uleb(body, mmu_va);
+  fbx_wasm_buffer_u8(body, WASM_OP_I64_CONST);
+  fbx_wasm_buffer_sleb(body, 12);
+  fbx_wasm_buffer_u8(body, WASM_OP_I64_SHR_U);
+  fbx_wasm_buffer_u8(body, WASM_OP_I64_CONST);
+  fbx_wasm_buffer_sleb(body, (i64)M_TLB_KEY_MASK);
+  fbx_wasm_buffer_u8(body, WASM_OP_I64_AND);
+  fbx_wasm_buffer_u8(body, WASM_OP_I32_WRAP_I64);
+  fbx_wasm_buffer_u8(body, WASM_OP_I32_CONST);
+  fbx_wasm_buffer_sleb(body, (i64)M_TLB_STRIDE);
+  fbx_wasm_buffer_u8(body, 0x6Cu);                       /* key*16 */
+  fbx_wasm_buffer_u8(body, WASM_OP_I32_ADD);
+  fbx_wasm_buffer_u8(body, WASM_OP_I64_LOAD);            /* tlb.page @ +PAGE */
+  fbx_wasm_buffer_uleb(body, 3);
+  fbx_wasm_buffer_uleb(body, M_OFF_TLB + M_TLB_OFF_PAGE);
+  fbx_wasm_buffer_u8(body, WASM_OP_LOCAL_GET);
+  fbx_wasm_buffer_uleb(body, mmu_va);
+  fbx_wasm_buffer_u8(body, WASM_OP_I64_CONST);
+  fbx_wasm_buffer_sleb(body, (i64)~(u64)4095);           /* ~4095 (sign-ext) */
+  fbx_wasm_buffer_u8(body, WASM_OP_I64_AND);             /* va & ~4095 */
+  fbx_wasm_buffer_u8(body, WASM_OP_I64_NE);              /* → i32 */
+
+  /* (b) (entry & need) != need. */
+  fbx_wasm_buffer_u8(body, WASM_OP_LOCAL_GET);
+  fbx_wasm_buffer_uleb(body, mmu_entry);
+  fbx_wasm_buffer_u8(body, WASM_OP_I64_CONST);
+  fbx_wasm_buffer_sleb(body, (i64)need);
+  fbx_wasm_buffer_u8(body, WASM_OP_I64_AND);
+  fbx_wasm_buffer_u8(body, WASM_OP_I64_CONST);
+  fbx_wasm_buffer_sleb(body, (i64)need);
+  fbx_wasm_buffer_u8(body, WASM_OP_I64_NE);              /* → i32 */
+  fbx_wasm_buffer_u8(body, WASM_OP_I32_OR);
+
+  /* (c) (entry & PAGE_HOST) == 0. */
+  fbx_wasm_buffer_u8(body, WASM_OP_LOCAL_GET);
+  fbx_wasm_buffer_uleb(body, mmu_entry);
+  fbx_wasm_buffer_u8(body, WASM_OP_I64_CONST);
+  fbx_wasm_buffer_sleb(body, (i64)M_PAGE_HOST);
+  fbx_wasm_buffer_u8(body, WASM_OP_I64_AND);
+  fbx_wasm_buffer_u8(body, WASM_OP_I64_EQZ);             /* → i32 (1 if no HOST) */
+  fbx_wasm_buffer_u8(body, WASM_OP_I32_OR);
+
+  /* (d) m->metal != 0  (bool, 1 byte). */
+  fbx_wasm_buffer_u8(body, WASM_OP_LOCAL_GET);
+  fbx_wasm_buffer_uleb(body, EMIT_LOCAL_M_PTR);
+  fbx_wasm_buffer_u8(body, WASM_OP_I64_LOAD8U);
+  fbx_wasm_buffer_uleb(body, 0);
+  fbx_wasm_buffer_uleb(body, M_OFF_METAL);
+  fbx_wasm_buffer_u8(body, WASM_OP_I64_CONST);
+  fbx_wasm_buffer_sleb(body, 0);
+  fbx_wasm_buffer_u8(body, WASM_OP_I64_NE);              /* → i32 */
+  fbx_wasm_buffer_u8(body, WASM_OP_I32_OR);
+
+  /* (e) page-crossing: (va & 4095) + width > 4096. */
+  fbx_wasm_buffer_u8(body, WASM_OP_LOCAL_GET);
+  fbx_wasm_buffer_uleb(body, mmu_va);
+  fbx_wasm_buffer_u8(body, WASM_OP_I64_CONST);
+  fbx_wasm_buffer_sleb(body, 4095);
+  fbx_wasm_buffer_u8(body, WASM_OP_I64_AND);
+  fbx_wasm_buffer_u8(body, WASM_OP_I64_CONST);
+  fbx_wasm_buffer_sleb(body, (i64)width);
+  fbx_wasm_buffer_u8(body, WASM_OP_I64_ADD);
+  fbx_wasm_buffer_u8(body, WASM_OP_I64_CONST);
+  fbx_wasm_buffer_sleb(body, 4096);
+  /* i64.gt_u (0x56). */
+  fbx_wasm_buffer_u8(body, 0x56u);                       /* → i32 */
+  fbx_wasm_buffer_u8(body, WASM_OP_I32_OR);
+
+  /* if (fail) { m->ip = bailout_pc; return 1 } */
+  fbx_wasm_buffer_u8(body, WASM_OP_IF);
+  fbx_wasm_buffer_u8(body, WASM_BLOCKTYPE_EMPTY);
+  EmitStoreIp(body, bailout_pc_slot);
+  fbx_wasm_buffer_u8(body, WASM_OP_I32_CONST);
+  fbx_wasm_buffer_sleb(body, 1);
+  fbx_wasm_buffer_u8(body, WASM_OP_RETURN);
+  fbx_wasm_buffer_u8(body, WASM_OP_END);
+
+  /* host_offset = (i32)(entry & PAGE_TA) + (i32)(va & 4095). */
+  fbx_wasm_buffer_u8(body, WASM_OP_LOCAL_GET);
+  fbx_wasm_buffer_uleb(body, mmu_entry);
+  fbx_wasm_buffer_u8(body, WASM_OP_I64_CONST);
+  fbx_wasm_buffer_sleb(body, (i64)M_PAGE_TA);
+  fbx_wasm_buffer_u8(body, WASM_OP_I64_AND);
+  fbx_wasm_buffer_u8(body, WASM_OP_I32_WRAP_I64);        /* page base (i32) */
+  fbx_wasm_buffer_u8(body, WASM_OP_LOCAL_GET);
+  fbx_wasm_buffer_uleb(body, mmu_va);
+  fbx_wasm_buffer_u8(body, WASM_OP_I64_CONST);
+  fbx_wasm_buffer_sleb(body, 4095);
+  fbx_wasm_buffer_u8(body, WASM_OP_I64_AND);
+  fbx_wasm_buffer_u8(body, WASM_OP_I32_WRAP_I64);        /* page offset (i32) */
+  fbx_wasm_buffer_u8(body, WASM_OP_I32_ADD);             /* → i32 host offset */
+}
+
 /* Emit code that stores the i64 currently on top of the wasm stack to the
  * guest memory location (m->weg[base_reg] + disp).  Leaves the stack
  * empty.  Width is the store width (1/2/4/8); only 8 used in v0.1.
@@ -2198,8 +2427,13 @@ static void EmitGregAddImm(struct FbxWasmBuffer *body, u32 base_slot,
 /* when `has_disp` is set. */
 
 /* Push the i32 wasm address for [base + disp] onto the wasm stack. */
-static void EmitMemEffectiveAddr(struct FbxWasmBuffer *body, u32 base_slot,
-                                 int has_disp, u32 disp_slot) {
+/* firebox#735 — push the GUEST VIRTUAL ADDRESS (m->weg[base] + disp) as an
+ * i64 on the wasm stack.  Under the software MMU this is NOT a linear offset;
+ * the caller routes it through EmitGuestVaToHostOffsetOrBailout to translate.
+ * (Pre-#735 this appended an `i32.wrap_i64`, treating the VA as a linear
+ * offset — the #709/#719 OOB-trap root cause.) */
+static void EmitMemEffectiveVa(struct FbxWasmBuffer *body, u32 base_slot,
+                               int has_disp, u32 disp_slot) {
   /* Load the guest base register's value as i64 (the guest VA base). */
   EmitPushGregBaseAddr(body, base_slot);
   fbx_wasm_buffer_u8(body, WASM_OP_I64_LOAD);
@@ -2210,17 +2444,24 @@ static void EmitMemEffectiveAddr(struct FbxWasmBuffer *body, u32 base_slot,
     EmitLoadCtxI64(body, disp_slot);
     fbx_wasm_buffer_u8(body, WASM_OP_I64_ADD);
   }
-  fbx_wasm_buffer_u8(body, WASM_OP_I32_WRAP_I64); /* → wasm i32 address */
 }
 
 /* Lower FBX_IR_OP_LOAD: vreg = (zero-extended) mem[base + disp].  Width-tagged
  * unsigned loads (matches x86 MOV/MOVZX load semantics).  Leaves nothing on
  * the wasm stack — the loaded value is stored into the destination vreg
- * local. */
+ * local.
+ *
+ * firebox#735: the guest VA is translated through the software-MMU TLB fast
+ * path (EmitGuestVaToHostOffsetOrBailout) which leaves the host linear offset
+ * on the stack, OR bails to Tier 1 on a TLB miss/fault.  A LOAD commits
+ * nothing before the translation (read-only into dst_local), so a bailout is
+ * safe to re-run on Tier 1. */
 static void EmitLoadMem(struct FbxWasmBuffer *body, u32 dst_local,
-                        u32 base_slot, int has_disp, u32 disp_slot,
-                        u8 width) {
-  EmitMemEffectiveAddr(body, base_slot, has_disp, disp_slot);
+                        u32 base_slot, int has_disp, u32 disp_slot, u8 width,
+                        u32 mmu_va, u32 mmu_entry, u32 bailout_pc_slot) {
+  EmitMemEffectiveVa(body, base_slot, has_disp, disp_slot);
+  EmitGuestVaToHostOffsetOrBailout(body, /*need_rw=*/0, width, mmu_va,
+                                   mmu_entry, bailout_pc_slot);
   switch (width) {
     case 1:
       fbx_wasm_buffer_u8(body, WASM_OP_I64_LOAD8U);
@@ -2250,11 +2491,17 @@ static void EmitLoadMem(struct FbxWasmBuffer *body, u32 dst_local,
 
 /* Lower FBX_IR_OP_STORE: mem[base + disp] = vreg (width-truncated).
  * The wasm store opcode consumes [addr, value]; we push the address first,
- * then the value local, then the width-tagged store. */
+ * then the value local, then the width-tagged store.
+ *
+ * firebox#735: the guest VA is translated to a host offset (or bails) BEFORE
+ * the value is pushed, so a translation-miss bailout has committed nothing for
+ * this op and Tier 1 can re-run the whole instruction soundly. */
 static void EmitStoreMem(struct FbxWasmBuffer *body, u32 val_local,
-                         u32 base_slot, int has_disp, u32 disp_slot,
-                         u8 width) {
-  EmitMemEffectiveAddr(body, base_slot, has_disp, disp_slot);
+                         u32 base_slot, int has_disp, u32 disp_slot, u8 width,
+                         u32 mmu_va, u32 mmu_entry, u32 bailout_pc_slot) {
+  EmitMemEffectiveVa(body, base_slot, has_disp, disp_slot);
+  EmitGuestVaToHostOffsetOrBailout(body, /*need_rw=*/1, width, mmu_va,
+                                   mmu_entry, bailout_pc_slot);
   fbx_wasm_buffer_u8(body, WASM_OP_LOCAL_GET);
   fbx_wasm_buffer_uleb(body, val_local);
   switch (width) {
@@ -2396,12 +2643,31 @@ static int EmitPop(struct FbxWasmBuffer *body, const struct FbxIrInst *p,
  * §599: blocks with a flag-reader present trigger the eager-update path;
  * every SET_FLAGS_RAW in such a block expands into the AluFlags emit
  * sequence and needs scratch_z + scratch_flags.
- */
+ *
+ * firebox#735 (CORRECTNESS — load-bearing): a block that contains a BAILOUT
+ * ALSO triggers flag emission, because the §735 Tier-1 handoff RESUMES at
+ * m->ip (the bailout PC) instead of re-walking entries[] from index 0.  The
+ * old re-walk-from-0 RE-RAN the CMP/TEST whose flags were dead-flag-elided in
+ * the T2 block (their flag result is consumed CROSS-block by a later Jcc, so
+ * within THIS block there is no reader → elision drops them).  With
+ * resume-at-m->ip, Tier 1 SKIPS those elided ops → the flags would be LOST →
+ * the next block's conditional branch reads stale flags → wrong control flow
+ * → silent output corruption (witnessed: grep matched 82/7693 lines).  Forcing
+ * flag emission here makes the T2 block COMMIT the flags before its BAILOUT,
+ * so what Tier 1 skips on resume is exactly what T2 already applied — the
+ * resume contract's invariant ("T2 commits exactly the entries Tier 1 skips").
+ * (REG_GET into a vreg is block-local — vregs die at block end — so no other
+ * elided op carries cross-block state; the dead-flag SET_FLAGS_RAW was the
+ * only one.) */
 static int BlockNeedsScratchLocals(const struct FbxIrBlock *ir) {
   u32 i;
   for (i = 0; i < ir->ninsts; ++i) {
     u8 op = ir->insts[i].opcode;
     if (op == FBX_IR_OP_BRANCH_COND || op == FBX_IR_OP_GET_FLAG) return 1;
+    /* firebox#735 — a BAILOUT forces flag emission (see the block comment):
+     * resume-at-m->ip skips any flag-elided CMP/TEST, so T2 must commit the
+     * flags instead of eliding them. */
+    if (op == FBX_IR_OP_BAILOUT) return 1;
     /* #602 — RET/PUSH/POP stash the popped or to-be-pushed value in
      * scratch_z to bridge the wasm-stack ordering between the load
      * and the subsequent RSP adjust + store-to-ip / store-to-greg.
@@ -2474,6 +2740,10 @@ static int EmitFunctionBody(struct FbxWasmBuffer *body,
    * always has needs_scratch==1, so the self-loop locals can be declared after
    * the scratch pair as a third locals group. */
   int self_loop = BlockIsSelfLoopCandidate(ir);
+  /* firebox#735 — does the block need the 2×i64 software-MMU scratch group?
+   * Declared LAST (after vregs/scratch/self-loop) so existing local indices
+   * are unchanged; MmuVaLocal/MmuEntryLocal compute the matching base. */
+  int needs_mmu = BlockNeedsMmuLocals(ir);
   struct BlockCtxBuilder ctx_b;
   BcInit(&ctx_b, NULL, 0); /* emit-time re-walk: just allocate, don't store */
   /* Locals declaration.  When the block needs scratch locals (#599 path),
@@ -2482,11 +2752,14 @@ static int EmitFunctionBody(struct FbxWasmBuffer *body,
    * groups are required because the types differ.
    *
    * #695: a self-loop block adds two more groups after the scratch pair:
-   *   (2 × i64) entry_ip + next_ip, then (1 × i32) iter_budget. */
+   *   (2 × i64) entry_ip + next_ip, then (1 × i32) iter_budget.
+   * #735: a memory-operand block adds one final group: (2 × i64) mmu_va +
+   *   mmu_entry. */
   if (needs_scratch) {
     /* Group 1: nvregs i64s + 1 more i64 for scratch_z.  Combining them
      * into one group is byte-cheaper than two separate i64 groups. */
-    fbx_wasm_buffer_uleb(body, self_loop ? 4u : 2u); /* locals groups */
+    fbx_wasm_buffer_uleb(body,
+                         (u64)(2u + (self_loop ? 2u : 0u) + (needs_mmu ? 1u : 0u)));
     fbx_wasm_buffer_uleb(body, (u64)ir->nvregs + 1u);
     fbx_wasm_buffer_u8(body, WASM_VALTYPE_I64);
     /* Group 2: 1 i32 for scratch_flags. */
@@ -2500,10 +2773,26 @@ static int EmitFunctionBody(struct FbxWasmBuffer *body,
       fbx_wasm_buffer_uleb(body, 1);
       fbx_wasm_buffer_u8(body, WASM_VALTYPE_I32);
     }
-  } else if (ir->nvregs > 0) {
-    fbx_wasm_buffer_uleb(body, 1);
-    fbx_wasm_buffer_uleb(body, ir->nvregs);
-    fbx_wasm_buffer_u8(body, WASM_VALTYPE_I64);
+    if (needs_mmu) {
+      /* Final group: 2 i64 (mmu_va, mmu_entry). */
+      fbx_wasm_buffer_uleb(body, EMIT_MMU_LOCAL_COUNT);
+      fbx_wasm_buffer_u8(body, WASM_VALTYPE_I64);
+    }
+  } else if (ir->nvregs > 0 || needs_mmu) {
+    /* Group count = (vreg group if nvregs>0) + (MMU group if needs_mmu).
+     * Both are i64; when nvregs>0 AND needs_mmu we keep them as two SEPARATE
+     * groups (not folded) so the MMU group's local base is exactly
+     * EMIT_LOCAL_VREG_BASE + nvregs (MmuLocalsBase), matching the use sites. */
+    fbx_wasm_buffer_uleb(body,
+                         (u64)((ir->nvregs > 0 ? 1u : 0u) + (needs_mmu ? 1u : 0u)));
+    if (ir->nvregs > 0) {
+      fbx_wasm_buffer_uleb(body, ir->nvregs);
+      fbx_wasm_buffer_u8(body, WASM_VALTYPE_I64);
+    }
+    if (needs_mmu) {
+      fbx_wasm_buffer_uleb(body, EMIT_MMU_LOCAL_COUNT);
+      fbx_wasm_buffer_u8(body, WASM_VALTYPE_I64);
+    }
   } else {
     fbx_wasm_buffer_uleb(body, 0);
   }
@@ -2537,7 +2826,11 @@ static int EmitFunctionBody(struct FbxWasmBuffer *body,
     switch (p->opcode) {
       case FBX_IR_OP_PC_MARK:
         /* No code emitted at v0.1.  Future: emit a custom section entry or
-         * a debug intrinsic. */
+         * a debug intrinsic.  firebox#735: track the current x86 PC so the
+         * LOAD/STORE bailout-PC slot (allocated below via AllocLoadStoreSlots)
+         * carries this op's PC — matching the consts-build walk, which
+         * updates cur_pc on PC_MARK in AllocSlotsForInst in the same order. */
+        ctx_b.cur_pc = p->imm;
         break;
       case FBX_IR_OP_SET_FLAGS_RAW: {
         /* §13.5 (v1): dead-flag elision — when no flag-reader follows in
@@ -2654,7 +2947,10 @@ static int EmitFunctionBody(struct FbxWasmBuffer *body,
           return 0;
         }
         EmitLoadMem(body, VregLocal(p->dst), s.base_slot, s.has_disp,
-                    s.disp_slot, p->width ? p->width : 8u);
+                    s.disp_slot, p->width ? p->width : 8u,
+                    MmuVaLocal(ir, needs_scratch, self_loop),
+                    MmuEntryLocal(ir, needs_scratch, self_loop),
+                    s.bailout_pc_slot);
         break;
       }
       case FBX_IR_OP_STORE: {
@@ -2671,7 +2967,10 @@ static int EmitFunctionBody(struct FbxWasmBuffer *body,
           return 0;
         }
         EmitStoreMem(body, VregLocal(p->src2), s.base_slot, s.has_disp,
-                     s.disp_slot, p->width ? p->width : 8u);
+                     s.disp_slot, p->width ? p->width : 8u,
+                     MmuVaLocal(ir, needs_scratch, self_loop),
+                     MmuEntryLocal(ir, needs_scratch, self_loop),
+                     s.bailout_pc_slot);
         break;
       }
       case FBX_IR_OP_ADD:

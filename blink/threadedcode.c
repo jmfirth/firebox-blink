@@ -503,27 +503,41 @@ static struct FbxTcBlock *CompileBlock(struct Machine *m, u64 start_pc) {
 
 static void ExecuteBlock(struct Machine *m, struct FbxTcBlock *b) {
   u32 i;
+  /* §6.4 bailout-resume (firebox#735): the entries[] index Tier 1 resumes
+   * at.  0 for the common path (no T2 funcref, or exit=0/2 already
+   * returned).  On a T2 bailout (exit=1) we resume at the entry whose
+   * pc == m->ip — see the resume-scan below. */
+  u32 resume_idx = 0;
   ++b->hits;
 
   /* Tier 2 §6.4 fast path — if we have a Tier-2-translated funcref,
    * dispatch through it instead of walking entries[].  Bailout (exit=1)
-   * falls through to the Tier 1 entries[] walk below; host-call escape
-   * (exit=2) and normal completion (exit=0) both return immediately
-   * (the dispatched module has already advanced m->ip).
+   * RESUMES the Tier 1 entries[] walk at m->ip (firebox#735, below);
+   * host-call escape (exit=2) and normal completion (exit=0) both return
+   * immediately (the dispatched module has already advanced m->ip).
    *
-   * Why the fall-through on exit=1: the cached translation refused the
-   * block at runtime (e.g., an opcode the v0.1 emitter accepted at
-   * synthesis time encountered an operand shape it can't lower — see
-   * spec §5.5 "correct OR refuse").  Tier 1 has the canonical behavior;
-   * running it now keeps the program correct without invalidating the
-   * cached funcref (the next hit may use a different operand shape that
-   * Tier 2 CAN handle).
+   * Why resume-at-m->ip on exit=1 (firebox#735, replaces the prior
+   * re-walk-from-index-0): a BAILOUT terminator emits
+   * `EmitStoreIp(bailout_pc); return 1`, where `bailout_pc` is the guest
+   * PC of the FIRST instruction the T2 block could not lower (the lifter
+   * emits BAILOUT at `e->ip` for that entry — fbx_ir_lift.c).  A
+   * mid-block translation-miss bailout (the §13.5 inline software-MMU
+   * path — fbx_ir_emit_wasm.c EmitGuestVaToHostOffsetOrBailout) likewise
+   * stores the PC of the FAILING memory op and returns 1, having
+   * committed nothing for that op (translation precedes every state
+   * mutation).  In BOTH cases the T2 block has committed exactly the
+   * ops at PCs strictly BELOW m->ip; the ops at m->ip and after were NOT
+   * run.  So Tier 1 must resume at the entry whose pc == m->ip — running
+   * exactly the not-yet-committed suffix.  The pre-#735 code re-walked
+   * from index 0, RE-EXECUTING every committed op (REG_SET / ALU / stack)
+   * a second time → guest state diverged → SIGSEGV.  #719 had to refuse
+   * any BAILOUT-after-commit block to dodge this; #735 fixes the handoff
+   * so those blocks (and the §13.5 memory-operand blocks) are sound.
    *
-   * v0.1 disclaimer: this fast path only activates for blocks whose IR
-   * was lifted + synthesised by #583 + #588's supported opcode set
-   * (REG_GET/SET, ALU group, LEA simple, BRANCH_TAKEN, BAILOUT, PC_MARK
-   * per spec §4.2).  Every other block stays on Tier 1 because
-   * `Fbxt2TryEscalate` bails before setting `t2_funcref >= 0`. */
+   * We deliberately do NOT clear `b->t2_funcref` — the translation is
+   * still valid for the common case; a bailout on one dispatch (e.g. a
+   * cold-TLB miss) isn't evidence of pervasive corruption, and the next
+   * hit may translate cleanly. */
   if (b->t2_funcref >= 0) {
     int exit_code = Fbxt2Dispatch(m, b);
     if (exit_code == 0 || exit_code == 2) {
@@ -531,13 +545,31 @@ static void ExecuteBlock(struct Machine *m, struct FbxTcBlock *b) {
        * the right state for the outer dispatch loop. */
       return;
     }
-    /* exit_code == 1: bailout to Tier 1.  Fall through to the entries[]
-     * walk.  We deliberately do NOT clear `b->t2_funcref` — the
-     * translation is still valid for the common case; a bailout on one
-     * dispatch isn't evidence of pervasive corruption. */
+    /* exit_code == 1: bailout to Tier 1.  Resume at the entry whose
+     * pc == m->ip (the bailout PC the T2 block stored).  Linear scan —
+     * blocks are short (typically < 16 entries; the spec §13.4 bounded
+     * size); a pc→index map would be premature.  If no entry matches
+     * (should not happen — the bailout PC always equals some entry's ip
+     * by construction in the lifter), fall back to index 0, which is the
+     * pre-#735 behavior — safe for the no-committed-prefix case the #719
+     * gate still guarantees as a backstop, and loud via the assert. */
+    {
+      u32 j;
+      u64 ip = m->ip;
+      int found = 0;
+      for (j = 0; j < b->nentries; ++j) {
+        if (b->entries[j].ip == ip) {
+          resume_idx = j;
+          found = 1;
+          break;
+        }
+      }
+      unassert(found || b->nentries == 0);
+      (void)found;
+    }
   }
 
-  for (i = 0; i < b->nentries; ++i) {
+  for (i = resume_idx; i < b->nentries; ++i) {
     struct FbxTcEntry *e = &b->entries[i];
     if (e->kind == FBX_TC_KIND_THUNK) {
       /* Thunk replaces the function body + emulates ret.  After the
