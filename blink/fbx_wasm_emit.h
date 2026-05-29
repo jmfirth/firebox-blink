@@ -178,6 +178,15 @@ enum FbxIrEmitFailReason {
   /* Structural */
   FBX_IR_EMIT_BUFFER_OOM = 10,             /* growable buffer realloc failed */
   FBX_IR_EMIT_EMPTY_IR = 11,               /* ir is NULL or ninsts == 0 */
+  /* firebox#719: guest-VA memory operand under a NON-linear (software-MMU)
+   * blink build.  The §13.5 LOAD/STORE/PUSH/POP/CALL/RET emit treats a guest
+   * register value (a guest virtual address) as a wasm linear-memory offset
+   * (ToHost(va)=va+kSkew, kSkew==0).  That invariant only holds under
+   * HasLinearMapping(); the wasm32 build has CAN_64BIT==0 so it runs the
+   * software MMU and guest VAs (e.g. the stack at 0x4fffff...) are NOT linear
+   * offsets.  Emitting these blocks both traps OOB and corrupts guest memory.
+   * Refuse them until the MMU-translation ABI is built (work/tasks/733). */
+  FBX_IR_EMIT_NONLINEAR_GUEST_MEM = 12,
 };
 
 /* Human-readable name for a reason variant; suitable for trace lines. */

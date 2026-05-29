@@ -102,6 +102,7 @@ const char *fbx_ir_fail_reason_name(enum FbxIrEmitFailReason r) {
     case FBX_IR_EMIT_UNSUPPORTED_MOPCODE: return "unsupported_mopcode";
     case FBX_IR_EMIT_BUFFER_OOM: return "buffer_oom";
     case FBX_IR_EMIT_EMPTY_IR: return "empty_ir";
+    case FBX_IR_EMIT_NONLINEAR_GUEST_MEM: return "nonlinear_guest_mem";
   }
   return "unknown";
 }
@@ -450,6 +451,40 @@ static int CoverageGate(const struct FbxIrBlock *ir,
   /* Pass 2 — per-op acceptance. */
   for (i = 0; i < ir->ninsts; ++i) {
     u8 op = ir->insts[i].opcode;
+    /* firebox#719 — guest-VA memory-operand refuse under a NON-linear build.
+     *
+     * LOAD / STORE (#677 mem-form MOV) and the stack-mutating control-flow ops
+     * (PUSH / POP / CALL_DIRECT / RET) compute their effective address as a
+     * guest register VALUE (+ disp) and dereference it AS A wasm linear-memory
+     * offset (EmitGuestMemLoad / EmitGuestMemStore* / the §13.5c stack helpers,
+     * `i32.wrap_i64` of `m->weg[base] + disp`).  That is only correct when
+     * `ToHost(va) == va` — i.e. HasLinearMapping() (CAN_64BIT && !FLAG_nolinear).
+     * On the wasm32 blink build CAN_64BIT==0 (builtin.h:239-245) so blink runs
+     * its software MMU: a guest VA like the stack at 0x4fffff... is NOT a linear
+     * offset — it must go through ResolveAddress/GetHostAddress.  Emitting these
+     * blocks both traps OOB (the wrapped garbage offset) AND, on the STORE side,
+     * corrupts guest memory (the partial write lands at the wrong wasm offset),
+     * crashing the guest (firebox#719 dispatch-diag witness: funcref 2/3 trap at
+     * the `i64.load (reg+disp)` site; reg-only blocks like funcref 1 succeed).
+     * REG_GET/REG_SET/LEA are NOT refused: they only touch `m_ptr + offsetof`
+     * (the Machine struct, a real linear-memory C object) or compute-into-a-reg.
+     *
+     * Refuse → these blocks stay on Tier 1 (correct-or-refuse, spec §13.2).
+     * Removing this gate is the work#733 MMU-translation-ABI follow-up. */
+    if (!HasLinearMapping()) {
+      switch (op) {
+        case FBX_IR_OP_LOAD:
+        case FBX_IR_OP_STORE:
+        case FBX_IR_OP_PUSH:
+        case FBX_IR_OP_POP:
+        case FBX_IR_OP_CALL_DIRECT:
+        case FBX_IR_OP_RET:
+          SetFail(fail, FBX_IR_EMIT_NONLINEAR_GUEST_MEM, op);
+          return 0;
+        default:
+          break;
+      }
+    }
     switch (op) {
       case FBX_IR_OP_PC_MARK:
       case FBX_IR_OP_REG_GET:
