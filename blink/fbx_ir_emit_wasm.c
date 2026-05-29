@@ -223,12 +223,26 @@ static void EmitName(struct FbxWasmBuffer *b, const char *s) {
 #define WASM_OP_END         0x0Bu
 #define WASM_OP_RETURN      0x0Fu
 #define WASM_OP_CALL        0x10u
+/* #695 — control-flow opcodes for the self-loop chain (§4 of the chaining
+ * design).  `loop` + `br_if` keep a self-targeting hot block iterating
+ * guest-side without crossing the FFI boundary every iteration.  All wasm
+ * MVP (portable across V8 / wasmer-Cranelift / JSC / SpiderMonkey). */
+#define WASM_OP_UNREACHABLE 0x00u
+#define WASM_OP_LOOP        0x03u
+#define WASM_OP_BR          0x0Cu
+#define WASM_OP_BR_IF       0x0Du
+/* Empty block-type for `loop` (no result on the value stack at the loop
+ * header — the self-loop wrapper carries its value flow through locals +
+ * an explicit `return`, so the loop body is balanced with zero stack
+ * height at its top/bottom). */
+#define WASM_BLOCKTYPE_EMPTY 0x40u
 #define WASM_OP_LOCAL_GET   0x20u
 #define WASM_OP_LOCAL_SET   0x21u
 #define WASM_OP_LOCAL_TEE   0x22u
 #define WASM_OP_I32_CONST   0x41u
 #define WASM_OP_I64_CONST   0x42u
 #define WASM_OP_I32_ADD     0x6Au
+#define WASM_OP_I32_SUB     0x6Bu /* #695 — self-loop iter_budget decrement */
 #define WASM_OP_I64_LOAD    0x29u
 #define WASM_OP_I64_LOAD32U 0x35u
 #define WASM_OP_I64_LOAD16U 0x33u
@@ -1393,6 +1407,26 @@ static u32 ScratchFlagsLocal(u16 nvregs) {
   return EMIT_LOCAL_VREG_BASE + (u32)nvregs + EMIT_LOCAL_OFF_SCRATCH_FLAGS;
 }
 
+/* #695 — self-loop locals.  Declared AFTER the two scratch locals (a self-loop
+ * candidate always terminates in BRANCH_COND, which forces needs_scratch=1,
+ * so scratch_z + scratch_flags are always present when these are).
+ *   entry_ip   (i64): m->ip captured at function entry (== block start_pc).
+ *   next_ip    (i64): the IP the BRANCH_COND selected this pass.
+ *   iter_budget(i32): remaining guest-side iterations before yielding. */
+#define EMIT_LOCAL_OFF_ENTRY_IP    2u /* i64 */
+#define EMIT_LOCAL_OFF_NEXT_IP     3u /* i64 */
+#define EMIT_LOCAL_OFF_ITER_BUDGET 4u /* i32 */
+
+static u32 EntryIpLocal(u16 nvregs) {
+  return EMIT_LOCAL_VREG_BASE + (u32)nvregs + EMIT_LOCAL_OFF_ENTRY_IP;
+}
+static u32 NextIpLocal(u16 nvregs) {
+  return EMIT_LOCAL_VREG_BASE + (u32)nvregs + EMIT_LOCAL_OFF_NEXT_IP;
+}
+static u32 IterBudgetLocal(u16 nvregs) {
+  return EMIT_LOCAL_VREG_BASE + (u32)nvregs + EMIT_LOCAL_OFF_ITER_BUDGET;
+}
+
 /* Emit code that pushes (vreg_local & width_mask) on the stack as i64.
  * width is 1/2/4/8; for width 8 no mask is needed but we emit one anyway
  * for uniformity (i64.const 0xFFFFFFFFFFFFFFFFu + i64.and is a no-op). */
@@ -1766,6 +1800,78 @@ static int EmitBranchCond(struct FbxWasmBuffer *body,
   fbx_wasm_buffer_uleb(body, M_OFF_IP);
   /* Block terminator: return exit=0 (normal control transfer).  Note
    * that Tier 1 will re-resolve the PC; this matches BRANCH_TAKEN. */
+  fbx_wasm_buffer_u8(body, WASM_OP_I32_CONST);
+  fbx_wasm_buffer_sleb(body, 0);
+  fbx_wasm_buffer_u8(body, WASM_OP_RETURN);
+  return 1;
+}
+
+/* #695 — self-loop variant of EmitBranchCond.  Emitted INSIDE the `loop $top`
+ * wrapper (see EmitFunctionBody).  Computes the next IP exactly as
+ * EmitBranchCond does, stashes it in `next_ip`, ALWAYS stores it to m->ip
+ * (so the non-loop exit path is identical to the base emit), then branches
+ * back to the loop header iff the self-loop condition holds at runtime:
+ *
+ *     next_ip == entry_ip   AND   (--iter_budget) != 0
+ *
+ * Both operands of the equality are runtime values (next_ip selected this
+ * pass; entry_ip captured at function entry == the dispatched block's
+ * start_pc).  For a cache-shared module reused on a non-self-loop block this
+ * comparison is false → br_if not taken → falls through to the same
+ * `i32.const 0; return` as the base path.  CACHE-SAFE: no PC relationship is
+ * baked into the bytes.
+ *
+ * `loop_depth` is the relative label index of the enclosing `loop` from this
+ * emit point (0 = innermost).  Returns 1, or 0 on predicate refusal. */
+static int EmitBranchCondSelfLoop(struct FbxWasmBuffer *body,
+                                  const struct FbxIrInst *p,
+                                  const struct BranchCondSlots *slots,
+                                  u16 nvregs, u32 loop_depth) {
+  u32 cond_id = p->src1;
+  u32 entry_ip = EntryIpLocal(nvregs);
+  u32 next_ip = NextIpLocal(nvregs);
+  u32 iter_budget = IterBudgetLocal(nvregs);
+  /* next_ip = select(taken_pc, fallthrough_pc, predicate). */
+  EmitLoadCtxI64(body, slots->taken_pc_slot);
+  EmitLoadCtxI64(body, slots->fallthrough_pc_slot);
+  if (!EmitJccPredicate(body, cond_id)) {
+    return 0;
+  }
+  fbx_wasm_buffer_u8(body, WASM_OP_SELECT);
+  fbx_wasm_buffer_u8(body, WASM_OP_LOCAL_SET);
+  fbx_wasm_buffer_uleb(body, next_ip);
+  /* m->ip = next_ip  (always — correct for both the loop-back and exit). */
+  fbx_wasm_buffer_u8(body, WASM_OP_LOCAL_GET);
+  fbx_wasm_buffer_uleb(body, EMIT_LOCAL_M_PTR);
+  fbx_wasm_buffer_u8(body, WASM_OP_LOCAL_GET);
+  fbx_wasm_buffer_uleb(body, next_ip);
+  fbx_wasm_buffer_u8(body, WASM_OP_I64_STORE);
+  fbx_wasm_buffer_uleb(body, 3);
+  fbx_wasm_buffer_uleb(body, M_OFF_IP);
+  /* loop-back predicate part 1: (next_ip == entry_ip) as i32 (0/1). */
+  fbx_wasm_buffer_u8(body, WASM_OP_LOCAL_GET);
+  fbx_wasm_buffer_uleb(body, next_ip);
+  fbx_wasm_buffer_u8(body, WASM_OP_LOCAL_GET);
+  fbx_wasm_buffer_uleb(body, entry_ip);
+  fbx_wasm_buffer_u8(body, WASM_OP_I64_EQ);
+  /* loop-back predicate part 2: iter_budget -= 1; push (iter_budget != 0). */
+  fbx_wasm_buffer_u8(body, WASM_OP_LOCAL_GET);
+  fbx_wasm_buffer_uleb(body, iter_budget);
+  fbx_wasm_buffer_u8(body, WASM_OP_I32_CONST);
+  fbx_wasm_buffer_sleb(body, 1);
+  fbx_wasm_buffer_u8(body, WASM_OP_I32_SUB);
+  fbx_wasm_buffer_u8(body, WASM_OP_LOCAL_TEE); /* write back, keep on stack */
+  fbx_wasm_buffer_uleb(body, iter_budget);
+  fbx_wasm_buffer_u8(body, WASM_OP_I32_CONST);
+  fbx_wasm_buffer_sleb(body, 0);
+  fbx_wasm_buffer_u8(body, WASM_OP_I32_NE); /* (iter_budget != 0) */
+  /* combine: same-target AND budget-remaining. */
+  fbx_wasm_buffer_u8(body, WASM_OP_I32_AND);
+  /* br_if to the enclosing loop header. */
+  fbx_wasm_buffer_u8(body, WASM_OP_BR_IF);
+  fbx_wasm_buffer_uleb(body, loop_depth);
+  /* Fell through: not looping this pass — normal exit=0 to the host.  m->ip
+   * is already set to next_ip above. */
   fbx_wasm_buffer_u8(body, WASM_OP_I32_CONST);
   fbx_wasm_buffer_sleb(body, 0);
   fbx_wasm_buffer_u8(body, WASM_OP_RETURN);
@@ -2218,6 +2324,49 @@ static int BlockNeedsScratchLocals(const struct FbxIrBlock *ir) {
   return 0;
 }
 
+/* ────────────────────────────────────────────────────────────────────────── */
+/* #695 — self-loop chain.                                                     */
+/*                                                                            */
+/* A block that terminates in BRANCH_COND is the do/while hot-loop shape.      */
+/* When at runtime its taken-PC equals the block's own entry PC, it is a       */
+/* self-loop: instead of returning to the host every iteration (one ~270ns     */
+/* FFI crossing per pass, #693), we keep iterating guest-side inside a wasm     */
+/* `loop` until either the predicate stops selecting the self target OR a       */
+/* bounded iteration budget is exhausted (so the `Actor` loop can re-check      */
+/* `m->attention` for signals — see chaining-design.md §3/§4.3).                */
+/*                                                                            */
+/* CACHE SAFETY (load-bearing, [[#633→#635]]): the self-loop decision is a      */
+/* RUNTIME comparison of runtime-supplied values (next_ip == entry_ip), NOT a   */
+/* compile-time bake.  taken_pc is hoisted into block_ctx (#635), so a cache-   */
+/* shared module reused for a non-self-loop block computes next_ip != entry_ip  */
+/* → the loop-back br_if is not taken → identical store-ip + return-0 behavior  */
+/* as before.  The wrapper is structurally present for EVERY BRANCH_COND block  */
+/* (decision keyed on IR shape, deterministic over the IR); it is a runtime     */
+/* no-op for non-self-loops.                                                   */
+/* ────────────────────────────────────────────────────────────────────────── */
+
+/* Iterations run guest-side per FFI crossing before yielding to the host so
+ * the Actor loop can service async signals / futex wakes (machine.c:2274).
+ * Bounds signal-delivery latency to one budget's worth of guest work — the
+ * same granularity Tier-1 imposes implicitly per block, coarsened to N. */
+#define FBX_T2_SELF_LOOP_BUDGET 4096u
+
+/* True iff the block's terminating control-flow op is BRANCH_COND (the only
+ * shape the self-loop wrapper applies to in this increment).  PC_MARK insts
+ * are ignored — the LAST emit-relevant op decides.  A block with any OTHER
+ * terminator (BRANCH_TAKEN / CALL_DIRECT / RET / BAILOUT) is emitted exactly
+ * as before — byte-identical, preserving the #635 cache + all emit tests. */
+static int BlockIsSelfLoopCandidate(const struct FbxIrBlock *ir) {
+  u32 i;
+  u8 last = FBX_IR_OP_PC_MARK;
+  for (i = 0; i < ir->ninsts; ++i) {
+    u8 op = ir->insts[i].opcode;
+    if (op == FBX_IR_OP_PC_MARK) continue;
+    last = op;
+  }
+  return last == FBX_IR_OP_BRANCH_COND;
+}
+
 /* Emit the function body for one IR block.  Returns 1 on success, 0 on
  * unsupported op encountered mid-emission (caller frees scratch).
  *
@@ -2232,27 +2381,67 @@ static int EmitFunctionBody(struct FbxWasmBuffer *body,
   u32 i;
   int terminated = 0;
   int needs_scratch = BlockNeedsScratchLocals(ir);
+  /* #695 — self-loop wrapper.  A BRANCH_COND-terminated block (do/while shape)
+   * always has needs_scratch==1, so the self-loop locals can be declared after
+   * the scratch pair as a third locals group. */
+  int self_loop = BlockIsSelfLoopCandidate(ir);
   struct BlockCtxBuilder ctx_b;
   BcInit(&ctx_b, NULL, 0); /* emit-time re-walk: just allocate, don't store */
   /* Locals declaration.  When the block needs scratch locals (#599 path),
    * emit two groups: vregs as i64, then a pair (i64 scratch_z, i32
    * scratch_flags).  Wasm encodes per-group as (count, valtype); separate
-   * groups are required because the types differ. */
+   * groups are required because the types differ.
+   *
+   * #695: a self-loop block adds two more groups after the scratch pair:
+   *   (2 × i64) entry_ip + next_ip, then (1 × i32) iter_budget. */
   if (needs_scratch) {
     /* Group 1: nvregs i64s + 1 more i64 for scratch_z.  Combining them
      * into one group is byte-cheaper than two separate i64 groups. */
-    fbx_wasm_buffer_uleb(body, 2); /* 2 groups */
+    fbx_wasm_buffer_uleb(body, self_loop ? 4u : 2u); /* locals groups */
     fbx_wasm_buffer_uleb(body, (u64)ir->nvregs + 1u);
     fbx_wasm_buffer_u8(body, WASM_VALTYPE_I64);
     /* Group 2: 1 i32 for scratch_flags. */
     fbx_wasm_buffer_uleb(body, 1);
     fbx_wasm_buffer_u8(body, WASM_VALTYPE_I32);
+    if (self_loop) {
+      /* Group 3: 2 i64 (entry_ip, next_ip). */
+      fbx_wasm_buffer_uleb(body, 2);
+      fbx_wasm_buffer_u8(body, WASM_VALTYPE_I64);
+      /* Group 4: 1 i32 (iter_budget). */
+      fbx_wasm_buffer_uleb(body, 1);
+      fbx_wasm_buffer_u8(body, WASM_VALTYPE_I32);
+    }
   } else if (ir->nvregs > 0) {
     fbx_wasm_buffer_uleb(body, 1);
     fbx_wasm_buffer_uleb(body, ir->nvregs);
     fbx_wasm_buffer_u8(body, WASM_VALTYPE_I64);
   } else {
     fbx_wasm_buffer_uleb(body, 0);
+  }
+  /* #695 — self-loop entry prelude + loop opener.  Capture m->ip (== this
+   * block's start_pc, by the dispatcher's lookup contract) into entry_ip,
+   * seed the iteration budget, then open a `loop` whose body is the block.
+   * The BRANCH_COND terminator re-enters via `br_if 0` while it keeps
+   * selecting the self target and the budget holds (EmitBranchCondSelfLoop). */
+  if (self_loop) {
+    u32 entry_ip = EntryIpLocal(ir->nvregs);
+    u32 iter_budget = IterBudgetLocal(ir->nvregs);
+    /* entry_ip = m->ip. */
+    fbx_wasm_buffer_u8(body, WASM_OP_LOCAL_GET);
+    fbx_wasm_buffer_uleb(body, EMIT_LOCAL_M_PTR);
+    fbx_wasm_buffer_u8(body, WASM_OP_I64_LOAD);
+    fbx_wasm_buffer_uleb(body, 3);
+    fbx_wasm_buffer_uleb(body, M_OFF_IP);
+    fbx_wasm_buffer_u8(body, WASM_OP_LOCAL_SET);
+    fbx_wasm_buffer_uleb(body, entry_ip);
+    /* iter_budget = FBX_T2_SELF_LOOP_BUDGET. */
+    fbx_wasm_buffer_u8(body, WASM_OP_I32_CONST);
+    fbx_wasm_buffer_sleb(body, (i64)(u32)FBX_T2_SELF_LOOP_BUDGET);
+    fbx_wasm_buffer_u8(body, WASM_OP_LOCAL_SET);
+    fbx_wasm_buffer_uleb(body, iter_budget);
+    /* loop $top (empty block-type — the body carries values via locals). */
+    fbx_wasm_buffer_u8(body, WASM_OP_LOOP);
+    fbx_wasm_buffer_u8(body, WASM_BLOCKTYPE_EMPTY);
   }
   for (i = 0; i < ir->ninsts; ++i) {
     const struct FbxIrInst *p = &ir->insts[i];
@@ -2291,14 +2480,23 @@ static int EmitFunctionBody(struct FbxWasmBuffer *body,
         break;
       case FBX_IR_OP_BRANCH_COND: {
         struct BranchCondSlots s;
+        int ok;
         if (!AllocBranchCondSlots(&ctx_b, p, &s)) {
           SetFail(fail, FBX_IR_EMIT_KIND_MISMATCH, p->opcode);
           return 0;
         }
-        if (!EmitBranchCond(body, p, &s)) {
-          /* EmitBranchCond's sole failure path is EmitJccPredicate refusal
-           * (Jcc PF/NP and unrecognised predicates).  Other shape errors are
-           * caught by the coverage gate above. */
+        /* #695: inside the self-loop wrapper the terminator re-enters the
+         * `loop` (depth 0) while it keeps selecting the self target; otherwise
+         * it exits to the host exactly as the base EmitBranchCond does. */
+        if (self_loop) {
+          ok = EmitBranchCondSelfLoop(body, p, &s, ir->nvregs, /*loop_depth=*/0);
+        } else {
+          ok = EmitBranchCond(body, p, &s);
+        }
+        if (!ok) {
+          /* Sole failure path is EmitJccPredicate refusal (Jcc PF/NP and
+           * unrecognised predicates).  Other shape errors are caught by the
+           * coverage gate above. */
           SetFail(fail, FBX_IR_EMIT_JCC_PREDICATE_DEFERRED, p->opcode);
           return 0;
         }
@@ -2515,6 +2713,16 @@ static int EmitFunctionBody(struct FbxWasmBuffer *body,
     fbx_wasm_buffer_u8(body, WASM_OP_I32_CONST);
     fbx_wasm_buffer_sleb(body, 0);
     fbx_wasm_buffer_u8(body, WASM_OP_RETURN);
+  }
+  /* #695 — close the self-loop `loop` (its EmitBranchCondSelfLoop terminator
+   * always `return`s on both the loop-back and exit paths, so control never
+   * falls off the bottom of the loop dynamically).  But the `loop` has an
+   * empty block-type, so after its `end` the value stack is [] while the
+   * function result type is [i32].  Emit `unreachable` to satisfy the
+   * stack-type validator for this statically-unreachable tail. */
+  if (self_loop) {
+    fbx_wasm_buffer_u8(body, WASM_OP_END);         /* end loop */
+    fbx_wasm_buffer_u8(body, WASM_OP_UNREACHABLE); /* statically unreachable */
   }
   /* All function bodies end with END (0x0B). */
   fbx_wasm_buffer_u8(body, WASM_OP_END);
