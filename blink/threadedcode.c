@@ -554,6 +554,7 @@ static void ExecuteBlock(struct Machine *m, struct FbxTcBlock *b) {
      * pre-#735 behavior — safe for the no-committed-prefix case the #719
      * gate still guarantees as a backstop, and loud via the assert. */
     {
+#ifndef FBX735_DIAG_NO_RESUME_AT_IP
       u32 j;
       u64 ip = m->ip;
       int found = 0;
@@ -566,6 +567,7 @@ static void ExecuteBlock(struct Machine *m, struct FbxTcBlock *b) {
       }
       unassert(found || b->nentries == 0);
       (void)found;
+#endif
 #ifdef FBX735_DIAG_RESUME_TRACE
       {
         static _Atomic(long) dbg_n = 0;

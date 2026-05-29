@@ -2694,7 +2694,9 @@ static int BlockNeedsScratchLocals(const struct FbxIrBlock *ir) {
     /* firebox#735 — a BAILOUT forces flag emission (see the block comment):
      * resume-at-m->ip skips any flag-elided CMP/TEST, so T2 must commit the
      * flags instead of eliding them. */
+#ifndef FBX735_DIAG_NO_BAILOUT_FLAG_FORCE
     if (op == FBX_IR_OP_BAILOUT) return 1;
+#endif
     /* #602 — RET/PUSH/POP stash the popped or to-be-pushed value in
      * scratch_z to bridge the wasm-stack ordering between the load
      * and the subsequent RSP adjust + store-to-ip / store-to-greg.
