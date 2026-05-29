@@ -103,6 +103,7 @@ const char *fbx_ir_fail_reason_name(enum FbxIrEmitFailReason r) {
     case FBX_IR_EMIT_BUFFER_OOM: return "buffer_oom";
     case FBX_IR_EMIT_EMPTY_IR: return "empty_ir";
     case FBX_IR_EMIT_NONLINEAR_GUEST_MEM: return "nonlinear_guest_mem";
+    case FBX_IR_EMIT_BAILOUT_AFTER_COMMIT: return "bailout_after_commit";
   }
   return "unknown";
 }
@@ -448,6 +449,59 @@ static int CoverageGate(const struct FbxIrBlock *ir,
     }
   }
   (void)saw_flag_writer; /* presence-only; no further gating */
+
+  /* firebox#719 — BAILOUT-after-committed-work refuse.
+   *
+   * THE SECOND #719 CORRUPTOR (dispatch-diag witness): a BAILOUT terminator
+   * emits `EmitStoreIp(bailout_pc); i32.const 1; return` — it sets m->ip to the
+   * bailout PC and returns exit=1.  The Tier-1 host (threadedcode.c:527-538)
+   * handles exit=1 by FALLING THROUGH to a full re-walk of `entries[]` FROM
+   * INDEX 0 — it does NOT resume at m->ip.  That re-walk re-executes every op
+   * the T2 block already committed BEFORE the bailout (REG_SET / ALU / flags /
+   * stack), so any non-idempotent prior op runs TWICE → guest state diverges →
+   * the guest SIGSEGVs (witness: rip in guest x86, rax=0, after ~hundreds of
+   * dispatches; refusing BAILOUT blocks made ok0 climb past 600k with zero
+   * traps and zero crash).
+   *
+   * The bailout contract is only sound when the T2 block committed NOTHING
+   * before the bailout (a pure "set ip, hand to T1" refusal).  Until the
+   * handoff is fixed arch-side (T1 resumes at m->ip on exit=1, OR BAILOUT
+   * commits nothing — work#733), REFUSE any block whose BAILOUT is preceded by
+   * a state-committing op.  PC_MARK / REG_GET / CMP / TEST are non-committing
+   * (CMP/TEST write only the lazy-flag shadow, which the re-walk recomputes
+   * identically); a leading run of those before a BAILOUT stays emittable. */
+  {
+    int committed_before_bailout = 0;
+    for (i = 0; i < ir->ninsts; ++i) {
+      u8 op = ir->insts[i].opcode;
+      switch (op) {
+        case FBX_IR_OP_REG_SET:
+        case FBX_IR_OP_STORE:
+        case FBX_IR_OP_ADD:
+        case FBX_IR_OP_SUB:
+        case FBX_IR_OP_AND:
+        case FBX_IR_OP_OR:
+        case FBX_IR_OP_XOR:
+        case FBX_IR_OP_LEA:
+        case FBX_IR_OP_PUSH:
+        case FBX_IR_OP_POP:
+        case FBX_IR_OP_CALL_DIRECT:
+        case FBX_IR_OP_RET:
+        case FBX_IR_OP_SET_FLAGS_RAW:
+          committed_before_bailout = 1;
+          break;
+        case FBX_IR_OP_BAILOUT:
+          if (committed_before_bailout) {
+            SetFail(fail, FBX_IR_EMIT_BAILOUT_AFTER_COMMIT, op);
+            return 0;
+          }
+          break;
+        default:
+          break;
+      }
+    }
+  }
+
   /* Pass 2 — per-op acceptance. */
   for (i = 0; i < ir->ninsts; ++i) {
     u8 op = ir->insts[i].opcode;

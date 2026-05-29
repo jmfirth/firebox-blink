@@ -187,6 +187,11 @@ enum FbxIrEmitFailReason {
    * offsets.  Emitting these blocks both traps OOB and corrupts guest memory.
    * Refuse them until the MMU-translation ABI is built (work/tasks/733). */
   FBX_IR_EMIT_NONLINEAR_GUEST_MEM = 12,
+  /* firebox#719: a BAILOUT terminator preceded by a state-committing op.  The
+   * Tier-1 host re-walks the block's entries[] from index 0 on exit=1 instead
+   * of resuming at m->ip, so any committed pre-bailout op runs twice → guest
+   * corruption.  Refuse until the handoff is fixed arch-side (work/tasks/733). */
+  FBX_IR_EMIT_BAILOUT_AFTER_COMMIT = 13,
 };
 
 /* Human-readable name for a reason variant; suitable for trace lines. */
