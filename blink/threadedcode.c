@@ -566,6 +566,20 @@ static void ExecuteBlock(struct Machine *m, struct FbxTcBlock *b) {
       }
       unassert(found || b->nentries == 0);
       (void)found;
+#ifdef FBX735_DIAG_RESUME_TRACE
+      {
+        static _Atomic(long) dbg_n = 0;
+        long n = atomic_fetch_add_explicit(&dbg_n, 1, memory_order_relaxed);
+        if (n < 40) {
+          fprintf(stderr,
+                  "[t735 resume] ip=%#llx start=%#llx end=%#llx nent=%u "
+                  "resume_idx=%u found=%d e0_ip=%#llx\n",
+                  (unsigned long long)ip, (unsigned long long)b->start_pc,
+                  (unsigned long long)b->end_pc, b->nentries, resume_idx, found,
+                  (unsigned long long)b->entries[0].ip);
+        }
+      }
+#endif
     }
   }
 
