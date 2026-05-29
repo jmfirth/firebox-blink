@@ -1755,3 +1755,145 @@ TEST(FbxWasmBuffer, AppendStress) {
   ASSERT_EQ(0, (i64)b.len);
   ASSERT_EQ(0, (i64)(intptr_t)b.data);
 }
+
+/* ────────────────────────────────────────────────────────────────────────── */
+/* #695 — self-loop whole-block emit.                                          */
+/*                                                                            */
+/* A block whose last emit-relevant op is BRANCH_COND is the do/while hot-loop */
+/* shape; #695 wraps it in a wasm `loop` so a runtime-self-targeting branch    */
+/* re-enters guest-side instead of crossing the FFI boundary every iteration.  */
+/* The wrapper is CACHE-SAFE: the loop-back is a runtime comparison            */
+/* (next_ip == entry_ip && --iter_budget != 0); nothing PC-related is baked    */
+/* into the bytes, so a cache-shared module reused on a non-self-loop block     */
+/* simply never takes the br_if and exits identically to the base path.        */
+/*                                                                            */
+/* These tests assert the structural signature of the wrapper at the byte      */
+/* level.  Cross-engine validity (wasmer-Cranelift + wabt) of the same bytes   */
+/* is checked by the out-of-tree dumper harness (fbx_ir_emit_wasm_dump.c +     */
+/* the 599_* modules, which all lift to BRANCH_COND-terminated blocks).        */
+/* ────────────────────────────────────────────────────────────────────────── */
+
+/* Wasm opcodes the self-loop wrapper introduces (mirrors fbx_ir_emit_wasm.c). */
+#define T695_OP_UNREACHABLE 0x00u
+#define T695_OP_LOOP        0x03u
+#define T695_OP_BR_IF       0x0Du
+#define T695_BLOCKTYPE_VOID 0x40u
+
+/* Returns the offset of the first occurrence of the 2-byte sequence
+ * {a, b} in [data, data+len), or -1 if absent. */
+static long T695FindPair(const u8 *data, size_t len, u8 a, u8 b) {
+  size_t i;
+  if (len < 2) return -1;
+  for (i = 0; i + 1 < len; ++i) {
+    if (data[i] == a && data[i + 1] == b) return (long)i;
+  }
+  return -1;
+}
+
+/* A single-instruction BRANCH_COND block is a self-loop candidate (the
+ * BranchCondJESynths shape).  The emit must carry the #695 wrapper signature:
+ *   - `loop 0x40` (loop opener with the void block-type), and
+ *   - `br_if 0`   (0x0D 0x00 — loop-back to the innermost label), and
+ *   - a trailing `unreachable` (0x00) immediately before the final function
+ *     `end` (0x0B), for the statically-unreachable tail. */
+TEST(FbxWasmEmit, SelfLoopWrapperEmitted) {
+  struct FbxIrBlock ir;
+  struct FbxIrInst insts[1];
+  struct FbxTcBlock *tc;
+  struct FbxWasmBuffer out;
+  memset(&ir, 0, sizeof ir);
+  memset(insts, 0, sizeof insts);
+  insts[0].opcode = FBX_IR_OP_BRANCH_COND;
+  insts[0].src1_kind = FBX_IR_KIND_IMM;
+  insts[0].src1 = 4; /* JE — ZF=1 */
+  insts[0].src2_kind = FBX_IR_KIND_IMM;
+  insts[0].src2 = 0x8002; /* fallthrough_pc (low 32 bits) */
+  insts[0].imm = 0x8100;  /* taken_pc */
+  ir.insts = insts;
+  ir.ninsts = 1;
+  ir.nvregs = 0;
+  tc = MakeTc(0x074, 0, 0, 0, 0x8000, 2, FBX_TC_KIND_NORMAL);
+  fbx_wasm_buffer_init(&out);
+  ASSERT_EQ(1, fbx_ir_emit_wasm(&ir, tc, &out));
+  ASSERT_NE((i64)0, (i64)out.len);
+  /* loop opener with void block-type. */
+  ASSERT_NE((i64)-1,
+            (i64)T695FindPair(out.data, out.len, T695_OP_LOOP,
+                              T695_BLOCKTYPE_VOID));
+  /* br_if to the innermost loop label (depth 0). */
+  ASSERT_NE((i64)-1, (i64)T695FindPair(out.data, out.len, T695_OP_BR_IF, 0x00));
+  /* The body ends with `unreachable` then the function `end` (0x0B). */
+  ASSERT_EQ((i64)T695_OP_UNREACHABLE, (i64)out.data[out.len - 2]);
+  ASSERT_EQ((i64)0x0Bu, (i64)out.data[out.len - 1]);
+  fbx_wasm_buffer_free(&out);
+  FreeTc(tc);
+}
+
+/* A non-BRANCH_COND terminator (BRANCH_TAKEN) is NOT a self-loop candidate:
+ * the wrapper must be absent so the emit stays byte-identical to the pre-#695
+ * base path (preserving the #635 per-block cache + all existing emit tests).
+ * The absence is proven by the lack of the `loop 0x40` opener and the lack of
+ * a trailing `unreachable` before the function `end`. */
+TEST(FbxWasmEmit, NonSelfLoopBlockHasNoWrapper) {
+  struct FbxIrBlock ir;
+  struct FbxIrInst insts[2];
+  struct FbxTcBlock *tc;
+  struct FbxWasmBuffer out;
+  memset(&ir, 0, sizeof ir);
+  memset(insts, 0, sizeof insts);
+  insts[0].opcode = FBX_IR_OP_PC_MARK;
+  insts[0].imm = 0x6000;
+  insts[1].opcode = FBX_IR_OP_BRANCH_TAKEN;
+  insts[1].imm = 0x6100;
+  ir.insts = insts;
+  ir.ninsts = 2;
+  ir.nvregs = 0;
+  ir.start_pc = 0x6000;
+  ir.end_pc = 0x6005;
+  tc = MakeTc(0x0E9, 0, 0, 0x100, 0x6000, 5, FBX_TC_KIND_NORMAL);
+  fbx_wasm_buffer_init(&out);
+  ASSERT_EQ(1, fbx_ir_emit_wasm(&ir, tc, &out));
+  ASSERT_NE((i64)0, (i64)out.len);
+  /* No loop opener. */
+  ASSERT_EQ((i64)-1,
+            (i64)T695FindPair(out.data, out.len, T695_OP_LOOP,
+                              T695_BLOCKTYPE_VOID));
+  /* The final byte is the function `end`; the byte before it is NOT the
+   * wrapper's `unreachable` (a BRANCH_TAKEN block ends in `return` then
+   * `end`). */
+  ASSERT_EQ((i64)0x0Bu, (i64)out.data[out.len - 1]);
+  ASSERT_NE((i64)T695_OP_UNREACHABLE, (i64)out.data[out.len - 2]);
+  fbx_wasm_buffer_free(&out);
+  FreeTc(tc);
+}
+
+/* The self-loop emit is deterministic: identical IR + TC → identical bytes.
+ * (The #599 BranchCondJESynths test covers the same block shape; this asserts
+ * the determinism property specifically across the #695 wrapper.) */
+TEST(FbxWasmEmit, SelfLoopEmitDeterministic) {
+  struct FbxIrBlock ir;
+  struct FbxIrInst insts[1];
+  struct FbxTcBlock *tc;
+  struct FbxWasmBuffer a, b;
+  memset(&ir, 0, sizeof ir);
+  memset(insts, 0, sizeof insts);
+  insts[0].opcode = FBX_IR_OP_BRANCH_COND;
+  insts[0].src1_kind = FBX_IR_KIND_IMM;
+  insts[0].src1 = 4;
+  insts[0].src2_kind = FBX_IR_KIND_IMM;
+  insts[0].src2 = 0x8002;
+  insts[0].imm = 0x8100;
+  ir.insts = insts;
+  ir.ninsts = 1;
+  ir.nvregs = 0;
+  tc = MakeTc(0x074, 0, 0, 0, 0x8000, 2, FBX_TC_KIND_NORMAL);
+  fbx_wasm_buffer_init(&a);
+  fbx_wasm_buffer_init(&b);
+  ASSERT_EQ(1, fbx_ir_emit_wasm(&ir, tc, &a));
+  ASSERT_EQ(1, fbx_ir_emit_wasm(&ir, tc, &b));
+  ASSERT_EQ((i64)a.len, (i64)b.len);
+  ASSERT_EQ(0, memcmp(a.data, b.data, a.len));
+  fbx_wasm_buffer_free(&a);
+  fbx_wasm_buffer_free(&b);
+  FreeTc(tc);
+}
