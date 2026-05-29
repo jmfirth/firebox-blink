@@ -524,6 +524,54 @@ static int CoverageGate(const struct FbxIrBlock *ir,
      * (they touch only `m_ptr + offsetof` into the Machine struct, a real
      * linear-memory C object). */
     if (!HasLinearMapping()) {
+      /* firebox#738 — INTERIM FALLBACK: refuse the wide (8-byte / 64-bit)
+       * guest LOAD permanently, so the whole block bails to Tier 1 (which
+       * does its own authoritative page-table walk + access).  Narrow LOADs
+       * (1/2/4 bytes) and ALL STOREs still emit the inline software-MMU
+       * translation; resume-at-m->ip stays.  PUSH/POP/CALL_DIRECT/RET stay
+       * refused (out of scope, below).
+       *
+       * WHY this is here and NOT a symptom-paper:
+       *   #738 localized the only #735 emit corruption to ONE op — the inline
+       *   software-MMU translation for the 8-byte (i64, width==8) guest LOAD,
+       *   on the path where its result is USED (does not bail).  The ifdef-
+       *   isolation matrix is conclusive: refusing exactly this op (the old
+       *   FBX735_DIAG_REFUSE_LOAD_WIDE knob) is byte-identical to T2-off at
+       *   2000 AND 10000 lines, while STORE, narrow LOADs, and resume-at-m->ip
+       *   are all proven byte-clean independently.  Bug B (resume) is REFUTED.
+       *
+       *   The translation arithmetic PROVABLY equals blink's GetPageAddress on
+       *   every accepted TLB-hit (offsets / PAGE_TA / key / stride verified vs
+       *   the emitted disasm; the predicate is STRICTER than blink's hit
+       *   condition so it can only over-bail, never mis-accept) — yet the
+       *   8-byte LOAD corrupts at runtime.  Per invariant 6 that means a
+       *   RUNTIME fact the static model is missing; five hypotheses are already
+       *   falsified by build (need-predicate looseness, align hint, stale-TLB,
+       *   #695 self-loop, resume x bailout-after-commit).  Residual suspects:
+       *   a wasmer-backend codegen issue on the specific `i64.load align=3`
+       *   shape under the compiled tier (the only LOAD/STORE asymmetry left is
+       *   read-vs-write of identical address math — points OUTSIDE Blink emit),
+       *   or a full-width-read visibility gap on a just-written 8-byte slot.
+       *
+       *   The ROOT CAUSE is OPEN — this refuse is a KNOWN-CORRECT interim
+       *   fallback, NOT the fix.  The fix lives in the deferred #738 root-cause
+       *   work: a runtime (va -> host-offset) oracle (emit the inline LOAD
+       *   success path to log (inline_host_offset, va) via resolve_indirect,
+       *   diff against blink's authoritative LookupAddress for the same VAs;
+       *   the first mismatch pinpoints the flaw).  See
+       *   work/tasks/738-*/README.md "Bug A - the open question for the next
+       *   move".  When that fix lands, this refuse is removed and the wide
+       *   LOAD re-enabled.
+       *
+       *   width semantics: the lifter's WidthFromRde() always sets a concrete
+       *   1/2/4/8 for a LOAD (never 0), but we test `!width || width == 8` to
+       *   match the proven LWID predicate exactly and stay robust to any future
+       *   default-width (0) lift path. */
+      if (op == FBX_IR_OP_LOAD &&
+          (!ir->insts[i].width || ir->insts[i].width == 8)) {
+        SetFail(fail, FBX_IR_EMIT_NONLINEAR_GUEST_MEM, op);
+        return 0;
+      }
       switch (op) {
 #ifdef FBX735_DIAG_REFUSE_LOADSTORE
         case FBX_IR_OP_LOAD:
