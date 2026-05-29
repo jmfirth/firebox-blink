@@ -231,21 +231,51 @@ void Fbxt2TryEscalate(struct Machine *m, struct FbxTcBlock *b) {
     }
   }
 
-  /* Step 3 — instantiate via host import; pass consts[] alongside wasm. */
-  sys_id = (u64)(uintptr_t)m->system; /* spec §11.3: sys_id = host-side &System */
-  funcref = fbx_t2_instantiate(sys_id, buf.data, (u32)buf.len,
-                               consts, nconsts);
-  fbx_ir_free(ir);
-  fbx_wasm_buffer_free(&buf);
-  if (funcref < 0) {
-    T2TraceLine(g_t2_trace_escalations,
-                "[t2 escalate] sys=%p pc=%#llx outcome=instantiate_failed\n",
-                (void *)m->system, (unsigned long long)b->start_pc);
-    return;
-  }
+  /* Step 3 — build the per-block FbxT2BlockCtx in the GUEST's own heap
+   * (firebox#719).  Pre-#719 the bridge copied consts[] into a
+   * bridge-owned scratch memory; now the T2 module imports the guest's
+   * REAL (shared) linear memory, so the ctx must live in guest memory at
+   * an address the guest controls (a bridge-chosen offset would clobber
+   * live guest data).  The allocation is stashed on the block and outlives
+   * every dispatch of the funcref (the wasm reads it at dispatch time);
+   * it is freed in FbxTcInvalidate alongside the funcref drop. */
+  {
+    struct FbxT2BlockCtx *ctx;
+    u32 ci;
+    ctx = (struct FbxT2BlockCtx *)malloc(sizeof(struct FbxT2BlockCtx));
+    if (!ctx) {
+      fbx_ir_free(ir);
+      fbx_wasm_buffer_free(&buf);
+      T2TraceLine(g_t2_trace_escalations,
+                  "[t2 escalate] sys=%p pc=%#llx outcome=ctx_alloc_failed\n",
+                  (void *)m->system, (unsigned long long)b->start_pc);
+      return;
+    }
+    ctx->version = FBX_T2_BLOCK_CTX_VERSION;
+    ctx->nconsts = nconsts;
+    for (ci = 0; ci < FBX_T2_BLOCK_CTX_MAX_CONSTS; ++ci) {
+      ctx->consts[ci] = (ci < nconsts) ? consts[ci] : 0;
+    }
 
-  /* Step 4 — stash funcref on the block.  Future ExecuteBlock calls
-   * route through Fbxt2Dispatch instead of walking entries[]. */
+    /* Step 4 — instantiate via host import; pass the guest-heap ctx
+     * pointer (== the i32 guest-memory offset on the wasm target). */
+    sys_id = (u64)(uintptr_t)m->system; /* spec §11.3: sys_id = host-side &System */
+    funcref = fbx_t2_instantiate(sys_id, buf.data, (u32)buf.len, ctx);
+    fbx_ir_free(ir);
+    fbx_wasm_buffer_free(&buf);
+    if (funcref < 0) {
+      free(ctx);
+      T2TraceLine(g_t2_trace_escalations,
+                  "[t2 escalate] sys=%p pc=%#llx outcome=instantiate_failed\n",
+                  (void *)m->system, (unsigned long long)b->start_pc);
+      return;
+    }
+
+    /* Step 5 — stash funcref + ctx on the block.  Future ExecuteBlock
+     * calls route through Fbxt2Dispatch instead of walking entries[].
+     * The ctx pointer is retained so it stays live for every dispatch. */
+    b->t2_block_ctx = ctx;
+  }
   b->t2_funcref = funcref;
   T2TraceLine(g_t2_trace_escalations,
               "[t2 escalate] sys=%p pc=%#llx outcome=success funcref=%d\n",
@@ -254,14 +284,17 @@ void Fbxt2TryEscalate(struct Machine *m, struct FbxTcBlock *b) {
 
 int Fbxt2Dispatch(struct Machine *m, struct FbxTcBlock *b) {
   u64 sys_id = (u64)(uintptr_t)m->system;
-  /* `m_ptr` is the host-linear-memory offset of the Machine struct.  When
-   * Blink is running inside wasm, this is the wasm `i32` offset.  For
-   * native test bench, it's a meaningless integer that the synthetic
-   * dispatcher echoes back — that's fine, the v0.1 supported opcode set
-   * (REG_GET/SET, ALU, LEA simple, BRANCH_TAKEN, BAILOUT, PC_MARK) doesn't
-   * load/store from m_ptr at all (those are §13.5 opcodes).  When §13.5
-   * lights up memory ops, the native test bench will need to feed a real
-   * Machine offset — out of scope for this task. */
+  /* `m_ptr` is the linear-memory offset of the Machine struct.  When Blink
+   * runs inside wasm (production), truncating the `struct Machine *` to i32
+   * yields the correct wasm offset into Blink's OWN linear memory — and
+   * firebox#719 makes the T2 module import THAT SAME (shared) memory, so a
+   * translated block's `m_ptr + reg_offset` load/store (§13.5 REG_GET/SET,
+   * LOAD/STORE) lands in the real `Machine` the Tier-1 interpreter uses.
+   * (Before #719 the bridge gave the T2 module an isolated scratch memory,
+   * so this offset — typically several MB — trapped OOB on the first
+   * access; that was the #709 root cause.)  For the native test bench it's
+   * a meaningless integer the synthetic dispatcher echoes back, which is
+   * fine for the integer-only opcodes those tests exercise. */
   i32 m_ptr = (i32)(intptr_t)m;
   int exit_code = fbx_t2_dispatch(sys_id, b->t2_funcref, m_ptr);
   if (exit_code == 1 || exit_code == 2) {
@@ -301,12 +334,11 @@ int Fbxt2Dispatch(struct Machine *m, struct FbxTcBlock *b) {
 
 __attribute__((weak))
 int fbx_t2_instantiate(u64 sys_id, const u8 *wasm_bytes, u32 wasm_len,
-                       const u64 *consts, u32 nconsts) {
+                       const struct FbxT2BlockCtx *block_ctx) {
   (void)sys_id;
   (void)wasm_bytes;
   (void)wasm_len;
-  (void)consts;
-  (void)nconsts;
+  (void)block_ctx;
   return -1; /* T2 disabled — no engine wired in */
 }
 

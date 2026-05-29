@@ -280,6 +280,13 @@ void FbxTcInit(struct System *sys) {
 static void FreeBlockChain(struct FbxTcBlock *b) {
   while (b) {
     struct FbxTcBlock *next = b->next;
+    /* firebox#719: free the guest-owned per-block FbxT2BlockCtx (NULL
+     * unless the block escalated to Tier 2).  Allocated in
+     * Fbxt2TryEscalate; outlives every dispatch of t2_funcref and is
+     * reclaimed here when the block itself is dropped (FbxTcInvalidate /
+     * SMC).  The matching funcref's host-side module is dropped via
+     * fbx_t2_drop_all on the same invalidate path. */
+    free(b->t2_block_ctx);
     free(b->entries);
     free(b);
     b = next;

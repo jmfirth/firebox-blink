@@ -57,6 +57,7 @@ extern "C" {
 
 struct Machine;
 struct FbxTcBlock;
+struct FbxT2BlockCtx;
 
 /* ────────────────────────────────────────────────────────────────────────── */
 /* Host-import shims — declared `extern` so the linker resolves them to     */
@@ -89,25 +90,31 @@ struct FbxTcBlock;
 /* Instantiate a wasm module fragment.  Returns a funcref index (>=0) or
  * -1 on failure (instantiation error, OOM, cap reached, T2 disabled).
  *
- * #635 ABI redesign: the `consts` / `nconsts` parameters carry the
- * per-block runtime constants the emit pass hoisted out of the wasm bytes
- * (PCs, register byte-offsets, x86 instruction immediates).  The bridge
- * copies them into a `struct FbxT2BlockCtx` slot in guest linear memory
- * and stashes the slot's guest-memory offset alongside the funcref so the
- * dispatch path can pass it as the second `translated_block` argument.
+ * firebox#719 ABI: `block_ctx` points at a fully-built `FbxT2BlockCtx`
+ * that the CALLER (Blink's `Fbxt2TryEscalate`) allocated + populated in
+ * the GUEST's own heap.  On the wasm target a C pointer IS the i32
+ * guest-memory offset, so the bridge receives `block_ctx` as the
+ * `block_ctx_ptr` it records alongside the funcref and replays as the 2nd
+ * `translated_block(m_ptr, block_ctx_ptr)` argument at every dispatch.
  *
- * Layout + indexing rules live in `blink/fbx_t2_block_ctx.h`.  The wasm
- * `ir_sha` cache key is prefixed with `FBX_T2_BLOCK_CTX_VERSION` on the
- * bridge side; old-ABI cache entries (no prefix) are silently invalidated
- * by construction.
+ * This supersedes the pre-#719 `(const u64 *consts, u32 nconsts)` pair,
+ * where the bridge copied the consts into a bridge-owned scratch memory.
+ * That scratch memory is gone: the T2 module now imports the guest's REAL
+ * (shared) linear memory, so both `m_ptr` (the `Machine` offset) and
+ * `block_ctx` resolve against the SAME bytes the Tier-1 interpreter reads
+ * (spec §5.2).  Writing a ctx at a bridge-chosen offset would clobber live
+ * guest data — hence guest ownership.
  *
- * `nconsts` MUST be ≤ `FBX_T2_BLOCK_CTX_MAX_CONSTS`; the bridge rejects
- * anything larger with funcref = -1.  Pass `consts=NULL, nconsts=0` for
- * blocks emitted by an emitter that hasn't been upgraded yet — the wasm
- * bytes are then expected to be self-contained (legacy path). */
+ * `block_ctx` MUST outlive every dispatch of the returned funcref (the
+ * wasm reads it at dispatch time, not instantiate time).  The caller
+ * stashes it on the block (`FbxTcBlock::t2_block_ctx`).  Layout + indexing
+ * rules live in `blink/fbx_t2_block_ctx.h`; `block_ctx->nconsts` MUST be
+ * ≤ `FBX_T2_BLOCK_CTX_MAX_CONSTS` (the caller's allocator enforces this).
+ * `block_ctx` may be NULL only for the legacy zero-ctx path (the wasm
+ * loads then read whatever is at offset 0 — used by tests, not production). */
 FBX_T2_HOST_IMPORT
 int fbx_t2_instantiate(u64 sys_id, const u8 *wasm_bytes, u32 wasm_len,
-                       const u64 *consts, u32 nconsts);
+                       const struct FbxT2BlockCtx *block_ctx);
 
 /* Dispatch the translated block.  Returns the wasm function's exit code
  * (0 = normal completion, 1 = bailout to Tier 1, 2 = host-call escape).

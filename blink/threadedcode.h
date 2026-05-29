@@ -114,7 +114,15 @@ struct FbxTcBlock {
   u32 hits;                /* execution count (best-effort; not atomic) */
   i32 t2_funcref;          /* Tier 2 funcref or -1 (spec §6.3) */
   u8 t2_attempted;         /* Tier 2 escalation latch (spec §6.1) */
-  u8 t2_reserved[3];       /* padding to keep `entries` naturally aligned */
+  u8 t2_reserved[3];       /* padding to keep the pointer naturally aligned */
+  /* firebox#719: the per-block FbxT2BlockCtx now lives in the GUEST's own
+   * heap (Blink owns the allocation) instead of a bridge-owned scratch
+   * arena.  Its guest-memory address IS the `block_ctx_ptr` the bridge
+   * records per-funcref and replays as the 2nd `translated_block` arg.
+   * It MUST outlive every dispatch of `t2_funcref`, so we stash it on the
+   * block; freed in `FbxTcInvalidate` alongside the funcref drop.  NULL
+   * until a successful escalation. */
+  void *t2_block_ctx;
   struct FbxTcEntry *entries; /* malloc'd array of nentries entries */
   struct FbxTcBlock *next; /* next block in the same hash bucket */
 };

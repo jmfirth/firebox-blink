@@ -109,10 +109,10 @@ static int g_t2_next_dispatch_exit = 0;     /* what the next dispatch returns */
 static int g_t2_force_instantiate_fail = 0; /* if 1, instantiate returns -1 */
 
 int fbx_t2_instantiate(u64 sys_id, const u8 *wasm_bytes, u32 wasm_len,
-                       const u64 *consts, u32 nconsts) {
+                       const struct FbxT2BlockCtx *block_ctx) {
   (void)sys_id;
-  (void)consts;
-  (void)nconsts;
+  (void)block_ctx; /* firebox#719: ctx now guest-owned; this synthetic
+                    * engine doesn't dispatch real wasm, so it ignores it */
   ++g_t2_instantiate_calls;
   if (g_t2_force_instantiate_fail) return -1;
   if (!wasm_bytes || wasm_len == 0) return -1;
