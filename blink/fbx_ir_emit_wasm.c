@@ -370,6 +370,7 @@ static int CoverageGate(const struct FbxIrBlock *ir,
   u32 i;
   u32 tc_idx;
   int saw_flag_reader = 0;
+  int saw_flag_writer_local = 0;
   int saw_flag_writer = 0;
   if (!ir || ir->ninsts == 0) {
     SetFail(fail, FBX_IR_EMIT_EMPTY_IR, 0);
@@ -391,6 +392,17 @@ static int CoverageGate(const struct FbxIrBlock *ir,
     u8 op = ir->insts[i].opcode;
     if (op == FBX_IR_OP_GET_FLAG || op == FBX_IR_OP_BRANCH_COND) {
       saw_flag_reader = 1;
+#ifdef FBX735_DIAG_REFUSE_FLAGREADER
+      /* firebox#738 Bug-A localization: refuse blocks with a flag reader
+       * (BRANCH_COND/GET_FLAG) to test if the Jcc/CMOVcc lowering — NOT the
+       * inline wide LOAD — is the corruptor. */
+      SetFail(fail, FBX_IR_EMIT_FLAG_READER_DEFERRED, op);
+      return 0;
+#endif
+    }
+    if (op == FBX_IR_OP_SET_FLAGS_RAW || op == FBX_IR_OP_CMP ||
+        op == FBX_IR_OP_TEST) {
+      saw_flag_writer_local = 1;
     }
     if (op == FBX_IR_OP_SET_FLAGS_RAW || op == FBX_IR_OP_CMP ||
         op == FBX_IR_OP_TEST) {
@@ -416,6 +428,16 @@ static int CoverageGate(const struct FbxIrBlock *ir,
   /* SET_FLAGS_RAW: when a flag-reader follows, the eager-update path is
    * triggered.  This requires the v2 IR shape (src1/src2 = operand vregs).
    * Validate that every SET_FLAGS_RAW carries the expected encoding. */
+#ifdef FBX735_DIAG_REFUSE_XBLOCK_FLAGREADER
+  /* firebox#738 Bug-A: refuse ONLY BRANCH_COND blocks that have NO in-block
+   * flag writer — i.e. PURE cross-block flag readers (they read flags a PRIOR
+   * block set). If this is CLEAN (wide LOAD still on), the corruptor is
+   * cross-block lazy-flag staleness, not the in-block writer or the predicate. */
+  if (saw_flag_reader && !saw_flag_writer_local) {
+    SetFail(fail, FBX_IR_EMIT_FLAG_READER_DEFERRED, FBX_IR_OP_BRANCH_COND);
+    return 0;
+  }
+#endif
   if (saw_flag_reader) {
     for (i = 0; i < ir->ninsts; ++i) {
       const struct FbxIrInst *p = &ir->insts[i];
@@ -559,7 +581,7 @@ static int CoverageGate(const struct FbxIrBlock *ir,
        *   success path to log (inline_host_offset, va) via resolve_indirect,
        *   diff against blink's authoritative LookupAddress for the same VAs;
        *   the first mismatch pinpoints the flaw).  See
-       *   work/tasks/738-*/README.md "Bug A - the open question for the next
+       *   work/tasks/738-... README.md "Bug A - the open question for the next
        *   move".  When that fix lands, this refuse is removed and the wide
        *   LOAD re-enabled.
        *
@@ -567,11 +589,18 @@ static int CoverageGate(const struct FbxIrBlock *ir,
        *   1/2/4/8 for a LOAD (never 0), but we test `!width || width == 8` to
        *   match the proven LWID predicate exactly and stay robust to any future
        *   default-width (0) lift path. */
+#ifndef FBX735_DIAG_XLAT_LOG
+      /* firebox#738 Bug-A ORACLE build (FBX735_DIAG_XLAT_LOG): RE-ENABLE the
+       * wide LOAD (skip this refuse) so the corrupting inline 8-byte LOAD emits
+       * AND gets instrumented with a `call resolve_indirect(m_ptr, va)` on its
+       * success path (see EmitLoadMem). The host closure reads the live TLB and
+       * self-checks. This is a DIAGNOSTIC build, never promoted. */
       if (op == FBX_IR_OP_LOAD &&
           (!ir->insts[i].width || ir->insts[i].width == 8)) {
         SetFail(fail, FBX_IR_EMIT_NONLINEAR_GUEST_MEM, op);
         return 0;
       }
+#endif
       switch (op) {
 #ifdef FBX735_DIAG_REFUSE_LOADSTORE
         case FBX_IR_OP_LOAD:
@@ -2537,6 +2566,17 @@ static void EmitLoadMem(struct FbxWasmBuffer *body, u32 dst_local,
   EmitMemEffectiveVa(body, base_slot, has_disp, disp_slot);
   EmitGuestVaToHostOffsetOrBailout(body, /*need_rw=*/0, width, mmu_va,
                                    mmu_entry, bailout_pc_slot);
+#ifdef FBX735_DIAG_XLAT_LOG
+  /* firebox#738 Bug-A ORACLE: on the inline WIDE (8-byte) LOAD success path
+   * (host offset now on the wasm stack), call resolve_indirect(m_ptr, va) so
+   * the bridge reads the LIVE TLB and self-checks the translation. mmu_va still
+   * holds the i64 VA (set at the top of EmitGuestVaToHostOffsetOrBailout, never
+   * overwritten). The call's 2 args are pushed + consumed and its i32 result is
+   * dropped, leaving the original host offset on the stack untouched for the
+   * load. Only width==8 — the corrupting op. */
+  /* (oracle call moved to AFTER the load+local.set — see below — so it can
+   * pass the GUEST-LOADED value for comparison against the host's own read.) */
+#endif
   switch (width) {
     case 1:
       fbx_wasm_buffer_u8(body, WASM_OP_I64_LOAD8U);
@@ -2562,6 +2602,41 @@ static void EmitLoadMem(struct FbxWasmBuffer *body, u32 dst_local,
   }
   fbx_wasm_buffer_u8(body, WASM_OP_LOCAL_SET);
   fbx_wasm_buffer_uleb(body, dst_local);
+#ifdef FBX735_DIAG_XLAT_LOG
+  /* firebox#738 Bug-A ORACLE: AFTER the wide LOAD wrote dst_local, call
+   * resolve_indirect(guest_loaded_low32, va).  The host recomputes inline_off
+   * from (m_ptr-via-env? no — it gets va), reads its OWN 8 bytes at the
+   * TLB-derived offset, and compares low32(host_read) against the i32 arg
+   * (the value the GUEST actually loaded).  A mismatch means the guest's
+   * i64.load read DIFFERENT bytes than the host sees at the same translated
+   * offset — the smoking gun for a guest/host memory-view divergence.  The
+   * i32 arg carries the guest-loaded low32; the i64 arg carries va so the
+   * host can re-derive the offset + compare. */
+  if (width == 8) {
+    /* i32 arg = host_offset, recomputed from the still-live mmu_entry/mmu_va
+     * locals exactly as the translation tail did: (i32)(entry & PAGE_TA) +
+     * (i32)(va & 4095). */
+    fbx_wasm_buffer_u8(body, WASM_OP_LOCAL_GET);
+    fbx_wasm_buffer_uleb(body, mmu_entry);
+    fbx_wasm_buffer_u8(body, WASM_OP_I64_CONST);
+    fbx_wasm_buffer_sleb(body, (i64)M_PAGE_TA);
+    fbx_wasm_buffer_u8(body, WASM_OP_I64_AND);
+    fbx_wasm_buffer_u8(body, WASM_OP_I32_WRAP_I64);
+    fbx_wasm_buffer_u8(body, WASM_OP_LOCAL_GET);
+    fbx_wasm_buffer_uleb(body, mmu_va);
+    fbx_wasm_buffer_u8(body, WASM_OP_I64_CONST);
+    fbx_wasm_buffer_sleb(body, 4095);
+    fbx_wasm_buffer_u8(body, WASM_OP_I64_AND);
+    fbx_wasm_buffer_u8(body, WASM_OP_I32_WRAP_I64);
+    fbx_wasm_buffer_u8(body, WASM_OP_I32_ADD);        /* i32 host_offset */
+    /* i64 arg = the value the GUEST just loaded into dst_local. */
+    fbx_wasm_buffer_u8(body, WASM_OP_LOCAL_GET);
+    fbx_wasm_buffer_uleb(body, dst_local);            /* i64 loaded value */
+    fbx_wasm_buffer_u8(body, WASM_OP_CALL);
+    fbx_wasm_buffer_uleb(body, FBX_HOST_IMPORT_RESOLVE_INDIRECT);
+    fbx_wasm_buffer_u8(body, 0x1Au);                  /* drop i32 result */
+  }
+#endif
 }
 
 /* Lower FBX_IR_OP_STORE: mem[base + disp] = vreg (width-truncated).

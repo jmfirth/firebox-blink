@@ -572,7 +572,11 @@ static void ExecuteBlock(struct Machine *m, struct FbxTcBlock *b) {
       {
         static _Atomic(long) dbg_n = 0;
         long n = atomic_fetch_add_explicit(&dbg_n, 1, memory_order_relaxed);
-        if (n < 40) {
+        /* firebox#738: log ONLY the dangerous resumes — a mid-block resume
+         * (resume_idx != 0) means the T2 block committed a prefix before
+         * bailing, the exact double-commit window. Start-of-block resumes are
+         * sound and flood the trace. Also flag found=0 (scan miss). */
+        if ((resume_idx != 0 || !found) && n < 2000) {
           fprintf(stderr,
                   "[t735 resume] ip=%#llx start=%#llx end=%#llx nent=%u "
                   "resume_idx=%u found=%d e0_ip=%#llx\n",
