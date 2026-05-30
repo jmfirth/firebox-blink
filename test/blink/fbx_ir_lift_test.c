@@ -281,6 +281,58 @@ TEST(FbxIrLift, Lea) {
   FreeTc(tc);
 }
 
+/* firebox#738 — ROOT CAUSE regression: LEA must lower ONLY the `[base + disp]`
+ * addressing form.  Before the fix, LiftLea unconditionally sourced the base as
+ * RexbRm(rde) and dropped any SIB index register, so a SIB-index LEA such as
+ * `lea r14, [r9 + rax]` was mis-lifted to `r14 = weg[wrong_base] + disp` with
+ * the index silently dropped → a garbage/-1 pointer Tier 1 then dereferenced
+ * → SIGSEGV (witnessed in the sort strcmp hot path under #735 T2).  The fix
+ * routes LEA through ClassifyMemBaseDisp (correct base sourcing + correct-or-
+ * refuse), so the unsupported forms now BAILOUT to Tier 1. */
+
+/* ModrmRm==4 selects a SIB byte; SibIndex default 0 (!= 4) ⇒ has an index
+ * register ⇒ the unsupported indexed form ⇒ BAILOUT (no LEA emitted). */
+TEST(FbxIrLift, LeaSibIndexRefused) {
+  struct FbxTcBlock *tc = MakeTc(0x08D, /*rde_extra=*/0x200ull, 0, 0,
+                                 0x400000, 4, FBX_TC_KIND_NORMAL);
+  struct FbxIrBlock *ir = fbx_ir_lift(tc);
+  ASSERT_NOTNULL(ir);
+  EXPECT_EQ(0, BlockHas(ir, FBX_IR_OP_LEA));     /* NOT lowered inline */
+  EXPECT_NE(0, BlockHas(ir, FBX_IR_OP_BAILOUT)); /* refused → Tier 1 */
+  fbx_ir_free(ir);
+  FreeTc(tc);
+}
+
+/* mod==0, ModrmRm==5 (no SIB) is the RIP-relative form — no base register.
+ * Unsupported ⇒ BAILOUT. */
+TEST(FbxIrLift, LeaRipRelativeRefused) {
+  struct FbxTcBlock *tc = MakeTc(0x08D, /*rde_extra=*/0x280ull, 0, 0,
+                                 0x400000, 7, FBX_TC_KIND_NORMAL);
+  struct FbxIrBlock *ir = fbx_ir_lift(tc);
+  ASSERT_NOTNULL(ir);
+  EXPECT_EQ(0, BlockHas(ir, FBX_IR_OP_LEA));
+  EXPECT_NE(0, BlockHas(ir, FBX_IR_OP_BAILOUT));
+  fbx_ir_free(ir);
+  FreeTc(tc);
+}
+
+/* The SIB base-only form (ModrmRm==4, SibIndex==4 ⇒ no index, SibBase ⇒ a real
+ * base) IS supported: it lowers to a LEA whose base is sourced via RexbBase
+ * (NOT RexbRm).  This is the case the original code got wrong even when it did
+ * emit a LEA — the base must come from the SIB base field. */
+TEST(FbxIrLift, LeaSibBaseOnlyAccepted) {
+  /* rde_extra: ModrmRm=4 (0x200) | SibIndex=4 (4 << 0o43) ⇒ no index. */
+  u64 rde_extra = 0x200ull | (4ull << 0043);
+  struct FbxTcBlock *tc = MakeTc(0x08D, rde_extra, 0, 0x10, 0x400000, 5,
+                                 FBX_TC_KIND_NORMAL);
+  struct FbxIrBlock *ir = fbx_ir_lift(tc);
+  ASSERT_NOTNULL(ir);
+  EXPECT_NE(0, BlockHas(ir, FBX_IR_OP_LEA));      /* supported form */
+  EXPECT_EQ(0, BlockHas(ir, FBX_IR_OP_BAILOUT));
+  fbx_ir_free(ir);
+  FreeTc(tc);
+}
+
 TEST(FbxIrLift, AddRR) {
   /* opcode 0x01: ADD r/m64, r64. */
   struct FbxTcBlock *tc = MakeTc(0x001, 0, 0, 0, 0x400000, 3,
