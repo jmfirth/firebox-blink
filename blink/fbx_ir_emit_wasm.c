@@ -554,14 +554,17 @@ static int CoverageGate(const struct FbxIrBlock *ir,
        *   or a full-width-read visibility gap on a just-written 8-byte slot.
        *
        *   The ROOT CAUSE is OPEN — this refuse is a KNOWN-CORRECT interim
-       *   fallback, NOT the fix.  The fix lives in the deferred #738 root-cause
-       *   work: a runtime (va -> host-offset) oracle (emit the inline LOAD
-       *   success path to log (inline_host_offset, va) via resolve_indirect,
-       *   diff against blink's authoritative LookupAddress for the same VAs;
-       *   the first mismatch pinpoints the flaw).  See
-       *   work/tasks/738-*/README.md "Bug A - the open question for the next
-       *   move".  When that fix lands, this refuse is removed and the wide
-       *   LOAD re-enabled.
+       *   fallback, NOT the fix.  UPDATE (#738 session 4): the runtime
+       *   (va -> host-offset) oracle was built and REFUTED the 8-byte-LOAD
+       *   hypothesis — the wide LOAD is faithful (zero oracle divergence, and a
+       *   cross-engine unaligned i64.load unit test passes).  The real corruptor
+       *   is the #599 BRANCH_COND (Jcc / lazy-flag) lowering in blocks that ALSO
+       *   carry a wide LOAD (an interaction); the wide LOAD was a correlated red
+       *   herring — refusing it bails the same blocks that carry the real bug.
+       *   The fix lives in EmitJccPredicate / EmitBranchCond / EmitFlagsAfterAlu.
+       *   See work/tasks/738-blink-t2-735-emit-corruption-fix-and-stack-ops/README.md
+       *   (session_4_verdict).  When that fix lands, this refuse is removed and
+       *   the wide LOAD re-enabled.
        *
        *   width semantics: the lifter's WidthFromRde() always sets a concrete
        *   1/2/4/8 for a LOAD (never 0), but we test `!width || width == 8` to
