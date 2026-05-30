@@ -546,55 +546,18 @@ static int CoverageGate(const struct FbxIrBlock *ir,
      * (they touch only `m_ptr + offsetof` into the Machine struct, a real
      * linear-memory C object). */
     if (!HasLinearMapping()) {
-      /* firebox#738 — INTERIM FALLBACK: refuse the wide (8-byte / 64-bit)
-       * guest LOAD permanently, so the whole block bails to Tier 1 (which
-       * does its own authoritative page-table walk + access).  Narrow LOADs
-       * (1/2/4 bytes) and ALL STOREs still emit the inline software-MMU
-       * translation; resume-at-m->ip stays.  PUSH/POP/CALL_DIRECT/RET stay
-       * refused (out of scope, below).
+      /* firebox#738 — the wide (8-byte / i64) guest LOAD is RE-ENABLED here.
+       * SESSION 4 proved the wide LOAD INNOCENT (the LOAD value is byte-faithful
+       * to the host's own read at the same translated offset, three independent
+       * ways).  The real corruptor was the #599 BRANCH_COND lazy-flag lowering
+       * in blocks that ALSO carried a wide LOAD; the SESSION-3 interim refuse of
+       * the wide LOAD was byte-clean only because it bailed those same blocks.
+       * With the #599 fix below (EmitFlagsAfterAlu — see its block comment), the
+       * wide LOAD emits inline again and the byte-identity gate is GREEN.
        *
-       * WHY this is here and NOT a symptom-paper:
-       *   #738 localized the only #735 emit corruption to ONE op — the inline
-       *   software-MMU translation for the 8-byte (i64, width==8) guest LOAD,
-       *   on the path where its result is USED (does not bail).  The ifdef-
-       *   isolation matrix is conclusive: refusing exactly this op (the old
-       *   FBX735_DIAG_REFUSE_LOAD_WIDE knob) is byte-identical to T2-off at
-       *   2000 AND 10000 lines, while STORE, narrow LOADs, and resume-at-m->ip
-       *   are all proven byte-clean independently.  Bug B (resume) is REFUTED.
-       *
-       *   The translation arithmetic PROVABLY equals blink's GetPageAddress on
-       *   every accepted TLB-hit (offsets / PAGE_TA / key / stride verified vs
-       *   the emitted disasm; the predicate is STRICTER than blink's hit
-       *   condition so it can only over-bail, never mis-accept) — yet the
-       *   8-byte LOAD corrupts at runtime.  Per invariant 6 that means a
-       *   RUNTIME fact the static model is missing; five hypotheses are already
-       *   falsified by build (need-predicate looseness, align hint, stale-TLB,
-       *   #695 self-loop, resume x bailout-after-commit).  Residual suspects:
-       *   a wasmer-backend codegen issue on the specific `i64.load align=3`
-       *   shape under the compiled tier (the only LOAD/STORE asymmetry left is
-       *   read-vs-write of identical address math — points OUTSIDE Blink emit),
-       *   or a full-width-read visibility gap on a just-written 8-byte slot.
-       *
-       *   The ROOT CAUSE is OPEN — this refuse is a KNOWN-CORRECT interim
-       *   fallback, NOT the fix.  The fix lives in the deferred #738 root-cause
-       *   work: a runtime (va -> host-offset) oracle (emit the inline LOAD
-       *   success path to log (inline_host_offset, va) via resolve_indirect,
-       *   diff against blink's authoritative LookupAddress for the same VAs;
-       *   the first mismatch pinpoints the flaw).  See
-       *   work/tasks/738-... README.md "Bug A - the open question for the next
-       *   move".  When that fix lands, this refuse is removed and the wide
-       *   LOAD re-enabled.
-       *
-       *   width semantics: the lifter's WidthFromRde() always sets a concrete
-       *   1/2/4/8 for a LOAD (never 0), but we test `!width || width == 8` to
-       *   match the proven LWID predicate exactly and stay robust to any future
-       *   default-width (0) lift path. */
-#ifndef FBX735_DIAG_XLAT_LOG
-      /* firebox#738 Bug-A ORACLE build (FBX735_DIAG_XLAT_LOG): RE-ENABLE the
-       * wide LOAD (skip this refuse) so the corrupting inline 8-byte LOAD emits
-       * AND gets instrumented with a `call resolve_indirect(m_ptr, va)` on its
-       * success path (see EmitLoadMem). The host closure reads the live TLB and
-       * self-checks. This is a DIAGNOSTIC build, never promoted. */
+       * FBX735_DIAG_REFUSE_LOAD_WIDE remains as a localization knob (refuse the
+       * wide LOAD to A/B the fix); it is OFF by default. */
+#ifdef FBX735_DIAG_REFUSE_LOAD_WIDE
       if (op == FBX_IR_OP_LOAD &&
           (!ir->insts[i].width || ir->insts[i].width == 8)) {
         SetFail(fail, FBX_IR_EMIT_NONLINEAR_GUEST_MEM, op);
@@ -2566,17 +2529,6 @@ static void EmitLoadMem(struct FbxWasmBuffer *body, u32 dst_local,
   EmitMemEffectiveVa(body, base_slot, has_disp, disp_slot);
   EmitGuestVaToHostOffsetOrBailout(body, /*need_rw=*/0, width, mmu_va,
                                    mmu_entry, bailout_pc_slot);
-#ifdef FBX735_DIAG_XLAT_LOG
-  /* firebox#738 Bug-A ORACLE: on the inline WIDE (8-byte) LOAD success path
-   * (host offset now on the wasm stack), call resolve_indirect(m_ptr, va) so
-   * the bridge reads the LIVE TLB and self-checks the translation. mmu_va still
-   * holds the i64 VA (set at the top of EmitGuestVaToHostOffsetOrBailout, never
-   * overwritten). The call's 2 args are pushed + consumed and its i32 result is
-   * dropped, leaving the original host offset on the stack untouched for the
-   * load. Only width==8 — the corrupting op. */
-  /* (oracle call moved to AFTER the load+local.set — see below — so it can
-   * pass the GUEST-LOADED value for comparison against the host's own read.) */
-#endif
   switch (width) {
     case 1:
       fbx_wasm_buffer_u8(body, WASM_OP_I64_LOAD8U);
@@ -2602,41 +2554,6 @@ static void EmitLoadMem(struct FbxWasmBuffer *body, u32 dst_local,
   }
   fbx_wasm_buffer_u8(body, WASM_OP_LOCAL_SET);
   fbx_wasm_buffer_uleb(body, dst_local);
-#ifdef FBX735_DIAG_XLAT_LOG
-  /* firebox#738 Bug-A ORACLE: AFTER the wide LOAD wrote dst_local, call
-   * resolve_indirect(guest_loaded_low32, va).  The host recomputes inline_off
-   * from (m_ptr-via-env? no — it gets va), reads its OWN 8 bytes at the
-   * TLB-derived offset, and compares low32(host_read) against the i32 arg
-   * (the value the GUEST actually loaded).  A mismatch means the guest's
-   * i64.load read DIFFERENT bytes than the host sees at the same translated
-   * offset — the smoking gun for a guest/host memory-view divergence.  The
-   * i32 arg carries the guest-loaded low32; the i64 arg carries va so the
-   * host can re-derive the offset + compare. */
-  if (width == 8) {
-    /* i32 arg = host_offset, recomputed from the still-live mmu_entry/mmu_va
-     * locals exactly as the translation tail did: (i32)(entry & PAGE_TA) +
-     * (i32)(va & 4095). */
-    fbx_wasm_buffer_u8(body, WASM_OP_LOCAL_GET);
-    fbx_wasm_buffer_uleb(body, mmu_entry);
-    fbx_wasm_buffer_u8(body, WASM_OP_I64_CONST);
-    fbx_wasm_buffer_sleb(body, (i64)M_PAGE_TA);
-    fbx_wasm_buffer_u8(body, WASM_OP_I64_AND);
-    fbx_wasm_buffer_u8(body, WASM_OP_I32_WRAP_I64);
-    fbx_wasm_buffer_u8(body, WASM_OP_LOCAL_GET);
-    fbx_wasm_buffer_uleb(body, mmu_va);
-    fbx_wasm_buffer_u8(body, WASM_OP_I64_CONST);
-    fbx_wasm_buffer_sleb(body, 4095);
-    fbx_wasm_buffer_u8(body, WASM_OP_I64_AND);
-    fbx_wasm_buffer_u8(body, WASM_OP_I32_WRAP_I64);
-    fbx_wasm_buffer_u8(body, WASM_OP_I32_ADD);        /* i32 host_offset */
-    /* i64 arg = the value the GUEST just loaded into dst_local. */
-    fbx_wasm_buffer_u8(body, WASM_OP_LOCAL_GET);
-    fbx_wasm_buffer_uleb(body, dst_local);            /* i64 loaded value */
-    fbx_wasm_buffer_u8(body, WASM_OP_CALL);
-    fbx_wasm_buffer_uleb(body, FBX_HOST_IMPORT_RESOLVE_INDIRECT);
-    fbx_wasm_buffer_u8(body, 0x1Au);                  /* drop i32 result */
-  }
-#endif
 }
 
 /* Lower FBX_IR_OP_STORE: mem[base + disp] = vreg (width-truncated).
@@ -2891,7 +2808,15 @@ static int EmitFunctionBody(struct FbxWasmBuffer *body,
   /* #695 — self-loop wrapper.  A BRANCH_COND-terminated block (do/while shape)
    * always has needs_scratch==1, so the self-loop locals can be declared after
    * the scratch pair as a third locals group. */
+#ifdef FBX735_DIAG_NO_SELF_LOOP
+  /* firebox#738 Bug-A localization: emit BRANCH_COND blocks WITHOUT the #695
+   * self-loop wrapper (each iteration returns to the host).  Isolates whether
+   * the corruptor lives in the self-loop control flow (entry_ip/resume) or in
+   * the per-iteration flag/branch emit. */
+  int self_loop = 0;
+#else
   int self_loop = BlockIsSelfLoopCandidate(ir);
+#endif
   /* firebox#735 — does the block need the 2×i64 software-MMU scratch group?
    * Declared LAST (after vregs/scratch/self-loop) so existing local indices
    * are unchanged; MmuVaLocal/MmuEntryLocal compute the matching base. */
