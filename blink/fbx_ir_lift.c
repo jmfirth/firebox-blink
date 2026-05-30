@@ -575,17 +575,55 @@ static int LiftMovImm(struct LiftCtx *ctx, u64 rde, u64 uimm0) {
   return 1;
 }
 
-/* Lift LEA (opcode 0x8D). */
+/* Lift LEA (opcode 0x8D).
+ *
+ * firebox#738 (ROOT CAUSE — correctness, load-bearing): LEA's emit lowers
+ * exactly ONE addressing shape, `[base + disp]` (FBX_IR_OP_LEA = greg base +
+ * immediate disp; see EmitLea).  The original lift sourced the base
+ * UNCONDITIONALLY as `RexbRm(rde)` and dropped any SIB index register — which
+ * is WRONG for every SIB-addressed LEA:
+ *   - `lea r14, [r9 + rax]` (SIB byte, base=r9 via RexbBase, index=rax) was
+ *     mis-lifted as `r14 = weg[RexbRm] + disp`.  With a SIB byte ModrmRm==4, so
+ *     RexbRm decodes reg 4/12 (NOT the SIB base r9), AND the index register rax
+ *     was silently dropped → r14 computed from the wrong base with no index →
+ *     a garbage pointer.  In the hot strcmp/strcoll string-end computation
+ *     (`mov r9,[rsp+disp]; lea r14,[r9+rax]; test …; jns …`) this produced a
+ *     -1/out-of-range pointer that Tier 1 then dereferenced → SIGSEGV after
+ *     correct output up to the crash (witnessed: sort crashes at line 85 once
+ *     the comparison block escalates to T2 at the default hotness threshold).
+ * This was masked until #735 enabled the inline wide guest LOAD, because the
+ * #719 acceptance gate refused LOAD/STORE → the strcmp blocks (which carry the
+ * wide stack LOAD feeding the LEA base) never escalated.  The SESSION-4
+ * "wide LOAD + in-block flag-writer + BRANCH_COND" correlation was exactly
+ * this block shape: the wide LOAD sources the LEA's base; the flag-writer +
+ * Jcc terminate it.  Refusing the wide LOAD OR the flag-reader was byte-clean
+ * only because each bailed the SAME block that carried the mis-lifted LEA.
+ *
+ * FIX (correct-or-refuse, the established #677 pattern): validate the EA is the
+ * supported `[base + disp]` via ClassifyMemBaseDisp — which sources the base
+ * correctly (RexbBase for the SIB-base form) and REFUSES SIB-index /
+ * RIP-relative / no-base forms.  A refused form returns -1 → LiftOne emits a
+ * BAILOUT so Tier 1 computes the LEA authoritatively (it already handles every
+ * addressing form).  This both fixes the mis-sourced base AND stops dropping
+ * the index register; the SIB-index LEA support is a clean follow-on (extend
+ * FBX_IR_OP_LEA's emit with an index+scale term, then accept it here). */
 static int LiftLea(struct LiftCtx *ctx, u64 rde, i64 disp) {
   u8 width = WidthFromRde(rde, 0);
-  struct FbxIrInst *lea = CtxEmit(ctx);
+  u32 base_greg;
+  struct FbxIrInst *lea;
+  /* Correct-or-refuse: only the `[base + disp]` form is lowerable by EmitLea.
+   * SIB-index / RIP-relative / no-base SIB → BAILOUT to Tier 1. */
+  if (!ClassifyMemBaseDisp(rde, &base_greg)) {
+    return -1;
+  }
+  lea = CtxEmit(ctx);
   if (!lea) return 0;
   lea->opcode = FBX_IR_OP_LEA;
   lea->width = width;
   lea->dst_kind = FBX_IR_KIND_GREG;
   lea->dst = (u32)RexrReg(rde);
   lea->src1_kind = FBX_IR_KIND_GREG;
-  lea->src1 = (u32)RexbRm(rde);
+  lea->src1 = base_greg;
   lea->src2_kind = FBX_IR_KIND_IMM;
   lea->imm = (u64)disp;
   return 1;
