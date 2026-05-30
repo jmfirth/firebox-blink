@@ -607,13 +607,66 @@ static int LiftMovImm(struct LiftCtx *ctx, u64 rde, u64 uimm0) {
  * addressing form).  This both fixes the mis-sourced base AND stops dropping
  * the index register; the SIB-index LEA support is a clean follow-on (extend
  * FBX_IR_OP_LEA's emit with an index+scale term, then accept it here). */
+/* Classify an LEA memory operand for the inline emitter (#778).               */
+/*                                                                            */
+/* LEA computes `dst = base + index*scale + disp`; it NEVER dereferences      */
+/* guest memory, so (unlike LOAD/STORE) there is no software-MMU concern — it */
+/* is pure register arithmetic into the Machine struct.  That is why LEA can  */
+/* support the SIB-INDEX form inline while LOAD/STORE/MOV still refuse it      */
+/* (their addressing form drives a translated memory access, deferred).       */
+/*                                                                            */
+/* Supported forms (return 1):                                                */
+/*   - No SIB:           base = RexbRm(rde),   no index, scale 0.             */
+/*   - SIB base-only:    base = RexbBase(rde), no index, scale 0.            */
+/*   - SIB base+index:   base = RexbBase(rde), index = Rexx<<3 | SibIndex,   */
+/*                       scale = 1 << SibScale(rde).                          */
+/*                                                                            */
+/* Refused (return 0 → caller BAILOUTs to Tier 1, which handles every form): */
+/*   - RIP-relative (no SIB, mod==0, ModrmRm==5) — no base register.         */
+/*   - No-base SIB (SibIsAbsolute / disp32 + optional index, mod==0,         */
+/*     SibBase==5): the address has no base GREG.  The index-without-base    */
+/*     encoding is rare and would need a 2-term (index*scale + disp) emit     */
+/*     the disp-or-base inline path doesn't model; bail rather than widen.   */
+/*                                                                            */
+/* `*out_scale` is 0 when there is no index term, else the SIB scale.         */
+static int ClassifyLeaMem(u64 rde, u32 *out_base_greg, u32 *out_index_greg,
+                          u32 *out_scale) {
+  *out_index_greg = 0;
+  *out_scale = 0;
+  if (IsModrmRegister(rde)) return 0; /* LEA must have mod != 3 */
+  if (!SibExists(rde)) {
+    /* No SIB.  RIP-relative (mod==0, ModrmRm==5) has no base register. */
+    if (ModrmMod(rde) == 0 && ModrmRm(rde) == 5) return 0;
+    *out_base_greg = (u32)RexbRm(rde);
+    return 1;
+  }
+  /* SIB present.  Require a base register (no-base / absolute forms refused). */
+  if (!SibHasBase(rde)) return 0;
+  *out_base_greg = (u32)RexbBase(rde);
+  if (SibHasIndex(rde)) {
+    /* Index register = Rexx<<3 | SibIndex; scale = 1 << SibScale.  Note that
+     * SibHasIndex already excludes the canonical no-index encoding
+     * (SibIndex==4 && !Rexx), so reg 4 here is the legitimate r12 index. */
+    *out_index_greg = ((u32)Rexx(rde) << 3) | (u32)SibIndex(rde);
+    *out_scale = 1u << (u32)SibScale(rde);
+  }
+  return 1;
+}
+
 static int LiftLea(struct LiftCtx *ctx, u64 rde, i64 disp) {
   u8 width = WidthFromRde(rde, 0);
   u32 base_greg;
+  u32 index_greg;
+  u32 scale;
   struct FbxIrInst *lea;
-  /* Correct-or-refuse: only the `[base + disp]` form is lowerable by EmitLea.
-   * SIB-index / RIP-relative / no-base SIB → BAILOUT to Tier 1. */
-  if (!ClassifyMemBaseDisp(rde, &base_greg)) {
+  /* #778 — inline the SIB-INDEX form too: `lea dst, [base + index*scale +
+   * disp]`.  #738 made LiftLea correct-or-refuse but the supported set was the
+   * disp-only `[base + disp]` shape (it BAILED every indexed LEA to Tier 1).
+   * ClassifyLeaMem now accepts the indexed form (the hot strcmp/strcoll
+   * `lea r14,[r9+rax]`) and refuses only the no-base / RIP-relative forms.
+   * EmitLea adds `weg[index]*scale` to the effective address — no MMU
+   * translation (LEA never touches guest memory). */
+  if (!ClassifyLeaMem(rde, &base_greg, &index_greg, &scale)) {
     return -1;
   }
   lea = CtxEmit(ctx);
@@ -624,7 +677,15 @@ static int LiftLea(struct LiftCtx *ctx, u64 rde, i64 disp) {
   lea->dst = (u32)RexrReg(rde);
   lea->src1_kind = FBX_IR_KIND_GREG;
   lea->src1 = base_greg;
-  lea->src2_kind = FBX_IR_KIND_IMM;
+  if (scale != 0) {
+    /* Indexed form: src2 = index greg, scale = SIB scale. */
+    lea->src2_kind = FBX_IR_KIND_GREG;
+    lea->src2 = index_greg;
+    lea->scale = scale;
+  } else {
+    /* Disp-only form (legacy IMM marker; src2 carries no greg). */
+    lea->src2_kind = FBX_IR_KIND_IMM;
+  }
   lea->imm = (u64)disp;
   return 1;
 }
@@ -1211,10 +1272,13 @@ void fbx_ir_block_sha256(const struct FbxIrBlock *ir, u8 out_sha256[32]) {
       b[k++] = (u8)(p->src2 >> 8);
       b[k++] = (u8)(p->src2 >> 16);
       b[k++] = (u8)(p->src2 >> 24);
-      b[k++] = (u8)(p->_pad2 >> 0);
-      b[k++] = (u8)(p->_pad2 >> 8);
-      b[k++] = (u8)(p->_pad2 >> 16);
-      b[k++] = (u8)(p->_pad2 >> 24);
+      /* Offset-20 word — formerly `_pad2`, now the LEA SIB `scale` (#778).
+       * Hashed in the same position; the FBX_IR_VERSION bump invalidates any
+       * sidecar built before the field carried meaning. */
+      b[k++] = (u8)(p->scale >> 0);
+      b[k++] = (u8)(p->scale >> 8);
+      b[k++] = (u8)(p->scale >> 16);
+      b[k++] = (u8)(p->scale >> 24);
       b[k++] = (u8)(p->imm >> 0);
       b[k++] = (u8)(p->imm >> 8);
       b[k++] = (u8)(p->imm >> 16);

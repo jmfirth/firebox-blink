@@ -125,8 +125,19 @@ extern "C" {
  *     emitted only BAILOUT/REG_GET-REG_SET-then-refused.  Stale Phase 4
  *     sidecars compiled against v3 invalidate cleanly.  Index/RIP-relative
  *     forms still BAILOUT (correct-or-refuse).  See work/tasks/677-* for
- *     the closure narrative. */
-#define FBX_IR_VERSION 4u
+ *     the closure narrative.
+ * v5: §13.5d follow-on (#778) — inline SIB-index LEA emit coverage.  LiftLea
+ *     now accepts the `[base + index*scale + disp]` form (it previously bailed
+ *     to Tier 1 via the #738 correct-or-refuse): src2 carries the index greg,
+ *     the new `scale` field (the renamed offset-20 word) carries the SIB scale,
+ *     and EmitLea adds `weg[index]*scale` to the effective address.  The IR
+ *     LAYOUT is unchanged (the `_pad2` slot is reused as `scale`, same offset +
+ *     size), but the lifter now produces NEW IR (indexed LEAs) for input that
+ *     previously emitted BAILOUT, AND the offset-20 word now carries meaning, so
+ *     stale v4 sidecars (which assumed that word was always zero) must
+ *     invalidate.  RIP-relative / no-base SIB LEAs still BAILOUT.  See
+ *     work/tasks/778-* for the closure narrative. */
+#define FBX_IR_VERSION 5u
 
 /* ────────────────────────────────────────────────────────────────────────── */
 /* IR opcodes.                                                                */
@@ -189,7 +200,18 @@ enum FbxIrOpcode {
   FBX_IR_OP_GET_FLAG = 13,      /* dst = flag value; imm encodes which flag */
 
   /* Address computation (LEA): dst = src1 + src2*scale + imm.  No memory
-   * access.  `width` is the result width (4 or 8 bytes). */
+   * access.  `width` is the result width (4 or 8 bytes).
+   *
+   * Two encodings (the index term is OPTIONAL):
+   *   - disp-only (`[base + disp]`): dst_kind=GREG dst=dest greg;
+   *     src1_kind=GREG src1=base greg; src2_kind=NONE or IMM (legacy
+   *     marker); scale=0; imm=signed displacement.
+   *   - indexed (`[base + index*scale + disp]`, #778): dst_kind=GREG;
+   *     src1_kind=GREG src1=base greg; src2_kind=GREG src2=index greg;
+   *     scale ∈ {1,2,4,8} (the SIB scale, 1<<SibScale); imm=disp.
+   * LEA computes an ADDRESS and never dereferences guest memory, so it
+   * needs no software-MMU translation even on the wasm32 (non-linear)
+   * build — it is pure register arithmetic into the Machine struct. */
   FBX_IR_OP_LEA = 14,
 
   /* Control flow — block terminators. */
@@ -285,7 +307,12 @@ struct FbxIrInst {
   u32 dst;       /* vreg index or greg id */
   u32 src1;      /* vreg index or greg id or narrow imm */
   u32 src2;      /* vreg index or greg id or narrow imm */
-  u32 _pad2;     /* explicit 4-byte pad so the u64 below sits at offset 24 */
+  u32 scale;     /* LEA SIB scale ∈ {1,2,4,8}; 0 = no index term (#778).
+                  * Occupies the former `_pad2` slot (same offset 20, same
+                  * 4-byte size) so the layout — and the 40-byte wire format —
+                  * is unchanged; it just gives the alignment pad a name and a
+                  * meaning for the indexed LEA.  Zero for every other opcode
+                  * (fbx_ir_inst_zero memsets it), so SHA determinism holds. */
   u64 imm;       /* wide immediate (PC, full-width literal, etc.) */
   u64 _pad3;     /* reserved for v0.2 extension without breaking layout */
 };

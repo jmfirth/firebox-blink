@@ -744,15 +744,25 @@ static int CoverageGate(const struct FbxIrBlock *ir,
   for (i = 0; i < ir->ninsts; ++i) {
     const struct FbxIrInst *p = &ir->insts[i];
     if (p->opcode == FBX_IR_OP_LEA) {
-      /* v0.1: accept LEA with src1=GREG (base) + imm (disp).  Anything else
-       * (e.g. src2_kind != FBX_IR_KIND_NONE && != FBX_IR_KIND_IMM) is a SIB
-       * form the v0.1 emitter doesn't model. */
+      /* #778: accept BOTH the disp-only form (src1=GREG base, src2=NONE/IMM,
+       * scale=0) AND the SIB-INDEX form (src1=GREG base, src2=GREG index,
+       * scale ∈ {1,2,4,8}).  EmitLea lowers both — the indexed form adds
+       * weg[index]*scale to the effective address (no MMU translation; LEA
+       * never dereferences memory).  Anything else (a missing base, or a GREG
+       * index with an invalid scale) is a form the emitter doesn't model. */
       if (p->src1_kind != FBX_IR_KIND_GREG) {
         SetFail(fail, FBX_IR_EMIT_LEA_SIB_FORM, p->opcode);
         return 0;
       }
-      if (p->src2_kind != FBX_IR_KIND_NONE &&
-          p->src2_kind != FBX_IR_KIND_IMM) {
+      if (p->src2_kind == FBX_IR_KIND_GREG) {
+        /* Indexed: scale must be a valid SIB scale. */
+        if (p->scale != 1 && p->scale != 2 && p->scale != 4 &&
+            p->scale != 8) {
+          SetFail(fail, FBX_IR_EMIT_LEA_SIB_FORM, p->opcode);
+          return 0;
+        }
+      } else if (p->src2_kind != FBX_IR_KIND_NONE &&
+                 p->src2_kind != FBX_IR_KIND_IMM) {
         SetFail(fail, FBX_IR_EMIT_LEA_SIB_FORM, p->opcode);
         return 0;
       }
@@ -1037,12 +1047,19 @@ static u32 AllocRegSetImmSlot(struct BlockCtxBuilder *b,
   return BcAllocImm(b, p->imm);
 }
 
-/* LEA: greg base slot + greg dst slot + (when imm != 0) an IMM slot.       */
+/* LEA: greg base slot + greg dst slot + (when imm != 0) an IMM slot          */
+/* + (#778, indexed form) a greg index slot.  The slot order is FIXED — the   */
+/* up-front allocator (block-ctx builder walk) and the body walker must call  */
+/* BcAlloc* in the SAME order so slot indices match; base, dst, [imm], [index]*/
+/* is the canonical order here and in both call sites.                        */
 struct LeaSlots {
   u32 base_slot;
   u32 dst_slot;
   u32 imm_slot;       /* 0xFFFFFFFFu when imm == 0 (no slot needed) */
   int has_imm;
+  u32 index_slot;     /* 0xFFFFFFFFu when no index term (#778) */
+  int has_index;
+  u32 scale;          /* SIB scale ∈ {1,2,4,8}; 0 when no index */
 };
 
 static int AllocLeaSlots(struct BlockCtxBuilder *b,
@@ -1055,6 +1072,16 @@ static int AllocLeaSlots(struct BlockCtxBuilder *b,
   } else {
     out->imm_slot = 0xFFFFFFFFu;
     out->has_imm = 0;
+  }
+  /* #778 — the indexed form carries a GREG index in src2 + a SIB scale. */
+  if (p->src2_kind == FBX_IR_KIND_GREG) {
+    out->index_slot = BcAllocGreg(b, p->src2);
+    out->has_index = 1;
+    out->scale = p->scale;
+  } else {
+    out->index_slot = 0xFFFFFFFFu;
+    out->has_index = 0;
+    out->scale = 0;
   }
   return !b->overflow;
 }
@@ -1496,11 +1523,23 @@ static int EmitAlu(struct FbxWasmBuffer *body, const struct FbxIrInst *p) {
   return 1;
 }
 
-/* Lower a LEA with base greg + immediate displacement (no index).
+/* Lower a LEA: `dst = base + index*scale + disp` (the index term is #778).
  *
  * #635: base greg byte-offset (Class 1, M5 src1), dst greg byte-offset
  * (Class 1, M5 dst), and the immediate (Class 2, site #3) are all hoisted
  * into the block_ctx.  Width-stamp on the store is structural (LEAVE).
+ * #778 adds the index greg byte-offset (Class 1) when the SIB-index form is
+ * lifted; `slots->scale` carries the SIB scale.
+ *
+ * LEA computes an ADDRESS and never dereferences guest memory, so there is NO
+ * software-MMU translation even on the wasm32 (non-linear) build — the value
+ * is plain i64 register arithmetic written into the Machine struct.
+ *
+ * Width: the width-4 store uses i64.store32 (writes the low 32 bits, mirroring
+ * REG_SET's EmitRegStoreFromLocal width-4 path).  This matches the existing
+ * REG_SET convention the spec calls for ("mask to the dest width as REG_SET
+ * does") — note it does NOT zero the upper 32 bits, exactly like REG_SET; the
+ * hot SIB-index LEA (`lea r14,[r9+rax]`) is REX.W (width 8 → full store).
  *
  * The `slots` argument carries the slot indices the up-front allocator
  * assigned for THIS LEA inst; the emit-pass walker passes them through. */
@@ -1509,7 +1548,14 @@ static int EmitLea(struct FbxWasmBuffer *body, const struct FbxIrInst *p,
   if (p->src1_kind != FBX_IR_KIND_GREG || p->dst_kind != FBX_IR_KIND_GREG) {
     return 0;
   }
-  if (p->src2_kind != FBX_IR_KIND_NONE && p->src2_kind != FBX_IR_KIND_IMM) {
+  if (p->src2_kind == FBX_IR_KIND_GREG) {
+    /* Indexed form (#778): src2 is the index greg; scale must be valid. */
+    if (!slots->has_index || (slots->scale != 1 && slots->scale != 2 &&
+                              slots->scale != 4 && slots->scale != 8)) {
+      return 0;
+    }
+  } else if (p->src2_kind != FBX_IR_KIND_NONE &&
+             p->src2_kind != FBX_IR_KIND_IMM) {
     return 0;
   }
   /* Push effective dst address for the eventual store. */
@@ -1519,6 +1565,22 @@ static int EmitLea(struct FbxWasmBuffer *body, const struct FbxIrInst *p,
   fbx_wasm_buffer_u8(body, WASM_OP_I64_LOAD);
   fbx_wasm_buffer_uleb(body, 3);
   fbx_wasm_buffer_uleb(body, 0);
+  /* #778 — add index*scale when the SIB-index form was lifted.  Effective
+   * address so far is `base`; add `weg[index] * scale` as i64.  Scale is a
+   * power of two (1/2/4/8); use a shift for 2/4/8, no-op for 1. */
+  if (slots->has_index) {
+    EmitPushGregBaseAddr(body, slots->index_slot);
+    fbx_wasm_buffer_u8(body, WASM_OP_I64_LOAD);
+    fbx_wasm_buffer_uleb(body, 3);
+    fbx_wasm_buffer_uleb(body, 0);
+    if (slots->scale != 1) {
+      u32 shift = (slots->scale == 2) ? 1u : (slots->scale == 4) ? 2u : 3u;
+      fbx_wasm_buffer_u8(body, WASM_OP_I64_CONST);
+      fbx_wasm_buffer_sleb(body, (i64)shift);
+      fbx_wasm_buffer_u8(body, WASM_OP_I64_SHL);
+    }
+    fbx_wasm_buffer_u8(body, WASM_OP_I64_ADD);
+  }
   /* Add immediate (only if non-zero — zero is invariant and the allocator
    * skipped reserving a slot for it). */
   if (slots->has_imm) {
