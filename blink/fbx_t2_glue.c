@@ -296,7 +296,35 @@ int Fbxt2Dispatch(struct Machine *m, struct FbxTcBlock *b) {
    * a meaningless integer the synthetic dispatcher echoes back, which is
    * fine for the integer-only opcodes those tests exercise. */
   i32 m_ptr = (i32)(intptr_t)m;
-  int exit_code = fbx_t2_dispatch(sys_id, b->t2_funcref, m_ptr);
+  int exit_code;
+#ifdef __wasm__
+  /* firebox#786 — GUEST-SIDE DISPATCH.  Instead of crossing to the host via
+   * the `fbx_t2_dispatch` import (a wasm->host re-entry that pays the ~270 ns
+   * wasmer coroutine-stack-switch crossing on EVERY dispatch, #694), call the
+   * translated block IN-GUEST through `__indirect_function_table`.  The host's
+   * `fbx_t2_instantiate` co-instantiates the block into Blink's OWN store and
+   * places its `translated_block` export into Blink's (exported, growable)
+   * function table, returning the TABLE INDEX as `t2_funcref`.  Casting that
+   * index to a C function pointer and calling it compiles (clang wasm ABI) to
+   * `call_indirect __indirect_function_table` with the type immediate for the
+   * #635 block ABI `(i32 m_ptr, i32 block_ctx_ptr) -> (i32 exit)` — a pure
+   * in-instance call with NO coroutine tax (the tax is only for ENTERING wasm
+   * from the host).  The guest supplies `block_ctx_ptr` itself: `t2_block_ctx`
+   * is the guest-heap FbxT2BlockCtx pointer (firebox#719), and
+   * `(i32)(intptr_t)t2_block_ctx` is byte-identical to the `block_ctx_ptr` the
+   * host computed under the old host-dispatch path.  `t2_funcref >= 0` is
+   * guaranteed by the ExecuteBlock fast-path gate (threadedcode.c). */
+  {
+    typedef int (*FbxT2BlockFn)(i32, i32);
+    i32 ctx_ptr = (i32)(intptr_t)b->t2_block_ctx;
+    FbxT2BlockFn fn = (FbxT2BlockFn)(uintptr_t)(u32)b->t2_funcref;
+    exit_code = fn(m_ptr, ctx_ptr);
+  }
+#else
+  /* Native test bench: no in-guest table; keep the host-dispatch shim (the
+   * synthetic dispatcher echoes integer-only opcodes for the unit tests). */
+  exit_code = fbx_t2_dispatch(sys_id, b->t2_funcref, m_ptr);
+#endif
   if (exit_code == 1 || exit_code == 2) {
     T2EnsureTraceFlags();
     T2TraceLine(g_t2_trace_bailouts,
