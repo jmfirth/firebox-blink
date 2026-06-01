@@ -192,6 +192,14 @@ enum FbxIrEmitFailReason {
    * of resuming at m->ip, so any committed pre-bailout op runs twice → guest
    * corruption.  Refuse until the handoff is fixed arch-side (work/tasks/733). */
   FBX_IR_EMIT_BAILOUT_AFTER_COMMIT = 13,
+  /* #794 (T3/T4 emit-coverage floor): an IMUL whose (un-synthesized) flags
+   * are LIVE at an in-block flag reader (BRANCH_COND / GET_FLAG) with no
+   * intervening real flag-writer.  IMUL carries no flag synthesis at this
+   * increment, so the flag shadow would be stale relative to Tier 1's eager
+   * imul-flag computation → refuse the block, Tier 1 runs it (correct-or-
+   * refuse).  Hot loops (imul…dec;jnz) have a real flag-writer after the
+   * imul, so this does NOT fire on them. */
+  FBX_IR_EMIT_IMUL_FLAGS_LIVE = 14,
 };
 
 /* Human-readable name for a reason variant; suitable for trace lines. */

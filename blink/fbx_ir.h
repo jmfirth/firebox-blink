@@ -136,8 +136,20 @@ extern "C" {
  *     previously emitted BAILOUT, AND the offset-20 word now carries meaning, so
  *     stale v4 sidecars (which assumed that word was always zero) must
  *     invalidate.  RIP-relative / no-base SIB LEAs still BAILOUT.  See
- *     work/tasks/778-* for the closure narrative. */
-#define FBX_IR_VERSION 5u
+ *     work/tasks/778-* for the closure narrative.
+ * v6: #794 (T3/T4 emit-coverage floor) — (1) new FBX_IR_OP_IMUL enumerator +
+ *     lift/emit for the truncating IMUL forms (0x69/0x6B/0x0FAF, reg-form);
+ *     (2) accumulator-immediate ALU forms (0x04/0x05…0x3C/0x3D) lifted via
+ *     LiftAluAccImm; (3) immediate-operand ALU made EMITTABLE — REG_GET with
+ *     an IMM src now lowers to a block-ctx IMM-slot load (previously the
+ *     coverage gate refused it, so EVERY immediate-operand ALU silently stayed
+ *     on Tier 1).  The lifter now produces NEW IR for input that previously
+ *     bailed/refused, so stale v5 sidecars must invalidate.  Also corrects a
+ *     latent width-4 register-write bug (32-bit writes now zero-extend, x86-64
+ *     semantics) — see EmitRegSlotStore.  IMUL carries no flag synthesis;
+ *     blocks where its flags are live at a reader refuse (correct-or-refuse).
+ *     See work/tasks/794-* for the closure narrative. */
+#define FBX_IR_VERSION 6u
 
 /* ────────────────────────────────────────────────────────────────────────── */
 /* IR opcodes.                                                                */
@@ -255,6 +267,17 @@ enum FbxIrOpcode {
    * CALL/RET reuse the same memory machinery. */
   FBX_IR_OP_PUSH = 22,
   FBX_IR_OP_POP  = 23,
+
+  /* #794 (T3/T4 emit-coverage floor) — truncating-form integer multiply.
+   * Lifts x86 IMUL r,r/m,imm (0x69/0x6B) and IMUL r,r/m (0x0FAF) to a
+   * vreg*vreg product, the SAME REG_GET→OP→REG_SET shape as the ALU ops:
+   *   dst(vreg) = src1(vreg) * src2(vreg)  (low operand-width bits; i64.mul
+   *   + the existing dest-width REG_SET store).
+   * Carries NO flags: imul's CF/OF (full-product overflow) + x86-undefined
+   * SF/ZF/AF/PF are not synthesized at this increment.  The emit coverage
+   * gate refuses any block where imul's flags are LIVE at a reader, so
+   * Tier 1 computes them (correct-or-refuse — the #677/#735 pattern). */
+  FBX_IR_OP_IMUL = 24,
 
   /* Sentinel — count of defined opcodes.  Used by validation; not emitted. */
   FBX_IR_OP_LAST_,

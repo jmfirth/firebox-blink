@@ -223,6 +223,7 @@ static const char *const kOpcodeNames[FBX_IR_OP_LAST_] = {
     [FBX_IR_OP_AND] = "AND",
     [FBX_IR_OP_OR] = "OR",
     [FBX_IR_OP_XOR] = "XOR",
+    [FBX_IR_OP_IMUL] = "IMUL",
     [FBX_IR_OP_CMP] = "CMP",
     [FBX_IR_OP_TEST] = "TEST",
     [FBX_IR_OP_SET_FLAGS_RAW] = "SET_FLAGS_RAW",
@@ -690,11 +691,15 @@ static int LiftLea(struct LiftCtx *ctx, u64 rde, i64 disp) {
   return 1;
 }
 
-/* Lift ALU group 1 r/m, imm (opcode 0x83 = OpAlui w/ sign-extended imm8;
- * also 0x81 = OpAlui w/ imm32; mopcode 0x080 / 0x081 / 0x082 / 0x083). */
-static int LiftAlui(struct LiftCtx *ctx, u64 rde, u64 uimm0, int byte_op) {
-  u8 width = WidthFromRde(rde, byte_op);
-  u8 op = AluSubOp(rde);
+/* Common body for the immediate-form ALU lift: `greg` = OP(greg, imm) with
+ * the eager SET_FLAGS_RAW.  `greg` is the destination/lhs guest register id;
+ * `op` must be a non-zero FBX_IR_OP_* (the caller resolves ADC/SBB to a
+ * bailout).  REG_GET with an IMM src1 materializes the immediate into a vreg.
+ *
+ * Shared by the group-1 r/m,imm forms (greg = RexbRm) and the #794
+ * accumulator-imm forms (greg = 0 = rAX). */
+static int LiftAluImmCommon(struct LiftCtx *ctx, u8 width, u32 greg,
+                            u64 uimm0, u8 op) {
   u32 lhs_vreg;
   u32 rhs_vreg;
   u32 res_vreg;
@@ -703,7 +708,6 @@ static int LiftAlui(struct LiftCtx *ctx, u64 rde, u64 uimm0, int byte_op) {
   struct FbxIrInst *alu;
   struct FbxIrInst *set_res;
   struct FbxIrInst *flags;
-  if (op == 0) return -1; /* ADC/SBB — bailout */
   get_lhs = CtxEmit(ctx);
   if (!get_lhs) return 0;
   lhs_vreg = CtxAllocVreg(ctx);
@@ -712,7 +716,7 @@ static int LiftAlui(struct LiftCtx *ctx, u64 rde, u64 uimm0, int byte_op) {
   get_lhs->dst_kind = FBX_IR_KIND_VREG;
   get_lhs->dst = lhs_vreg;
   get_lhs->src1_kind = FBX_IR_KIND_GREG;
-  get_lhs->src1 = (u32)RexbRm(rde);
+  get_lhs->src1 = greg;
   set_rhs = CtxEmit(ctx);
   if (!set_rhs) return 0;
   rhs_vreg = CtxAllocVreg(ctx);
@@ -739,7 +743,7 @@ static int LiftAlui(struct LiftCtx *ctx, u64 rde, u64 uimm0, int byte_op) {
     set_res->opcode = FBX_IR_OP_REG_SET;
     set_res->width = width;
     set_res->dst_kind = FBX_IR_KIND_GREG;
-    set_res->dst = (u32)RexbRm(rde);
+    set_res->dst = greg;
     set_res->src1_kind = FBX_IR_KIND_VREG;
     set_res->src1 = res_vreg;
   }
@@ -756,6 +760,100 @@ static int LiftAlui(struct LiftCtx *ctx, u64 rde, u64 uimm0, int byte_op) {
   flags->src1 = lhs_vreg;
   flags->src2_kind = FBX_IR_KIND_VREG;
   flags->src2 = rhs_vreg;
+  return 1;
+}
+
+/* Lift ALU group 1 r/m, imm (opcode 0x83 = OpAlui w/ sign-extended imm8;
+ * also 0x81 = OpAlui w/ imm32; mopcode 0x080 / 0x081 / 0x082 / 0x083). */
+static int LiftAlui(struct LiftCtx *ctx, u64 rde, u64 uimm0, int byte_op) {
+  u8 op = AluSubOp(rde);
+  if (op == 0) return -1; /* ADC/SBB — bailout */
+  return LiftAluImmCommon(ctx, WidthFromRde(rde, byte_op), (u32)RexbRm(rde),
+                          uimm0, op);
+}
+
+/* #794 — lift the accumulator-immediate ALU forms (no modrm byte; the
+ * destination/source is always rAX/eAX/AX/AL = greg 0):
+ *   0x04 ADD AL,imm8   0x05 ADD eAX,imm32   (+ OR/AND/SUB/XOR/CMP siblings).
+ * The assembler picks these short encodings for `add rax, imm` etc. — the
+ * exact shape the #794 register loop uses (`add rax, 12345`).  `op` is the
+ * resolved FBX_IR_OP_* (caller maps the opcode); byte_op selects AL vs eAX. */
+static int LiftAluAccImm(struct LiftCtx *ctx, u64 rde, u64 uimm0, u8 op,
+                         int byte_op) {
+  return LiftAluImmCommon(ctx, WidthFromRde(rde, byte_op), 0u, uimm0, op);
+}
+
+/* #794 (T3/T4 emit-coverage floor) — lift the truncating IMUL forms.
+ *
+ *   has_imm==1: IMUL r, r/m, imm   (0x69 imm32-sx / 0x6B imm8-sx).
+ *               dst = RexrReg; lhs = r/m (RexbRm); rhs = imm.
+ *   has_imm==0: IMUL r, r/m        (0x0FAF).
+ *               dst = RexrReg; lhs = RexrReg; rhs = r/m (RexbRm).
+ *
+ * Shape mirrors LiftAlui/LiftAluRR (REG_GET lhs + REG_GET rhs + OP + REG_SET)
+ * but with op=FBX_IR_OP_IMUL and — deliberately — NO trailing SET_FLAGS_RAW:
+ * imul's CF/OF (full-product overflow) + x86-undefined SF/ZF/AF/PF are not
+ * synthesized at this increment.  The emit coverage gate's imul-flag-liveness
+ * pass refuses any block where those flags are observed, so Tier 1 computes
+ * them (correct-or-refuse).  REG_GET with an IMM src1 materializes the
+ * immediate into a vreg (same trick LiftAlui uses).
+ *
+ * Reg-form (modrm.mod==3) only: the r/m memory-operand form requests a
+ * BAILOUT (return -1) — the §13.5 memory path is a later increment. */
+static int LiftImul(struct LiftCtx *ctx, u64 rde, int has_imm, u64 uimm0) {
+  u8 width = WidthFromRde(rde, 0); /* no byte form for 0x69/0x6B/0x0FAF */
+  u32 lhs_vreg;
+  u32 rhs_vreg;
+  u32 res_vreg;
+  struct FbxIrInst *get_lhs;
+  struct FbxIrInst *get_rhs;
+  struct FbxIrInst *mul;
+  struct FbxIrInst *set_res;
+  if (!IsModrmRegister(rde)) {
+    return -1; /* memory r/m operand — bail to Tier 1 (later increment) */
+  }
+  get_lhs = CtxEmit(ctx);
+  if (!get_lhs) return 0;
+  lhs_vreg = CtxAllocVreg(ctx);
+  get_lhs->opcode = FBX_IR_OP_REG_GET;
+  get_lhs->width = width;
+  get_lhs->dst_kind = FBX_IR_KIND_VREG;
+  get_lhs->dst = lhs_vreg;
+  get_lhs->src1_kind = FBX_IR_KIND_GREG;
+  get_lhs->src1 = has_imm ? (u32)RexbRm(rde) : (u32)RexrReg(rde);
+  get_rhs = CtxEmit(ctx);
+  if (!get_rhs) return 0;
+  rhs_vreg = CtxAllocVreg(ctx);
+  get_rhs->opcode = FBX_IR_OP_REG_GET;
+  get_rhs->width = width;
+  get_rhs->dst_kind = FBX_IR_KIND_VREG;
+  get_rhs->dst = rhs_vreg;
+  if (has_imm) {
+    get_rhs->src1_kind = FBX_IR_KIND_IMM;
+    get_rhs->imm = uimm0;
+  } else {
+    get_rhs->src1_kind = FBX_IR_KIND_GREG;
+    get_rhs->src1 = (u32)RexbRm(rde);
+  }
+  mul = CtxEmit(ctx);
+  if (!mul) return 0;
+  res_vreg = CtxAllocVreg(ctx);
+  mul->opcode = FBX_IR_OP_IMUL;
+  mul->width = width;
+  mul->dst_kind = FBX_IR_KIND_VREG;
+  mul->dst = res_vreg;
+  mul->src1_kind = FBX_IR_KIND_VREG;
+  mul->src1 = lhs_vreg;
+  mul->src2_kind = FBX_IR_KIND_VREG;
+  mul->src2 = rhs_vreg;
+  set_res = CtxEmit(ctx);
+  if (!set_res) return 0;
+  set_res->opcode = FBX_IR_OP_REG_SET;
+  set_res->width = width;
+  set_res->dst_kind = FBX_IR_KIND_GREG;
+  set_res->dst = (u32)RexrReg(rde);
+  set_res->src1_kind = FBX_IR_KIND_VREG;
+  set_res->src1 = res_vreg;
   return 1;
 }
 
@@ -1017,6 +1115,29 @@ static int LiftOne(struct LiftCtx *ctx, const struct FbxTcEntry *e,
     case 0x080: return LiftAlui(ctx, rde, e->uimm0, 1);
     case 0x081:
     case 0x083: return LiftAlui(ctx, rde, e->uimm0, 0);
+    /* #794 — IMUL truncating forms.  3-operand imm (0x69 imm32-sx / 0x6B
+     * imm8-sx) → r = r/m * imm; 2-operand (0x0FAF → mopcode 0x1AF) → r =
+     * r * r/m.  No flag synthesis (correct-or-refuse at the emit gate). */
+    case 0x069:
+    case 0x06B: return LiftImul(ctx, rde, /*has_imm=*/1, e->uimm0);
+    case 0x1AF: return LiftImul(ctx, rde, /*has_imm=*/0, 0);
+    /* #794 — accumulator-immediate ALU forms (no modrm; dst/lhs = rAX).
+     * The assembler emits these short encodings for `add rax,imm` etc.
+     * Byte form (0x04/0x0C/0x24/0x2C/0x34/0x3C) → byte_op=1; word form
+     * (0x05/0x0D/0x25/0x2D/0x35/0x3D) → byte_op=0.  ADC/SBB (0x14/0x15/
+     * 0x1C/0x1D) intentionally omitted — same as AluSubOp's exclusion. */
+    case 0x004: return LiftAluAccImm(ctx, rde, e->uimm0, FBX_IR_OP_ADD, 1);
+    case 0x005: return LiftAluAccImm(ctx, rde, e->uimm0, FBX_IR_OP_ADD, 0);
+    case 0x00C: return LiftAluAccImm(ctx, rde, e->uimm0, FBX_IR_OP_OR,  1);
+    case 0x00D: return LiftAluAccImm(ctx, rde, e->uimm0, FBX_IR_OP_OR,  0);
+    case 0x024: return LiftAluAccImm(ctx, rde, e->uimm0, FBX_IR_OP_AND, 1);
+    case 0x025: return LiftAluAccImm(ctx, rde, e->uimm0, FBX_IR_OP_AND, 0);
+    case 0x02C: return LiftAluAccImm(ctx, rde, e->uimm0, FBX_IR_OP_SUB, 1);
+    case 0x02D: return LiftAluAccImm(ctx, rde, e->uimm0, FBX_IR_OP_SUB, 0);
+    case 0x034: return LiftAluAccImm(ctx, rde, e->uimm0, FBX_IR_OP_XOR, 1);
+    case 0x035: return LiftAluAccImm(ctx, rde, e->uimm0, FBX_IR_OP_XOR, 0);
+    case 0x03C: return LiftAluAccImm(ctx, rde, e->uimm0, FBX_IR_OP_CMP, 1);
+    case 0x03D: return LiftAluAccImm(ctx, rde, e->uimm0, FBX_IR_OP_CMP, 0);
     /* Conditional jumps — short (0x70-0x7F) and near (0x180-0x18F). */
     case 0x070: case 0x071: case 0x072: case 0x073:
     case 0x074: case 0x075: case 0x076: case 0x077:

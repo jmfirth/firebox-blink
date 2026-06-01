@@ -104,6 +104,7 @@ const char *fbx_ir_fail_reason_name(enum FbxIrEmitFailReason r) {
     case FBX_IR_EMIT_EMPTY_IR: return "empty_ir";
     case FBX_IR_EMIT_NONLINEAR_GUEST_MEM: return "nonlinear_guest_mem";
     case FBX_IR_EMIT_BAILOUT_AFTER_COMMIT: return "bailout_after_commit";
+    case FBX_IR_EMIT_IMUL_FLAGS_LIVE: return "imul_flags_live";
   }
   return "unknown";
 }
@@ -256,6 +257,7 @@ static void EmitName(struct FbxWasmBuffer *b, const char *s) {
 #define WASM_OP_I64_STORE8  0x3Cu
 #define WASM_OP_I64_ADD     0x7Cu
 #define WASM_OP_I64_SUB     0x7Du
+#define WASM_OP_I64_MUL     0x7Eu  /* #794 — IMUL truncating forms */
 #define WASM_OP_I64_AND     0x83u
 #define WASM_OP_I64_OR      0x84u
 #define WASM_OP_I64_XOR     0x85u
@@ -473,6 +475,36 @@ static int CoverageGate(const struct FbxIrBlock *ir,
   }
   (void)saw_flag_writer; /* presence-only; no further gating */
 
+  /* #794 — IMUL flag-liveness refuse.  IMUL (FBX_IR_OP_IMUL) carries NO
+   * synthesized flags at this increment: its CF/OF (full-product overflow)
+   * and x86-undefined SF/ZF/AF/PF are deferred.  The eager-flag model emits a
+   * SET_FLAGS_RAW after every OTHER flag-writing ALU op, so the flag shadow a
+   * reader observes always comes from the LAST flag-definer before it.  If an
+   * IMUL is that last definer (no intervening SET_FLAGS_RAW) at a BRANCH_COND
+   * / GET_FLAG, the shadow is stale relative to Tier 1's eager imul-flag
+   * computation → refuse the block so Tier 1 runs it (correct-or-refuse, the
+   * #677/#735 pattern).  When a real flag-writer (add/sub/and/or/xor/cmp/test)
+   * follows the imul before the reader — the hot-loop shape `imul…dec;jnz` —
+   * imul's dead flags never matter and the block escalates.  (Flag-reader-free
+   * blocks elide all SET_FLAGS_RAW anyway, so imul is no worse than the
+   * existing dead-flag-elision model there; nothing to gate.) */
+  {
+    int imul_flags_pending = 0;
+    for (i = 0; i < ir->ninsts; ++i) {
+      u8 op = ir->insts[i].opcode;
+      if (op == FBX_IR_OP_IMUL) {
+        imul_flags_pending = 1;
+      } else if (op == FBX_IR_OP_SET_FLAGS_RAW) {
+        imul_flags_pending = 0; /* a real flag-def overwrites the shadow */
+      } else if (op == FBX_IR_OP_BRANCH_COND || op == FBX_IR_OP_GET_FLAG) {
+        if (imul_flags_pending) {
+          SetFail(fail, FBX_IR_EMIT_IMUL_FLAGS_LIVE, op);
+          return 0;
+        }
+      }
+    }
+  }
+
   /* firebox#735 — the #719 BAILOUT-after-committed-work refuse is REMOVED.
    *
    * #719 (root cause 2): a BAILOUT terminator emits
@@ -590,6 +622,7 @@ static int CoverageGate(const struct FbxIrBlock *ir,
       case FBX_IR_OP_AND:
       case FBX_IR_OP_OR:
       case FBX_IR_OP_XOR:
+      case FBX_IR_OP_IMUL:  /* #794 — truncating integer multiply */
       case FBX_IR_OP_LEA:
       case FBX_IR_OP_BRANCH_TAKEN:
       case FBX_IR_OP_BAILOUT:
@@ -682,6 +715,25 @@ static int CoverageGate(const struct FbxIrBlock *ir,
           return 0;
         }
         break;
+      /* #794 — IMUL r,r/m,imm32 (0x69) / imm8 (0x6B) and IMUL r,r/m (0x1AF =
+       * 0x0FAF).  Reg-form (modrm.mod==3) only at this increment — the lifter
+       * (LiftImul) bails the memory-operand form.  i64.mul truncating product;
+       * the imul-flag-liveness pass below refuses blocks where the (un-
+       * synthesized) flags are observed. */
+      case 0x069: case 0x06B: case 0x1AF:
+        if (!Mod3(rde)) {
+          SetFail(fail, FBX_IR_EMIT_MOD3_REQUIRED, (u8)(mop & 0xFF));
+          return 0;
+        }
+        break;
+      /* #794 — accumulator-immediate ALU forms (ADD/OR/AND/SUB/XOR/CMP
+       * rAX,imm).  No modrm byte (dst/lhs is the implicit rAX) → no mod3
+       * check, like MOV reg,imm below.  The lifter emits the same
+       * REG_GET/ALU/REG_SET/SET_FLAGS_RAW shape as the group-1 imm forms. */
+      case 0x004: case 0x005: case 0x00C: case 0x00D:
+      case 0x024: case 0x025: case 0x02C: case 0x02D:
+      case 0x034: case 0x035: case 0x03C: case 0x03D:
+        break;
       /* MOV r/m, imm and group-1 r/m, imm: require modrm.mod==3 as well. */
       case 0x0C6: case 0x0C7:
       case 0x080: case 0x081: case 0x083:
@@ -768,12 +820,15 @@ static int CoverageGate(const struct FbxIrBlock *ir,
       }
     }
     if (p->opcode == FBX_IR_OP_REG_GET || p->opcode == FBX_IR_OP_REG_SET) {
-      /* REG_GET/SET must read/write a guest register; the lifter emits IMM
-       * src1 for the "load imm into vreg" trick used by OpAlui — that
-       * pattern is part of the SET_FLAGS_RAW chain which we already refused
-       * above, but defend regardless. */
+      /* REG_GET sources a guest register OR (#794) an immediate — the lifter
+       * emits IMM src1 for the "load imm into a vreg" form used by every
+       * immediate-operand ALU lift (LiftAluImmCommon / LiftImul).  The emit
+       * (REG_GET dispatch) lowers GREG via EmitRegLoad and IMM via the
+       * block-ctx IMM slot; both are accepted here.  REG_SET still requires a
+       * GREG destination. */
       if (p->opcode == FBX_IR_OP_REG_GET &&
-          p->src1_kind != FBX_IR_KIND_GREG) {
+          p->src1_kind != FBX_IR_KIND_GREG &&
+          p->src1_kind != FBX_IR_KIND_IMM) {
         SetFail(fail, FBX_IR_EMIT_KIND_MISMATCH, p->opcode);
         return 0;
       }
@@ -1036,6 +1091,16 @@ static u32 AllocRegGetSlot(struct BlockCtxBuilder *b,
   return BcAllocGreg(b, p->src1);
 }
 
+/* #794 — REG_GET with an IMM src ("load immediate into a vreg", used by the
+ * immediate-operand ALU lifts).  Needs one IMM slot for p->imm — the
+ * immediate cannot be baked as an inline i64.const (that would make the wasm
+ * bytes value-dependent, breaking the #635 block-ctx byte-stability model);
+ * it is hoisted into the per-block constants table exactly like REG_SET-IMM. */
+static u32 AllocRegGetImmSlot(struct BlockCtxBuilder *b,
+                              const struct FbxIrInst *p) {
+  return BcAllocImm(b, p->imm);
+}
+
 static u32 AllocRegSetGregSlot(struct BlockCtxBuilder *b,
                                const struct FbxIrInst *p) {
   return BcAllocGreg(b, p->dst);
@@ -1209,12 +1274,17 @@ static void AllocSlotsForInst(struct BlockCtxBuilder *b,
     case FBX_IR_OP_AND:
     case FBX_IR_OP_OR:
     case FBX_IR_OP_XOR:
+    case FBX_IR_OP_IMUL:  /* #794 — pure vreg-local, no block_ctx slots */
     case FBX_IR_OP_SET_FLAGS_RAW:
     case FBX_IR_OP_GET_FLAG:
       /* No per-block constants. */
       break;
     case FBX_IR_OP_REG_GET:
-      (void)AllocRegGetSlot(b, p);
+      if (p->src1_kind == FBX_IR_KIND_IMM) {
+        (void)AllocRegGetImmSlot(b, p); /* #794 — load-imm-into-vreg */
+      } else {
+        (void)AllocRegGetSlot(b, p);
+      }
       break;
     case FBX_IR_OP_REG_SET:
       if (p->src1_kind == FBX_IR_KIND_IMM) {
@@ -1412,14 +1482,22 @@ static void EmitRegStorePrep(struct FbxWasmBuffer *body) {
  *
  * #635: greg_slot is the per-block context slot holding the
  * (M_OFF_WEG + greg_id*8) byte offset.  Class 1 site M2. */
-static void EmitRegStoreFromLocal(struct FbxWasmBuffer *body, u32 greg_slot,
-                                  u32 src_local, u8 width) {
-  /* Push effective address (m_ptr + ctx[greg_slot]). */
-  EmitPushGregBaseAddr(body, greg_slot);
-  /* Push value. */
-  fbx_wasm_buffer_u8(body, WASM_OP_LOCAL_GET);
-  fbx_wasm_buffer_uleb(body, src_local);
-  /* Width-truncated i64 store at offset=0. */
+/* Emit a width-sized store of a value into a guest REGISTER slot.  Stack on
+ * entry: [ addr(i32), value(i64) ]; both are consumed.
+ *
+ * x86-64 register-write width semantics (the authority here, since this writes
+ * Machine.weg[]):
+ *   - width 8: full i64.store.
+ *   - width 4: a 32-bit register write ZERO-EXTENDS to 64 bits, so mask the
+ *     value to 32 bits and store the FULL i64 — clearing the upper half of the
+ *     8-byte greg slot.  (i64.store32 alone would leave the upper 32 bits
+ *     STALE; #794 — latent until immediate-operand 32-bit ALU started
+ *     escalating, then it corrupted any register that previously held a
+ *     pointer, e.g. AX=0x00004fff_00000000 → OOB.)
+ *   - width 2 / 1: 16-/8-bit writes do NOT zero-extend → i64.store16/8
+ *     preserve the upper bits, which is correct.
+ * REGISTER-only: guest MEMORY stores keep i64.store32 (a real 4-byte write). */
+static void EmitRegSlotStore(struct FbxWasmBuffer *body, u8 width) {
   switch (width) {
     case 1:
       fbx_wasm_buffer_u8(body, WASM_OP_I64_STORE8);
@@ -1432,8 +1510,12 @@ static void EmitRegStoreFromLocal(struct FbxWasmBuffer *body, u32 greg_slot,
       fbx_wasm_buffer_uleb(body, 0);
       break;
     case 4:
-      fbx_wasm_buffer_u8(body, WASM_OP_I64_STORE32);
-      fbx_wasm_buffer_uleb(body, 2);
+      /* (value & 0xFFFFFFFF) then full i64.store — zero-extends to 64 bits. */
+      fbx_wasm_buffer_u8(body, WASM_OP_I64_CONST);
+      fbx_wasm_buffer_sleb(body, (i64)0xFFFFFFFFll);
+      fbx_wasm_buffer_u8(body, WASM_OP_I64_AND);
+      fbx_wasm_buffer_u8(body, WASM_OP_I64_STORE);
+      fbx_wasm_buffer_uleb(body, 3);
       fbx_wasm_buffer_uleb(body, 0);
       break;
     case 8:
@@ -1443,6 +1525,17 @@ static void EmitRegStoreFromLocal(struct FbxWasmBuffer *body, u32 greg_slot,
       fbx_wasm_buffer_uleb(body, 0);
       break;
   }
+}
+
+static void EmitRegStoreFromLocal(struct FbxWasmBuffer *body, u32 greg_slot,
+                                  u32 src_local, u8 width) {
+  /* Push effective address (m_ptr + ctx[greg_slot]). */
+  EmitPushGregBaseAddr(body, greg_slot);
+  /* Push value. */
+  fbx_wasm_buffer_u8(body, WASM_OP_LOCAL_GET);
+  fbx_wasm_buffer_uleb(body, src_local);
+  /* Width-sized store (width-4 zero-extends — see EmitRegSlotStore). */
+  EmitRegSlotStore(body, width);
 }
 
 /* Emit a REG_SET when the source is an immediate.
@@ -1455,29 +1548,8 @@ static void EmitRegStoreImm(struct FbxWasmBuffer *body, u32 greg_slot,
   EmitPushGregBaseAddr(body, greg_slot);
   /* Push immediate value from block_ctx[imm_slot]. */
   EmitLoadCtxI64(body, imm_slot);
-  switch (width) {
-    case 1:
-      fbx_wasm_buffer_u8(body, WASM_OP_I64_STORE8);
-      fbx_wasm_buffer_uleb(body, 0);
-      fbx_wasm_buffer_uleb(body, 0);
-      break;
-    case 2:
-      fbx_wasm_buffer_u8(body, WASM_OP_I64_STORE16);
-      fbx_wasm_buffer_uleb(body, 1);
-      fbx_wasm_buffer_uleb(body, 0);
-      break;
-    case 4:
-      fbx_wasm_buffer_u8(body, WASM_OP_I64_STORE32);
-      fbx_wasm_buffer_uleb(body, 2);
-      fbx_wasm_buffer_uleb(body, 0);
-      break;
-    case 8:
-    default:
-      fbx_wasm_buffer_u8(body, WASM_OP_I64_STORE);
-      fbx_wasm_buffer_uleb(body, 3);
-      fbx_wasm_buffer_uleb(body, 0);
-      break;
-  }
+  /* Width-sized store (width-4 zero-extends — see EmitRegSlotStore). */
+  EmitRegSlotStore(body, width);
 }
 
 /* Emit a store of `block_ctx[pc_slot]` (i64) into Machine.ip.
@@ -1497,7 +1569,10 @@ static void EmitStoreIp(struct FbxWasmBuffer *body, u32 pc_slot) {
  * local 1 is block_ctx_ptr (#635), locals 2..nvregs+1 are the vregs. */
 static u32 VregLocal(u32 vreg) { return vreg + EMIT_LOCAL_VREG_BASE; }
 
-/* Lower an ALU op (ADD/SUB/AND/OR/XOR) — both operands are VREG-kind. */
+/* Lower an ALU op (ADD/SUB/AND/OR/XOR/IMUL) — both operands are VREG-kind.
+ * #794: IMUL emits i64.mul (low operand-width product), the same vreg→vreg→
+ * vreg local shape as the bitwise/additive ALU ops; flags are NOT touched
+ * here (deferred — see the coverage gate's imul-flag-liveness refuse). */
 static int EmitAlu(struct FbxWasmBuffer *body, const struct FbxIrInst *p) {
   u8 wasm_op;
   if (p->src1_kind != FBX_IR_KIND_VREG || p->src2_kind != FBX_IR_KIND_VREG ||
@@ -1515,6 +1590,7 @@ static int EmitAlu(struct FbxWasmBuffer *body, const struct FbxIrInst *p) {
     case FBX_IR_OP_AND: wasm_op = WASM_OP_I64_AND; break;
     case FBX_IR_OP_OR:  wasm_op = WASM_OP_I64_OR; break;
     case FBX_IR_OP_XOR: wasm_op = WASM_OP_I64_XOR; break;
+    case FBX_IR_OP_IMUL: wasm_op = WASM_OP_I64_MUL; break;
     default: return 0;
   }
   fbx_wasm_buffer_u8(body, wasm_op);
@@ -1587,15 +1663,11 @@ static int EmitLea(struct FbxWasmBuffer *body, const struct FbxIrInst *p,
     EmitLoadCtxI64(body, slots->imm_slot);
     fbx_wasm_buffer_u8(body, WASM_OP_I64_ADD);
   }
-  /* Store into dst (offset=0; effective address already on stack). */
-  if (p->width == 4) {
-    fbx_wasm_buffer_u8(body, WASM_OP_I64_STORE32);
-    fbx_wasm_buffer_uleb(body, 2);
-  } else {
-    fbx_wasm_buffer_u8(body, WASM_OP_I64_STORE);
-    fbx_wasm_buffer_uleb(body, 3);
-  }
-  fbx_wasm_buffer_uleb(body, 0);
+  /* Store the effective address into dst (already on stack).  width-4 LEA
+   * (`lea r32,[...]`) zero-extends the 32-bit EA into the 64-bit register —
+   * the same register-write semantics as REG_SET (see EmitRegSlotStore); the
+   * prior i64.store32 left the upper half stale. */
+  EmitRegSlotStore(body, (u8)p->width);
   return 1;
 }
 
@@ -3026,9 +3098,29 @@ static int EmitFunctionBody(struct FbxWasmBuffer *body,
       }
       case FBX_IR_OP_REG_GET: {
         u32 greg_slot;
-        /* dst is a vreg local; src1 is a guest register. */
-        if (p->dst_kind != FBX_IR_KIND_VREG ||
-            p->src1_kind != FBX_IR_KIND_GREG) {
+        /* dst is a vreg local; src1 is a guest register OR (#794) an
+         * immediate to materialize into the vreg. */
+        if (p->dst_kind != FBX_IR_KIND_VREG) {
+          SetFail(fail, FBX_IR_EMIT_KIND_MISMATCH, p->opcode);
+          return 0;
+        }
+        if (p->src1_kind == FBX_IR_KIND_IMM) {
+          /* #794 — load the per-block IMM-slot value into the vreg.  The
+           * immediate is hoisted into block_ctx (allocator order matches
+           * AllocSlotsForInst's REG_GET-IMM branch) and read via
+           * EmitLoadCtxI64; baking an inline i64.const would make the wasm
+           * value-dependent (breaks #635 byte-stability). */
+          u32 imm_slot = AllocRegGetImmSlot(&ctx_b, p);
+          if (ctx_b.overflow) {
+            SetFail(fail, FBX_IR_EMIT_KIND_MISMATCH, p->opcode);
+            return 0;
+          }
+          EmitLoadCtxI64(body, imm_slot);
+          fbx_wasm_buffer_u8(body, WASM_OP_LOCAL_SET);
+          fbx_wasm_buffer_uleb(body, VregLocal(p->dst));
+          break;
+        }
+        if (p->src1_kind != FBX_IR_KIND_GREG) {
           SetFail(fail, FBX_IR_EMIT_KIND_MISMATCH, p->opcode);
           return 0;
         }
@@ -3117,6 +3209,7 @@ static int EmitFunctionBody(struct FbxWasmBuffer *body,
       case FBX_IR_OP_AND:
       case FBX_IR_OP_OR:
       case FBX_IR_OP_XOR:
+      case FBX_IR_OP_IMUL:  /* #794 — i64.mul, no flags (see EmitAlu) */
         if (!EmitAlu(body, p)) {
           SetFail(fail, FBX_IR_EMIT_KIND_MISMATCH, p->opcode);
           return 0;
