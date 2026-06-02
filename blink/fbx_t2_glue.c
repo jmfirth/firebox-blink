@@ -232,8 +232,11 @@ void Fbxt2TryEscalate(struct Machine *m, struct FbxTcBlock *b) {
   u32 nconsts = 0;
   /* The latch — spec §6.1 idempotence.  Set FIRST so a racing thread that
    * also sees `hits >= threshold` short-circuits without re-running the
-   * pipeline.  The leak-on-race is harmless per spec (the loser's funcref
-   * leaks but doesn't corrupt). */
+   * pipeline (and, on a synchronous host, without a second cranelift compile).
+   * The leak-on-race is harmless per spec (the loser's funcref leaks but
+   * doesn't corrupt).  firebox#794: a PENDING async-compile outcome CLEARS this
+   * latch again (the only path that does) so the block re-attempts on a later
+   * hit; every terminal outcome leaves it set, exactly as before. */
   if (b->t2_attempted) return;
   b->t2_attempted = 1;
 
@@ -369,6 +372,32 @@ void Fbxt2TryEscalate(struct Machine *m, struct FbxTcBlock *b) {
     funcref = fbx_t2_instantiate(sys_id, buf.data, (u32)buf.len, ctx);
     fbx_ir_free(ir);
     fbx_wasm_buffer_free(&buf);
+    if (funcref == FBX_T2_INSTANTIATE_PENDING) {
+      /* firebox#794 async escalation — the host dispatched this block's compile
+       * to its background pool; it is not ready yet.  Free the per-attempt ctx
+       * (a fresh one is built on the next poll), then arrange a BOUNDED retry:
+       * clear the terminal latch and push the next attempt out by
+       * FBX_T2_PENDING_RETRY_STRIDE hits — UNLESS we've already polled
+       * FBX_T2_PENDING_MAX_ATTEMPTS times, in which case give up (leave the
+       * latch set).  Giving up is harmless: the background compile still lands
+       * in the cache, so a later run (or a hotter sibling block) starts warm.
+       * The whole branch is dead on a synchronous host (it never returns
+       * PENDING), so non-async behavior is byte-identical. */
+      free(ctx);
+      if (++b->t2_pending_attempts >= FBX_T2_PENDING_MAX_ATTEMPTS) {
+        T2TraceLine(g_t2_trace_escalations,
+                    "[t2 escalate] sys=%p pc=%#llx outcome=pending_gave_up\n",
+                    (void *)m->system, (unsigned long long)b->start_pc);
+      } else {
+        b->t2_attempted = 0; /* reopen — the ONLY path that clears the latch */
+        b->t2_retry_at_hits = b->hits + FBX_T2_PENDING_RETRY_STRIDE;
+        T2TraceLine(g_t2_trace_escalations,
+                    "[t2 escalate] sys=%p pc=%#llx outcome=pending attempts=%u\n",
+                    (void *)m->system, (unsigned long long)b->start_pc,
+                    (unsigned)b->t2_pending_attempts);
+      }
+      return;
+    }
     if (funcref < 0) {
       free(ctx);
       T2TraceLine(g_t2_trace_escalations,

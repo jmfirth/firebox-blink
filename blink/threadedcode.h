@@ -113,8 +113,12 @@ struct FbxTcBlock {
   u32 nentries;            /* number of entries */
   u32 hits;                /* execution count (best-effort; not atomic) */
   i32 t2_funcref;          /* Tier 2 funcref or -1 (spec §6.3) */
-  u8 t2_attempted;         /* Tier 2 escalation latch (spec §6.1) */
-  u8 t2_reserved[3];       /* padding to keep the pointer naturally aligned */
+  u8 t2_attempted;         /* Tier 2 escalation TERMINAL latch (success or
+                            * permanent failure); a PENDING async compile does
+                            * NOT set it (firebox#794) so the block retries. */
+  u8 t2_pending_attempts;  /* firebox#794 — count of PENDING async-compile polls
+                            * so far; gives up at FBX_T2_PENDING_MAX_ATTEMPTS. */
+  u8 t2_reserved[2];       /* padding to keep the pointer naturally aligned */
   /* firebox#719: the per-block FbxT2BlockCtx now lives in the GUEST's own
    * heap (Blink owns the allocation) instead of a bridge-owned scratch
    * arena.  Its guest-memory address IS the `block_ctx_ptr` the bridge
@@ -132,6 +136,12 @@ struct FbxTcBlock {
    * non-self-loop) is de-escalated (t2_funcref → -1, latch kept). */
   u32 t2_dispatches;
   u32 t2_filled;
+  /* firebox#794 async escalation — the hit count at which a PENDING block may
+   * next re-attempt escalation (the lift+emit+instantiate poll).  Set to
+   * `hits + FBX_T2_PENDING_RETRY_STRIDE` on each PENDING outcome so a fast
+   * self-loop polls at a bounded cadence instead of re-lifting every iteration.
+   * 0 (init) lets the first attempt fire at the hotness threshold. */
+  u32 t2_retry_at_hits;
   struct FbxTcEntry *entries; /* malloc'd array of nentries entries */
   struct FbxTcBlock *next; /* next block in the same hash bucket */
 };
