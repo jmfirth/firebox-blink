@@ -113,6 +113,19 @@ static u32 g_t2_threshold = 100; /* spec §Q2 default */
 static int g_t2_enabled_cached = 0;
 static bool g_t2_enabled = true;
 
+/* #794 increment 3 — selective-escalation policy mode (measurement knob; the
+ * winning mode becomes the default).  Decides, from a block's IR structure,
+ * whether escalating it is PROFITABLE — coverage made grep escalate 94
+ * memory/branch-heavy blocks that lose to the interpreter (2.4×); only blocks
+ * the compiled form actually beats T1 on (the tight compute self-loops) should
+ * escalate.  Modes:
+ *   0 = all (current behaviour — escalate every covered+hot block)
+ *   1 = self-loop only (the dispatch-amortizing shape)
+ *   2 = no-memory only (refuse LOAD/STORE/PUSH/POP/CALL/RET — the MMU losers)
+ *   3 = self-loop AND no-memory */
+static int g_t2_selective_cached = 0;
+static int g_t2_selective_mode = 0;
+
 u32 Fbxt2HotnessThreshold(void) {
   if (!g_t2_threshold_cached) {
     const char *e = getenv("FBX_T2_HOTNESS_THRESHOLD");
@@ -141,11 +154,25 @@ bool Fbxt2Enabled(void) {
   return g_t2_enabled;
 }
 
+static int Fbxt2SelectiveMode(void) {
+  if (!g_t2_selective_cached) {
+    const char *e = getenv("FBX_T2_SELECTIVE");
+    g_t2_selective_cached = 1;
+    if (e && *e) {
+      long v = strtol(e, NULL, 10);
+      if (v >= 0 && v <= 3) g_t2_selective_mode = (int)v;
+    }
+  }
+  return g_t2_selective_mode;
+}
+
 void Fbxt2ResetEnvCacheForTest(void) {
   g_t2_threshold_cached = 0;
   g_t2_threshold = 100;
   g_t2_enabled_cached = 0;
   g_t2_enabled = true;
+  g_t2_selective_cached = 0;
+  g_t2_selective_mode = 0;
   g_t2_trace_init = 0;
   g_t2_trace_escalations = 0;
   g_t2_trace_bailouts = 0;
@@ -190,6 +217,49 @@ void Fbxt2TryEscalate(struct Machine *m, struct FbxTcBlock *b) {
                 "[t2 escalate] sys=%p pc=%#llx outcome=lift_bailed\n",
                 (void *)m->system, (unsigned long long)b->start_pc);
     return;
+  }
+
+  /* #794 increment 3 — selective escalation.  Profile the lifted block + apply
+   * the policy mode.  Coverage (inc 1) made memory/branch-heavy blocks escalate
+   * and LOSE to the interpreter (grep 2.4×); only blocks the compiled form
+   * actually beats T1 on should escalate.  The profile line (verbose) lets us
+   * SEE the loser distribution; the mode gate refuses the unprofitable ones. */
+  {
+    u32 pi;
+    int self_loop, has_mem = 0, n_mem = 0, n_alu = 0;
+    u8 last = FBX_IR_OP_PC_MARK;
+    int mode, refuse = 0;
+    for (pi = 0; pi < ir->ninsts; ++pi) {
+      u8 op = ir->insts[pi].opcode;
+      if (op == FBX_IR_OP_PC_MARK) continue;
+      last = op;
+      switch (op) {
+        case FBX_IR_OP_LOAD: case FBX_IR_OP_STORE: case FBX_IR_OP_PUSH:
+        case FBX_IR_OP_POP: case FBX_IR_OP_CALL_DIRECT: case FBX_IR_OP_RET:
+          has_mem = 1; n_mem++; break;
+        case FBX_IR_OP_ADD: case FBX_IR_OP_SUB: case FBX_IR_OP_AND:
+        case FBX_IR_OP_OR: case FBX_IR_OP_XOR: case FBX_IR_OP_IMUL:
+          n_alu++; break;
+        default: break;
+      }
+    }
+    self_loop = (last == FBX_IR_OP_BRANCH_COND);
+    T2TraceLine(g_t2_trace_verbose,
+                "[t2 profile] pc=%#llx ninsts=%u self_loop=%d n_mem=%d "
+                "n_alu=%d\n",
+                (unsigned long long)b->start_pc, (unsigned)ir->ninsts,
+                self_loop, n_mem, n_alu);
+    mode = Fbxt2SelectiveMode();
+    if (mode == 1 && !self_loop) refuse = 1;
+    else if (mode == 2 && has_mem) refuse = 1;
+    else if (mode == 3 && (!self_loop || has_mem)) refuse = 1;
+    if (refuse) {
+      fbx_ir_free(ir);
+      T2TraceLine(g_t2_trace_escalations,
+                  "[t2 escalate] sys=%p pc=%#llx outcome=not_profitable\n",
+                  (void *)m->system, (unsigned long long)b->start_pc);
+      return;
+    }
   }
 
   /* Step 2a — build the per-block consts[] table (#635). */
