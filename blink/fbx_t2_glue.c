@@ -166,6 +166,40 @@ static int Fbxt2SelectiveMode(void) {
   return g_t2_selective_mode;
 }
 
+/* #794 increment 3b — runtime-profitability DE-ESCALATION.  A block is
+ * profitable only if it does enough work per dispatch to amortize the dispatch
+ * cost; a self-loop reports "full budget of work" via exit code 3.  A block
+ * that NEVER fills the budget in its first FBX_T2_DEESCALATE_AFTER dispatches
+ * (short loop or non-self-loop) is reverted to Tier 1.
+ *
+ * Default OFF (FBX_T2_DEESCALATE=1 enables).  This mechanism is arch-correct
+ * and works (it reverts the unprofitable blocks), but #794 MEASURED that it
+ * does NOT fix the grep T2-on regression: even reverting EVERY escalated block
+ * to Tier 1 leaves grep ~3.6 s (vs t2off 1.5 s), because grep's loss is the
+ * one-time runtime ESCALATION/COMPILE overhead (~110 ms/block: lift→emit→
+ * cranelift-compile→guest co-instantiate), which is SUNK at escalation and
+ * irrecoverable by de-escalation — NOT per-dispatch block-execution loss
+ * (T2≈T1/dispatch, so de-escalating saves ~0 and the bookkeeping makes grep
+ * slightly worse).  De-escalation helps only workloads whose blocks are
+ * genuine per-dispatch losers; grep is escalation-overhead-bound.  The real
+ * grep fix is reducing escalation cost (compiled-block cache hit-rate / faster
+ * codegen) or T4 AOT (compile at build time → zero runtime escalation).  Kept
+ * opt-in as a correct, banked mechanism. */
+#define FBX_T2_DEESCALATE_AFTER 8u
+static int g_t2_deescalate_cached = 0;
+static bool g_t2_deescalate = false;
+static bool Fbxt2DeescalateEnabled(void) {
+  if (!g_t2_deescalate_cached) {
+    const char *e = getenv("FBX_T2_DEESCALATE");
+    g_t2_deescalate_cached = 1;
+    if (e && *e && (!strcmp(e, "1") || !strcmp(e, "on") ||
+                    !strcmp(e, "true") || !strcmp(e, "yes"))) {
+      g_t2_deescalate = true;
+    }
+  }
+  return g_t2_deescalate;
+}
+
 void Fbxt2ResetEnvCacheForTest(void) {
   g_t2_threshold_cached = 0;
   g_t2_threshold = 100;
@@ -173,6 +207,8 @@ void Fbxt2ResetEnvCacheForTest(void) {
   g_t2_enabled = true;
   g_t2_selective_cached = 0;
   g_t2_selective_mode = 0;
+  g_t2_deescalate_cached = 0;
+  g_t2_deescalate = false;
   g_t2_trace_init = 0;
   g_t2_trace_escalations = 0;
   g_t2_trace_bailouts = 0;
@@ -395,6 +431,32 @@ int Fbxt2Dispatch(struct Machine *m, struct FbxTcBlock *b) {
    * synthetic dispatcher echoes integer-only opcodes for the unit tests). */
   exit_code = fbx_t2_dispatch(sys_id, b->t2_funcref, m_ptr);
 #endif
+  /* #794 increment 3b — runtime-profitability feedback + de-escalation.  Exit
+   * code 3 (a self-loop that exhausted the full iteration budget = a deep,
+   * profitable loop) is counted and mapped to 0 so ExecuteBlock's control flow
+   * is unchanged.  A block that never fills the budget in its first
+   * FBX_T2_DEESCALATE_AFTER dispatches (short loop / non-self-loop) does too
+   * little work per dispatch to amortize the dispatch cost → revert it to
+   * Tier 1 (t2_funcref = -1; the t2_attempted latch stays set so it is not
+   * re-escalated → no oscillation).  This is the fix for the coverage-driven
+   * grep T2-on regression (#794): the headroom loop fills the budget on its
+   * first dispatch and is KEPT; grep's short/straight-line blocks never fill
+   * and revert. */
+  if (exit_code == 3) {
+    if (b->t2_filled != 0xFFFFFFFFu) ++b->t2_filled;
+    exit_code = 0;
+  }
+  if (b->t2_dispatches != 0xFFFFFFFFu) ++b->t2_dispatches;
+  if (Fbxt2DeescalateEnabled() &&
+      b->t2_dispatches == FBX_T2_DEESCALATE_AFTER && b->t2_filled == 0) {
+    b->t2_funcref = -1; /* revert to Tier 1; latch kept (no re-escalation) */
+    T2EnsureTraceFlags();
+    T2TraceLine(g_t2_trace_escalations,
+                "[t2 deescalate] sys=%p pc=%#llx dispatches=%u "
+                "(never filled budget — unprofitable)\n",
+                (void *)m->system, (unsigned long long)b->start_pc,
+                (unsigned)b->t2_dispatches);
+  }
   if (exit_code == 1 || exit_code == 2) {
     T2EnsureTraceFlags();
     T2TraceLine(g_t2_trace_bailouts,

@@ -493,6 +493,8 @@ static struct FbxTcBlock *CompileBlock(struct Machine *m, u64 start_pc) {
    * "no funcref" sentinel — 0 is a valid funcref. */
   b->t2_funcref = -1;
   b->t2_attempted = 0;
+  b->t2_dispatches = 0; /* #794 3b — de-escalation feedback */
+  b->t2_filled = 0;
   b->next = NULL;
   return b;
 }

@@ -123,6 +123,15 @@ struct FbxTcBlock {
    * block; freed in `FbxTcInvalidate` alongside the funcref drop.  NULL
    * until a successful escalation. */
   void *t2_block_ctx;
+  /* #794 increment 3b — runtime-profitability de-escalation feedback.  A T2
+   * block only beats the interpreter when it does enough work per dispatch to
+   * amortize the dispatch cost; a self-loop signals "full budget of work" by
+   * returning exit code 3 (EmitBranchCondSelfLoop).  Fbxt2Dispatch counts
+   * dispatches + budget-fills since escalation; a block that NEVER fills the
+   * budget in its first FBX_T2_DEESCALATE_AFTER dispatches (short loop or
+   * non-self-loop) is de-escalated (t2_funcref → -1, latch kept). */
+  u32 t2_dispatches;
+  u32 t2_filled;
   struct FbxTcEntry *entries; /* malloc'd array of nentries entries */
   struct FbxTcBlock *next; /* next block in the same hash bucket */
 };

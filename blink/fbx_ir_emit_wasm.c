@@ -2224,10 +2224,21 @@ static int EmitBranchCondSelfLoop(struct FbxWasmBuffer *body,
   /* br_if to the enclosing loop header. */
   fbx_wasm_buffer_u8(body, WASM_OP_BR_IF);
   fbx_wasm_buffer_uleb(body, loop_depth);
-  /* Fell through: not looping this pass — normal exit=0 to the host.  m->ip
-   * is already set to next_ip above. */
+  /* Fell through: not looping this pass.  m->ip is already set to next_ip.
+   * #794 inc 3b — runtime-profitability signal: return exit code 3 when the
+   * fall-through is because the iteration budget was EXHAUSTED (iter_budget==0
+   * → the block did a FULL budget of work this dispatch = a deep, profitable
+   * loop), else exit 0 (the loop ended early → low work this dispatch).
+   * Fbxt2Dispatch counts the budget-fills and maps 3→0 for ExecuteBlock, so
+   * control flow is unchanged; only the de-escalation feedback sees the 3. */
   fbx_wasm_buffer_u8(body, WASM_OP_I32_CONST);
-  fbx_wasm_buffer_sleb(body, 0);
+  fbx_wasm_buffer_sleb(body, 3); /* exit value if budget exhausted */
+  fbx_wasm_buffer_u8(body, WASM_OP_I32_CONST);
+  fbx_wasm_buffer_sleb(body, 0); /* exit value if loop ended early */
+  fbx_wasm_buffer_u8(body, WASM_OP_LOCAL_GET);
+  fbx_wasm_buffer_uleb(body, iter_budget);
+  fbx_wasm_buffer_u8(body, WASM_OP_I32_EQZ); /* (iter_budget == 0) ? 1 : 0 */
+  fbx_wasm_buffer_u8(body, WASM_OP_SELECT);  /* budget==0 ? 3 : 0 */
   fbx_wasm_buffer_u8(body, WASM_OP_RETURN);
   return 1;
 }
