@@ -2925,6 +2925,33 @@ static int BlockIsSelfLoopCandidate(const struct FbxIrBlock *ir) {
   return last == FBX_IR_OP_BRANCH_COND;
 }
 
+/* #794 increment 2 — in-block dead-flag liveness.  m->flags is a single shared
+ * shadow, so only the LAST SET_FLAGS_RAW before each reader is ever observed.
+ * The lifter emits a SET_FLAGS_RAW after EVERY ALU op, and the whole-block
+ * elision (case below: `!needs_scratch`) only drops them when the block has NO
+ * reader at all — so in a flag-reading loop like `imul…add…xor…sub…jnz`, the
+ * add/xor/sub flag computations (≈30 wasm ops EACH, full AluFlags) ALL run
+ * every iteration even though only `sub`'s ZF reaches `jnz`.  Measurement
+ * (#794): this redundant flag materialization — NOT reg-spill — is the loop's
+ * dominant cost (the register-cache experiment 7547c62 confirmed reg-spill is
+ * already optimized by the wasmer backend; the explicit cache made the loop
+ * SLOWER, 0.82 s → 1.30 s).
+ *
+ * A SET_FLAGS_RAW at `idx` is DEAD iff a later SET_FLAGS_RAW overwrites the
+ * shadow before any flag-reader (BRANCH_COND / GET_FLAG).  Returns 1 LIVE / 0
+ * DEAD.  Eliding a DEAD one is unobservable both in-block (a later SFR rewrites
+ * m->flags before any read) AND cross-block (the surviving set includes the
+ * LAST SFR — what a next block would read). */
+static int SetFlagsRawIsLive(const struct FbxIrBlock *ir, u32 idx) {
+  u32 j;
+  for (j = idx + 1u; j < ir->ninsts; ++j) {
+    u8 op = ir->insts[j].opcode;
+    if (op == FBX_IR_OP_SET_FLAGS_RAW) return 0; /* overwritten before a read */
+    if (op == FBX_IR_OP_BRANCH_COND || op == FBX_IR_OP_GET_FLAG) return 1;
+  }
+  return 1; /* no later flag op in-block → keep (a next block may read it) */
+}
+
 /* Emit the function body for one IR block.  Returns 1 on success, 0 on
  * unsupported op encountered mid-emission (caller frees scratch).
  *
@@ -3053,7 +3080,12 @@ static int EmitFunctionBody(struct FbxWasmBuffer *body,
          * matches blink/alu.c:AluFlags byte-for-byte.  The IR encoding
          * carries (op_kind in imm) + (lhs_vreg in src1) + (rhs_vreg in
          * src2) + (width in width) — see LiftAlui + LiftAluRR. */
-        if (!needs_scratch) break; /* dead-flag elision path */
+        if (!needs_scratch) break; /* whole-block dead-flag elision (#599) */
+        /* #794 inc 2 — IN-BLOCK dead-flag elision: skip this SET_FLAGS_RAW if a
+         * later one overwrites m->flags before any reader (its full AluFlags
+         * computation would be unobservable).  Removes the redundant per-op
+         * flag materialization that dominates flag-reading loops. */
+        if (!SetFlagsRawIsLive(ir, i)) break;
         if (p->src1_kind != FBX_IR_KIND_VREG ||
             p->src2_kind != FBX_IR_KIND_VREG) {
           SetFail(fail, FBX_IR_EMIT_SET_FLAGS_RAW_BAD, p->opcode);
