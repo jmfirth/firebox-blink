@@ -379,6 +379,18 @@ int main(int argc, char *argv[]) {
   g_blink_path = argc > 0 ? argv[0] : 0;
   WriteErrorInit();
   InitMap();
+#if defined(__wasm64__)
+  // firebox#796: confine blink's malloc heap below the kSkew-relocated guest
+  // region of the single wasm linear memory. Without this, once the guest grows
+  // linear memory (its address space starts at linear offset kSkew), blink's
+  // sbrk would walk the malloc break up into the guest's mapped pages and
+  // corrupt them intermittently. See tunables.h (kSkew) and wasix-libc sbrk.c
+  // (__wasilibc_sbrk_max). kSkew==0 (non-linear) leaves the heap uncapped.
+  if (kSkew) {
+    extern uintptr_t __wasilibc_sbrk_max;
+    __wasilibc_sbrk_max = (uintptr_t)kSkew;
+  }
+#endif
   GetOpts(argc, argv);
   if (optind_ == argc) {
     PrintUsage(argc, argv, 48, 2);

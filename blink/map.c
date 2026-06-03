@@ -143,6 +143,17 @@ void InitMap(void) {
   FLAG_vabits = GetBitsInAddressSpace();
   FLAG_vaspace = GetVirtualAddressSpace(FLAG_vabits, FLAG_pagesize);
   FLAG_aslrmask = ScaleAddress(kAslrMask);
+#if defined(__wasm64__)
+  // firebox#796: disable guest ASLR on wasm64. `ScaleAddress` halves the
+  // 47-bit-intended kAslrMask down to fit the ~32-bit clamped wasm vaspace,
+  // which inflates it to a ~2GB mask. XOR'ing brk/automap by up to 2GB
+  // (loader.c) scatters the guest's mmap base across [base, base+2GB] of a
+  // SINGLE contiguous wasm linear memory — sometimes past the memory ceiling,
+  // which is the (intermittent!) OOB the original kSkew=0 PoC hit. A wasm
+  // guest is already isolated by the host sandbox, so per-guest ASLR is
+  // defense-in-depth we trade for a compact, deterministic linear layout.
+  FLAG_aslrmask = 0;
+#endif
   FLAG_imagestart = ScaleAddress(kImageStart);
   FLAG_automapstart = ScaleAddress(kAutomapStart);
   FLAG_automapend = ScaleAddress(kAutomapEnd);
