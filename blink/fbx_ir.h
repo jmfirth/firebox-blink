@@ -125,8 +125,31 @@ extern "C" {
  *     emitted only BAILOUT/REG_GET-REG_SET-then-refused.  Stale Phase 4
  *     sidecars compiled against v3 invalidate cleanly.  Index/RIP-relative
  *     forms still BAILOUT (correct-or-refuse).  See work/tasks/677-* for
- *     the closure narrative. */
-#define FBX_IR_VERSION 4u
+ *     the closure narrative.
+ * v5: §13.5d follow-on (#778) — inline SIB-index LEA emit coverage.  LiftLea
+ *     now accepts the `[base + index*scale + disp]` form (it previously bailed
+ *     to Tier 1 via the #738 correct-or-refuse): src2 carries the index greg,
+ *     the new `scale` field (the renamed offset-20 word) carries the SIB scale,
+ *     and EmitLea adds `weg[index]*scale` to the effective address.  The IR
+ *     LAYOUT is unchanged (the `_pad2` slot is reused as `scale`, same offset +
+ *     size), but the lifter now produces NEW IR (indexed LEAs) for input that
+ *     previously emitted BAILOUT, AND the offset-20 word now carries meaning, so
+ *     stale v4 sidecars (which assumed that word was always zero) must
+ *     invalidate.  RIP-relative / no-base SIB LEAs still BAILOUT.  See
+ *     work/tasks/778-* for the closure narrative.
+ * v6: #794 (T3/T4 emit-coverage floor) — (1) new FBX_IR_OP_IMUL enumerator +
+ *     lift/emit for the truncating IMUL forms (0x69/0x6B/0x0FAF, reg-form);
+ *     (2) accumulator-immediate ALU forms (0x04/0x05…0x3C/0x3D) lifted via
+ *     LiftAluAccImm; (3) immediate-operand ALU made EMITTABLE — REG_GET with
+ *     an IMM src now lowers to a block-ctx IMM-slot load (previously the
+ *     coverage gate refused it, so EVERY immediate-operand ALU silently stayed
+ *     on Tier 1).  The lifter now produces NEW IR for input that previously
+ *     bailed/refused, so stale v5 sidecars must invalidate.  Also corrects a
+ *     latent width-4 register-write bug (32-bit writes now zero-extend, x86-64
+ *     semantics) — see EmitRegSlotStore.  IMUL carries no flag synthesis;
+ *     blocks where its flags are live at a reader refuse (correct-or-refuse).
+ *     See work/tasks/794-* for the closure narrative. */
+#define FBX_IR_VERSION 6u
 
 /* ────────────────────────────────────────────────────────────────────────── */
 /* IR opcodes.                                                                */
@@ -189,7 +212,18 @@ enum FbxIrOpcode {
   FBX_IR_OP_GET_FLAG = 13,      /* dst = flag value; imm encodes which flag */
 
   /* Address computation (LEA): dst = src1 + src2*scale + imm.  No memory
-   * access.  `width` is the result width (4 or 8 bytes). */
+   * access.  `width` is the result width (4 or 8 bytes).
+   *
+   * Two encodings (the index term is OPTIONAL):
+   *   - disp-only (`[base + disp]`): dst_kind=GREG dst=dest greg;
+   *     src1_kind=GREG src1=base greg; src2_kind=NONE or IMM (legacy
+   *     marker); scale=0; imm=signed displacement.
+   *   - indexed (`[base + index*scale + disp]`, #778): dst_kind=GREG;
+   *     src1_kind=GREG src1=base greg; src2_kind=GREG src2=index greg;
+   *     scale ∈ {1,2,4,8} (the SIB scale, 1<<SibScale); imm=disp.
+   * LEA computes an ADDRESS and never dereferences guest memory, so it
+   * needs no software-MMU translation even on the wasm32 (non-linear)
+   * build — it is pure register arithmetic into the Machine struct. */
   FBX_IR_OP_LEA = 14,
 
   /* Control flow — block terminators. */
@@ -233,6 +267,17 @@ enum FbxIrOpcode {
    * CALL/RET reuse the same memory machinery. */
   FBX_IR_OP_PUSH = 22,
   FBX_IR_OP_POP  = 23,
+
+  /* #794 (T3/T4 emit-coverage floor) — truncating-form integer multiply.
+   * Lifts x86 IMUL r,r/m,imm (0x69/0x6B) and IMUL r,r/m (0x0FAF) to a
+   * vreg*vreg product, the SAME REG_GET→OP→REG_SET shape as the ALU ops:
+   *   dst(vreg) = src1(vreg) * src2(vreg)  (low operand-width bits; i64.mul
+   *   + the existing dest-width REG_SET store).
+   * Carries NO flags: imul's CF/OF (full-product overflow) + x86-undefined
+   * SF/ZF/AF/PF are not synthesized at this increment.  The emit coverage
+   * gate refuses any block where imul's flags are LIVE at a reader, so
+   * Tier 1 computes them (correct-or-refuse — the #677/#735 pattern). */
+  FBX_IR_OP_IMUL = 24,
 
   /* Sentinel — count of defined opcodes.  Used by validation; not emitted. */
   FBX_IR_OP_LAST_,
@@ -285,7 +330,12 @@ struct FbxIrInst {
   u32 dst;       /* vreg index or greg id */
   u32 src1;      /* vreg index or greg id or narrow imm */
   u32 src2;      /* vreg index or greg id or narrow imm */
-  u32 _pad2;     /* explicit 4-byte pad so the u64 below sits at offset 24 */
+  u32 scale;     /* LEA SIB scale ∈ {1,2,4,8}; 0 = no index term (#778).
+                  * Occupies the former `_pad2` slot (same offset 20, same
+                  * 4-byte size) so the layout — and the 40-byte wire format —
+                  * is unchanged; it just gives the alignment pad a name and a
+                  * meaning for the indexed LEA.  Zero for every other opcode
+                  * (fbx_ir_inst_zero memsets it), so SHA determinism holds. */
   u64 imm;       /* wide immediate (PC, full-width literal, etc.) */
   u64 _pad3;     /* reserved for v0.2 extension without breaking layout */
 };

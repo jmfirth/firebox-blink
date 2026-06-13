@@ -113,6 +113,19 @@ static u32 g_t2_threshold = 100; /* spec §Q2 default */
 static int g_t2_enabled_cached = 0;
 static bool g_t2_enabled = true;
 
+/* #794 increment 3 — selective-escalation policy mode (measurement knob; the
+ * winning mode becomes the default).  Decides, from a block's IR structure,
+ * whether escalating it is PROFITABLE — coverage made grep escalate 94
+ * memory/branch-heavy blocks that lose to the interpreter (2.4×); only blocks
+ * the compiled form actually beats T1 on (the tight compute self-loops) should
+ * escalate.  Modes:
+ *   0 = all (current behaviour — escalate every covered+hot block)
+ *   1 = self-loop only (the dispatch-amortizing shape)
+ *   2 = no-memory only (refuse LOAD/STORE/PUSH/POP/CALL/RET — the MMU losers)
+ *   3 = self-loop AND no-memory */
+static int g_t2_selective_cached = 0;
+static int g_t2_selective_mode = 0;
+
 u32 Fbxt2HotnessThreshold(void) {
   if (!g_t2_threshold_cached) {
     const char *e = getenv("FBX_T2_HOTNESS_THRESHOLD");
@@ -141,11 +154,61 @@ bool Fbxt2Enabled(void) {
   return g_t2_enabled;
 }
 
+static int Fbxt2SelectiveMode(void) {
+  if (!g_t2_selective_cached) {
+    const char *e = getenv("FBX_T2_SELECTIVE");
+    g_t2_selective_cached = 1;
+    if (e && *e) {
+      long v = strtol(e, NULL, 10);
+      if (v >= 0 && v <= 3) g_t2_selective_mode = (int)v;
+    }
+  }
+  return g_t2_selective_mode;
+}
+
+/* #794 increment 3b — runtime-profitability DE-ESCALATION.  A block is
+ * profitable only if it does enough work per dispatch to amortize the dispatch
+ * cost; a self-loop reports "full budget of work" via exit code 3.  A block
+ * that NEVER fills the budget in its first FBX_T2_DEESCALATE_AFTER dispatches
+ * (short loop or non-self-loop) is reverted to Tier 1.
+ *
+ * Default OFF (FBX_T2_DEESCALATE=1 enables).  This mechanism is arch-correct
+ * and works (it reverts the unprofitable blocks), but #794 MEASURED that it
+ * does NOT fix the grep T2-on regression: even reverting EVERY escalated block
+ * to Tier 1 leaves grep ~3.6 s (vs t2off 1.5 s), because grep's loss is the
+ * one-time runtime ESCALATION/COMPILE overhead (~110 ms/block: lift→emit→
+ * cranelift-compile→guest co-instantiate), which is SUNK at escalation and
+ * irrecoverable by de-escalation — NOT per-dispatch block-execution loss
+ * (T2≈T1/dispatch, so de-escalating saves ~0 and the bookkeeping makes grep
+ * slightly worse).  De-escalation helps only workloads whose blocks are
+ * genuine per-dispatch losers; grep is escalation-overhead-bound.  The real
+ * grep fix is reducing escalation cost (compiled-block cache hit-rate / faster
+ * codegen) or T4 AOT (compile at build time → zero runtime escalation).  Kept
+ * opt-in as a correct, banked mechanism. */
+#define FBX_T2_DEESCALATE_AFTER 8u
+static int g_t2_deescalate_cached = 0;
+static bool g_t2_deescalate = false;
+static bool Fbxt2DeescalateEnabled(void) {
+  if (!g_t2_deescalate_cached) {
+    const char *e = getenv("FBX_T2_DEESCALATE");
+    g_t2_deescalate_cached = 1;
+    if (e && *e && (!strcmp(e, "1") || !strcmp(e, "on") ||
+                    !strcmp(e, "true") || !strcmp(e, "yes"))) {
+      g_t2_deescalate = true;
+    }
+  }
+  return g_t2_deescalate;
+}
+
 void Fbxt2ResetEnvCacheForTest(void) {
   g_t2_threshold_cached = 0;
   g_t2_threshold = 100;
   g_t2_enabled_cached = 0;
   g_t2_enabled = true;
+  g_t2_selective_cached = 0;
+  g_t2_selective_mode = 0;
+  g_t2_deescalate_cached = 0;
+  g_t2_deescalate = false;
   g_t2_trace_init = 0;
   g_t2_trace_escalations = 0;
   g_t2_trace_bailouts = 0;
@@ -169,8 +232,11 @@ void Fbxt2TryEscalate(struct Machine *m, struct FbxTcBlock *b) {
   u32 nconsts = 0;
   /* The latch — spec §6.1 idempotence.  Set FIRST so a racing thread that
    * also sees `hits >= threshold` short-circuits without re-running the
-   * pipeline.  The leak-on-race is harmless per spec (the loser's funcref
-   * leaks but doesn't corrupt). */
+   * pipeline (and, on a synchronous host, without a second cranelift compile).
+   * The leak-on-race is harmless per spec (the loser's funcref leaks but
+   * doesn't corrupt).  firebox#794: a PENDING async-compile outcome CLEARS this
+   * latch again (the only path that does) so the block re-attempts on a later
+   * hit; every terminal outcome leaves it set, exactly as before. */
   if (b->t2_attempted) return;
   b->t2_attempted = 1;
 
@@ -190,6 +256,49 @@ void Fbxt2TryEscalate(struct Machine *m, struct FbxTcBlock *b) {
                 "[t2 escalate] sys=%p pc=%#llx outcome=lift_bailed\n",
                 (void *)m->system, (unsigned long long)b->start_pc);
     return;
+  }
+
+  /* #794 increment 3 — selective escalation.  Profile the lifted block + apply
+   * the policy mode.  Coverage (inc 1) made memory/branch-heavy blocks escalate
+   * and LOSE to the interpreter (grep 2.4×); only blocks the compiled form
+   * actually beats T1 on should escalate.  The profile line (verbose) lets us
+   * SEE the loser distribution; the mode gate refuses the unprofitable ones. */
+  {
+    u32 pi;
+    int self_loop, has_mem = 0, n_mem = 0, n_alu = 0;
+    u8 last = FBX_IR_OP_PC_MARK;
+    int mode, refuse = 0;
+    for (pi = 0; pi < ir->ninsts; ++pi) {
+      u8 op = ir->insts[pi].opcode;
+      if (op == FBX_IR_OP_PC_MARK) continue;
+      last = op;
+      switch (op) {
+        case FBX_IR_OP_LOAD: case FBX_IR_OP_STORE: case FBX_IR_OP_PUSH:
+        case FBX_IR_OP_POP: case FBX_IR_OP_CALL_DIRECT: case FBX_IR_OP_RET:
+          has_mem = 1; n_mem++; break;
+        case FBX_IR_OP_ADD: case FBX_IR_OP_SUB: case FBX_IR_OP_AND:
+        case FBX_IR_OP_OR: case FBX_IR_OP_XOR: case FBX_IR_OP_IMUL:
+          n_alu++; break;
+        default: break;
+      }
+    }
+    self_loop = (last == FBX_IR_OP_BRANCH_COND);
+    T2TraceLine(g_t2_trace_verbose,
+                "[t2 profile] pc=%#llx ninsts=%u self_loop=%d n_mem=%d "
+                "n_alu=%d\n",
+                (unsigned long long)b->start_pc, (unsigned)ir->ninsts,
+                self_loop, n_mem, n_alu);
+    mode = Fbxt2SelectiveMode();
+    if (mode == 1 && !self_loop) refuse = 1;
+    else if (mode == 2 && has_mem) refuse = 1;
+    else if (mode == 3 && (!self_loop || has_mem)) refuse = 1;
+    if (refuse) {
+      fbx_ir_free(ir);
+      T2TraceLine(g_t2_trace_escalations,
+                  "[t2 escalate] sys=%p pc=%#llx outcome=not_profitable\n",
+                  (void *)m->system, (unsigned long long)b->start_pc);
+      return;
+    }
   }
 
   /* Step 2a — build the per-block consts[] table (#635). */
@@ -263,6 +372,32 @@ void Fbxt2TryEscalate(struct Machine *m, struct FbxTcBlock *b) {
     funcref = fbx_t2_instantiate(sys_id, buf.data, (u32)buf.len, ctx);
     fbx_ir_free(ir);
     fbx_wasm_buffer_free(&buf);
+    if (funcref == FBX_T2_INSTANTIATE_PENDING) {
+      /* firebox#794 async escalation — the host dispatched this block's compile
+       * to its background pool; it is not ready yet.  Free the per-attempt ctx
+       * (a fresh one is built on the next poll), then arrange a BOUNDED retry:
+       * clear the terminal latch and push the next attempt out by
+       * FBX_T2_PENDING_RETRY_STRIDE hits — UNLESS we've already polled
+       * FBX_T2_PENDING_MAX_ATTEMPTS times, in which case give up (leave the
+       * latch set).  Giving up is harmless: the background compile still lands
+       * in the cache, so a later run (or a hotter sibling block) starts warm.
+       * The whole branch is dead on a synchronous host (it never returns
+       * PENDING), so non-async behavior is byte-identical. */
+      free(ctx);
+      if (++b->t2_pending_attempts >= FBX_T2_PENDING_MAX_ATTEMPTS) {
+        T2TraceLine(g_t2_trace_escalations,
+                    "[t2 escalate] sys=%p pc=%#llx outcome=pending_gave_up\n",
+                    (void *)m->system, (unsigned long long)b->start_pc);
+      } else {
+        b->t2_attempted = 0; /* reopen — the ONLY path that clears the latch */
+        b->t2_retry_at_hits = b->hits + FBX_T2_PENDING_RETRY_STRIDE;
+        T2TraceLine(g_t2_trace_escalations,
+                    "[t2 escalate] sys=%p pc=%#llx outcome=pending attempts=%u\n",
+                    (void *)m->system, (unsigned long long)b->start_pc,
+                    (unsigned)b->t2_pending_attempts);
+      }
+      return;
+    }
     if (funcref < 0) {
       free(ctx);
       T2TraceLine(g_t2_trace_escalations,
@@ -296,7 +431,61 @@ int Fbxt2Dispatch(struct Machine *m, struct FbxTcBlock *b) {
    * a meaningless integer the synthetic dispatcher echoes back, which is
    * fine for the integer-only opcodes those tests exercise. */
   i32 m_ptr = (i32)(intptr_t)m;
-  int exit_code = fbx_t2_dispatch(sys_id, b->t2_funcref, m_ptr);
+  int exit_code;
+#ifdef __wasm__
+  /* firebox#786 — GUEST-SIDE DISPATCH.  Instead of crossing to the host via
+   * the `fbx_t2_dispatch` import (a wasm->host re-entry that pays the ~270 ns
+   * wasmer coroutine-stack-switch crossing on EVERY dispatch, #694), call the
+   * translated block IN-GUEST through `__indirect_function_table`.  The host's
+   * `fbx_t2_instantiate` co-instantiates the block into Blink's OWN store and
+   * places its `translated_block` export into Blink's (exported, growable)
+   * function table, returning the TABLE INDEX as `t2_funcref`.  Casting that
+   * index to a C function pointer and calling it compiles (clang wasm ABI) to
+   * `call_indirect __indirect_function_table` with the type immediate for the
+   * #635 block ABI `(i32 m_ptr, i32 block_ctx_ptr) -> (i32 exit)` — a pure
+   * in-instance call with NO coroutine tax (the tax is only for ENTERING wasm
+   * from the host).  The guest supplies `block_ctx_ptr` itself: `t2_block_ctx`
+   * is the guest-heap FbxT2BlockCtx pointer (firebox#719), and
+   * `(i32)(intptr_t)t2_block_ctx` is byte-identical to the `block_ctx_ptr` the
+   * host computed under the old host-dispatch path.  `t2_funcref >= 0` is
+   * guaranteed by the ExecuteBlock fast-path gate (threadedcode.c). */
+  {
+    typedef int (*FbxT2BlockFn)(i32, i32);
+    i32 ctx_ptr = (i32)(intptr_t)b->t2_block_ctx;
+    FbxT2BlockFn fn = (FbxT2BlockFn)(uintptr_t)(u32)b->t2_funcref;
+    exit_code = fn(m_ptr, ctx_ptr);
+  }
+#else
+  /* Native test bench: no in-guest table; keep the host-dispatch shim (the
+   * synthetic dispatcher echoes integer-only opcodes for the unit tests). */
+  exit_code = fbx_t2_dispatch(sys_id, b->t2_funcref, m_ptr);
+#endif
+  /* #794 increment 3b — runtime-profitability feedback + de-escalation.  Exit
+   * code 3 (a self-loop that exhausted the full iteration budget = a deep,
+   * profitable loop) is counted and mapped to 0 so ExecuteBlock's control flow
+   * is unchanged.  A block that never fills the budget in its first
+   * FBX_T2_DEESCALATE_AFTER dispatches (short loop / non-self-loop) does too
+   * little work per dispatch to amortize the dispatch cost → revert it to
+   * Tier 1 (t2_funcref = -1; the t2_attempted latch stays set so it is not
+   * re-escalated → no oscillation).  This is the fix for the coverage-driven
+   * grep T2-on regression (#794): the headroom loop fills the budget on its
+   * first dispatch and is KEPT; grep's short/straight-line blocks never fill
+   * and revert. */
+  if (exit_code == 3) {
+    if (b->t2_filled != 0xFFFFFFFFu) ++b->t2_filled;
+    exit_code = 0;
+  }
+  if (b->t2_dispatches != 0xFFFFFFFFu) ++b->t2_dispatches;
+  if (Fbxt2DeescalateEnabled() &&
+      b->t2_dispatches == FBX_T2_DEESCALATE_AFTER && b->t2_filled == 0) {
+    b->t2_funcref = -1; /* revert to Tier 1; latch kept (no re-escalation) */
+    T2EnsureTraceFlags();
+    T2TraceLine(g_t2_trace_escalations,
+                "[t2 deescalate] sys=%p pc=%#llx dispatches=%u "
+                "(never filled budget — unprofitable)\n",
+                (void *)m->system, (unsigned long long)b->start_pc,
+                (unsigned)b->t2_dispatches);
+  }
   if (exit_code == 1 || exit_code == 2) {
     T2EnsureTraceFlags();
     T2TraceLine(g_t2_trace_bailouts,

@@ -116,6 +116,32 @@ FBX_T2_HOST_IMPORT
 int fbx_t2_instantiate(u64 sys_id, const u8 *wasm_bytes, u32 wasm_len,
                        const struct FbxT2BlockCtx *block_ctx);
 
+/* firebox#794 ASYNC ESCALATION — the host may dispatch a block's ~20 ms
+ * cranelift compile to a BACKGROUND thread instead of blocking the guest hot
+ * path, returning this sentinel to mean "compile in flight; stay Tier-1 and
+ * re-attempt on a later hit."  Distinct from -1 ("terminal failure; never
+ * escalate this block").  Keep in sync with `FBX_T2_INSTANTIATE_PENDING` in
+ * `crates/firebox-wasix/src/t2_bridge.rs`.  This removes the run-1 cold-compile
+ * cost that made T2-on a regression on short memory/branch-heavy workloads: a
+ * short workload finishes at interpreter speed while the compile warms the
+ * cache for the next hit / next run.  A host that compiles synchronously
+ * (FBX_T2_ASYNC_COMPILE=0, or the browser host with no thread pool) never
+ * returns this value, so the retry machinery below stays dormant there. */
+#define FBX_T2_INSTANTIATE_PENDING (-2)
+
+/* Re-attempt cadence for a PENDING block (firebox#794).  A self-loop is
+ * dispatched once PER ITERATION, so retrying on every hit would re-run the
+ * lift+emit pipeline millions of times inside one ~20 ms compile window.
+ * Instead, re-attempt only every FBX_T2_PENDING_RETRY_STRIDE hits (tracked via
+ * `FbxTcBlock::t2_retry_at_hits`), and give up after FBX_T2_PENDING_MAX_ATTEMPTS
+ * polls (the compile, if it ever lands, still warms the cache for the next run).
+ * Tuned so a deep compute loop catches its ready compile within a poll or two
+ * (→ the ~10x win) while a short scan exhausts neither budget before the
+ * workload ends (→ no escalation, no run-1 regression — the desired outcome for
+ * the memory/branch-heavy class). */
+#define FBX_T2_PENDING_RETRY_STRIDE 8192u
+#define FBX_T2_PENDING_MAX_ATTEMPTS 64u
+
 /* Dispatch the translated block.  Returns the wasm function's exit code
  * (0 = normal completion, 1 = bailout to Tier 1, 2 = host-call escape).
  * Spec §5.1 (translated_block return-value convention). */

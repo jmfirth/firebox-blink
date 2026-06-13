@@ -223,6 +223,7 @@ static const char *const kOpcodeNames[FBX_IR_OP_LAST_] = {
     [FBX_IR_OP_AND] = "AND",
     [FBX_IR_OP_OR] = "OR",
     [FBX_IR_OP_XOR] = "XOR",
+    [FBX_IR_OP_IMUL] = "IMUL",
     [FBX_IR_OP_CMP] = "CMP",
     [FBX_IR_OP_TEST] = "TEST",
     [FBX_IR_OP_SET_FLAGS_RAW] = "SET_FLAGS_RAW",
@@ -575,27 +576,130 @@ static int LiftMovImm(struct LiftCtx *ctx, u64 rde, u64 uimm0) {
   return 1;
 }
 
-/* Lift LEA (opcode 0x8D). */
+/* Lift LEA (opcode 0x8D).
+ *
+ * firebox#738 (ROOT CAUSE — correctness, load-bearing): LEA's emit lowers
+ * exactly ONE addressing shape, `[base + disp]` (FBX_IR_OP_LEA = greg base +
+ * immediate disp; see EmitLea).  The original lift sourced the base
+ * UNCONDITIONALLY as `RexbRm(rde)` and dropped any SIB index register — which
+ * is WRONG for every SIB-addressed LEA:
+ *   - `lea r14, [r9 + rax]` (SIB byte, base=r9 via RexbBase, index=rax) was
+ *     mis-lifted as `r14 = weg[RexbRm] + disp`.  With a SIB byte ModrmRm==4, so
+ *     RexbRm decodes reg 4/12 (NOT the SIB base r9), AND the index register rax
+ *     was silently dropped → r14 computed from the wrong base with no index →
+ *     a garbage pointer.  In the hot strcmp/strcoll string-end computation
+ *     (`mov r9,[rsp+disp]; lea r14,[r9+rax]; test …; jns …`) this produced a
+ *     -1/out-of-range pointer that Tier 1 then dereferenced → SIGSEGV after
+ *     correct output up to the crash (witnessed: sort crashes at line 85 once
+ *     the comparison block escalates to T2 at the default hotness threshold).
+ * This was masked until #735 enabled the inline wide guest LOAD, because the
+ * #719 acceptance gate refused LOAD/STORE → the strcmp blocks (which carry the
+ * wide stack LOAD feeding the LEA base) never escalated.  The SESSION-4
+ * "wide LOAD + in-block flag-writer + BRANCH_COND" correlation was exactly
+ * this block shape: the wide LOAD sources the LEA's base; the flag-writer +
+ * Jcc terminate it.  Refusing the wide LOAD OR the flag-reader was byte-clean
+ * only because each bailed the SAME block that carried the mis-lifted LEA.
+ *
+ * FIX (correct-or-refuse, the established #677 pattern): validate the EA is the
+ * supported `[base + disp]` via ClassifyMemBaseDisp — which sources the base
+ * correctly (RexbBase for the SIB-base form) and REFUSES SIB-index /
+ * RIP-relative / no-base forms.  A refused form returns -1 → LiftOne emits a
+ * BAILOUT so Tier 1 computes the LEA authoritatively (it already handles every
+ * addressing form).  This both fixes the mis-sourced base AND stops dropping
+ * the index register; the SIB-index LEA support is a clean follow-on (extend
+ * FBX_IR_OP_LEA's emit with an index+scale term, then accept it here). */
+/* Classify an LEA memory operand for the inline emitter (#778).               */
+/*                                                                            */
+/* LEA computes `dst = base + index*scale + disp`; it NEVER dereferences      */
+/* guest memory, so (unlike LOAD/STORE) there is no software-MMU concern — it */
+/* is pure register arithmetic into the Machine struct.  That is why LEA can  */
+/* support the SIB-INDEX form inline while LOAD/STORE/MOV still refuse it      */
+/* (their addressing form drives a translated memory access, deferred).       */
+/*                                                                            */
+/* Supported forms (return 1):                                                */
+/*   - No SIB:           base = RexbRm(rde),   no index, scale 0.             */
+/*   - SIB base-only:    base = RexbBase(rde), no index, scale 0.            */
+/*   - SIB base+index:   base = RexbBase(rde), index = Rexx<<3 | SibIndex,   */
+/*                       scale = 1 << SibScale(rde).                          */
+/*                                                                            */
+/* Refused (return 0 → caller BAILOUTs to Tier 1, which handles every form): */
+/*   - RIP-relative (no SIB, mod==0, ModrmRm==5) — no base register.         */
+/*   - No-base SIB (SibIsAbsolute / disp32 + optional index, mod==0,         */
+/*     SibBase==5): the address has no base GREG.  The index-without-base    */
+/*     encoding is rare and would need a 2-term (index*scale + disp) emit     */
+/*     the disp-or-base inline path doesn't model; bail rather than widen.   */
+/*                                                                            */
+/* `*out_scale` is 0 when there is no index term, else the SIB scale.         */
+static int ClassifyLeaMem(u64 rde, u32 *out_base_greg, u32 *out_index_greg,
+                          u32 *out_scale) {
+  *out_index_greg = 0;
+  *out_scale = 0;
+  if (IsModrmRegister(rde)) return 0; /* LEA must have mod != 3 */
+  if (!SibExists(rde)) {
+    /* No SIB.  RIP-relative (mod==0, ModrmRm==5) has no base register. */
+    if (ModrmMod(rde) == 0 && ModrmRm(rde) == 5) return 0;
+    *out_base_greg = (u32)RexbRm(rde);
+    return 1;
+  }
+  /* SIB present.  Require a base register (no-base / absolute forms refused). */
+  if (!SibHasBase(rde)) return 0;
+  *out_base_greg = (u32)RexbBase(rde);
+  if (SibHasIndex(rde)) {
+    /* Index register = Rexx<<3 | SibIndex; scale = 1 << SibScale.  Note that
+     * SibHasIndex already excludes the canonical no-index encoding
+     * (SibIndex==4 && !Rexx), so reg 4 here is the legitimate r12 index. */
+    *out_index_greg = ((u32)Rexx(rde) << 3) | (u32)SibIndex(rde);
+    *out_scale = 1u << (u32)SibScale(rde);
+  }
+  return 1;
+}
+
 static int LiftLea(struct LiftCtx *ctx, u64 rde, i64 disp) {
   u8 width = WidthFromRde(rde, 0);
-  struct FbxIrInst *lea = CtxEmit(ctx);
+  u32 base_greg;
+  u32 index_greg;
+  u32 scale;
+  struct FbxIrInst *lea;
+  /* #778 — inline the SIB-INDEX form too: `lea dst, [base + index*scale +
+   * disp]`.  #738 made LiftLea correct-or-refuse but the supported set was the
+   * disp-only `[base + disp]` shape (it BAILED every indexed LEA to Tier 1).
+   * ClassifyLeaMem now accepts the indexed form (the hot strcmp/strcoll
+   * `lea r14,[r9+rax]`) and refuses only the no-base / RIP-relative forms.
+   * EmitLea adds `weg[index]*scale` to the effective address — no MMU
+   * translation (LEA never touches guest memory). */
+  if (!ClassifyLeaMem(rde, &base_greg, &index_greg, &scale)) {
+    return -1;
+  }
+  lea = CtxEmit(ctx);
   if (!lea) return 0;
   lea->opcode = FBX_IR_OP_LEA;
   lea->width = width;
   lea->dst_kind = FBX_IR_KIND_GREG;
   lea->dst = (u32)RexrReg(rde);
   lea->src1_kind = FBX_IR_KIND_GREG;
-  lea->src1 = (u32)RexbRm(rde);
-  lea->src2_kind = FBX_IR_KIND_IMM;
+  lea->src1 = base_greg;
+  if (scale != 0) {
+    /* Indexed form: src2 = index greg, scale = SIB scale. */
+    lea->src2_kind = FBX_IR_KIND_GREG;
+    lea->src2 = index_greg;
+    lea->scale = scale;
+  } else {
+    /* Disp-only form (legacy IMM marker; src2 carries no greg). */
+    lea->src2_kind = FBX_IR_KIND_IMM;
+  }
   lea->imm = (u64)disp;
   return 1;
 }
 
-/* Lift ALU group 1 r/m, imm (opcode 0x83 = OpAlui w/ sign-extended imm8;
- * also 0x81 = OpAlui w/ imm32; mopcode 0x080 / 0x081 / 0x082 / 0x083). */
-static int LiftAlui(struct LiftCtx *ctx, u64 rde, u64 uimm0, int byte_op) {
-  u8 width = WidthFromRde(rde, byte_op);
-  u8 op = AluSubOp(rde);
+/* Common body for the immediate-form ALU lift: `greg` = OP(greg, imm) with
+ * the eager SET_FLAGS_RAW.  `greg` is the destination/lhs guest register id;
+ * `op` must be a non-zero FBX_IR_OP_* (the caller resolves ADC/SBB to a
+ * bailout).  REG_GET with an IMM src1 materializes the immediate into a vreg.
+ *
+ * Shared by the group-1 r/m,imm forms (greg = RexbRm) and the #794
+ * accumulator-imm forms (greg = 0 = rAX). */
+static int LiftAluImmCommon(struct LiftCtx *ctx, u8 width, u32 greg,
+                            u64 uimm0, u8 op) {
   u32 lhs_vreg;
   u32 rhs_vreg;
   u32 res_vreg;
@@ -604,7 +708,6 @@ static int LiftAlui(struct LiftCtx *ctx, u64 rde, u64 uimm0, int byte_op) {
   struct FbxIrInst *alu;
   struct FbxIrInst *set_res;
   struct FbxIrInst *flags;
-  if (op == 0) return -1; /* ADC/SBB — bailout */
   get_lhs = CtxEmit(ctx);
   if (!get_lhs) return 0;
   lhs_vreg = CtxAllocVreg(ctx);
@@ -613,7 +716,7 @@ static int LiftAlui(struct LiftCtx *ctx, u64 rde, u64 uimm0, int byte_op) {
   get_lhs->dst_kind = FBX_IR_KIND_VREG;
   get_lhs->dst = lhs_vreg;
   get_lhs->src1_kind = FBX_IR_KIND_GREG;
-  get_lhs->src1 = (u32)RexbRm(rde);
+  get_lhs->src1 = greg;
   set_rhs = CtxEmit(ctx);
   if (!set_rhs) return 0;
   rhs_vreg = CtxAllocVreg(ctx);
@@ -640,7 +743,7 @@ static int LiftAlui(struct LiftCtx *ctx, u64 rde, u64 uimm0, int byte_op) {
     set_res->opcode = FBX_IR_OP_REG_SET;
     set_res->width = width;
     set_res->dst_kind = FBX_IR_KIND_GREG;
-    set_res->dst = (u32)RexbRm(rde);
+    set_res->dst = greg;
     set_res->src1_kind = FBX_IR_KIND_VREG;
     set_res->src1 = res_vreg;
   }
@@ -657,6 +760,100 @@ static int LiftAlui(struct LiftCtx *ctx, u64 rde, u64 uimm0, int byte_op) {
   flags->src1 = lhs_vreg;
   flags->src2_kind = FBX_IR_KIND_VREG;
   flags->src2 = rhs_vreg;
+  return 1;
+}
+
+/* Lift ALU group 1 r/m, imm (opcode 0x83 = OpAlui w/ sign-extended imm8;
+ * also 0x81 = OpAlui w/ imm32; mopcode 0x080 / 0x081 / 0x082 / 0x083). */
+static int LiftAlui(struct LiftCtx *ctx, u64 rde, u64 uimm0, int byte_op) {
+  u8 op = AluSubOp(rde);
+  if (op == 0) return -1; /* ADC/SBB — bailout */
+  return LiftAluImmCommon(ctx, WidthFromRde(rde, byte_op), (u32)RexbRm(rde),
+                          uimm0, op);
+}
+
+/* #794 — lift the accumulator-immediate ALU forms (no modrm byte; the
+ * destination/source is always rAX/eAX/AX/AL = greg 0):
+ *   0x04 ADD AL,imm8   0x05 ADD eAX,imm32   (+ OR/AND/SUB/XOR/CMP siblings).
+ * The assembler picks these short encodings for `add rax, imm` etc. — the
+ * exact shape the #794 register loop uses (`add rax, 12345`).  `op` is the
+ * resolved FBX_IR_OP_* (caller maps the opcode); byte_op selects AL vs eAX. */
+static int LiftAluAccImm(struct LiftCtx *ctx, u64 rde, u64 uimm0, u8 op,
+                         int byte_op) {
+  return LiftAluImmCommon(ctx, WidthFromRde(rde, byte_op), 0u, uimm0, op);
+}
+
+/* #794 (T3/T4 emit-coverage floor) — lift the truncating IMUL forms.
+ *
+ *   has_imm==1: IMUL r, r/m, imm   (0x69 imm32-sx / 0x6B imm8-sx).
+ *               dst = RexrReg; lhs = r/m (RexbRm); rhs = imm.
+ *   has_imm==0: IMUL r, r/m        (0x0FAF).
+ *               dst = RexrReg; lhs = RexrReg; rhs = r/m (RexbRm).
+ *
+ * Shape mirrors LiftAlui/LiftAluRR (REG_GET lhs + REG_GET rhs + OP + REG_SET)
+ * but with op=FBX_IR_OP_IMUL and — deliberately — NO trailing SET_FLAGS_RAW:
+ * imul's CF/OF (full-product overflow) + x86-undefined SF/ZF/AF/PF are not
+ * synthesized at this increment.  The emit coverage gate's imul-flag-liveness
+ * pass refuses any block where those flags are observed, so Tier 1 computes
+ * them (correct-or-refuse).  REG_GET with an IMM src1 materializes the
+ * immediate into a vreg (same trick LiftAlui uses).
+ *
+ * Reg-form (modrm.mod==3) only: the r/m memory-operand form requests a
+ * BAILOUT (return -1) — the §13.5 memory path is a later increment. */
+static int LiftImul(struct LiftCtx *ctx, u64 rde, int has_imm, u64 uimm0) {
+  u8 width = WidthFromRde(rde, 0); /* no byte form for 0x69/0x6B/0x0FAF */
+  u32 lhs_vreg;
+  u32 rhs_vreg;
+  u32 res_vreg;
+  struct FbxIrInst *get_lhs;
+  struct FbxIrInst *get_rhs;
+  struct FbxIrInst *mul;
+  struct FbxIrInst *set_res;
+  if (!IsModrmRegister(rde)) {
+    return -1; /* memory r/m operand — bail to Tier 1 (later increment) */
+  }
+  get_lhs = CtxEmit(ctx);
+  if (!get_lhs) return 0;
+  lhs_vreg = CtxAllocVreg(ctx);
+  get_lhs->opcode = FBX_IR_OP_REG_GET;
+  get_lhs->width = width;
+  get_lhs->dst_kind = FBX_IR_KIND_VREG;
+  get_lhs->dst = lhs_vreg;
+  get_lhs->src1_kind = FBX_IR_KIND_GREG;
+  get_lhs->src1 = has_imm ? (u32)RexbRm(rde) : (u32)RexrReg(rde);
+  get_rhs = CtxEmit(ctx);
+  if (!get_rhs) return 0;
+  rhs_vreg = CtxAllocVreg(ctx);
+  get_rhs->opcode = FBX_IR_OP_REG_GET;
+  get_rhs->width = width;
+  get_rhs->dst_kind = FBX_IR_KIND_VREG;
+  get_rhs->dst = rhs_vreg;
+  if (has_imm) {
+    get_rhs->src1_kind = FBX_IR_KIND_IMM;
+    get_rhs->imm = uimm0;
+  } else {
+    get_rhs->src1_kind = FBX_IR_KIND_GREG;
+    get_rhs->src1 = (u32)RexbRm(rde);
+  }
+  mul = CtxEmit(ctx);
+  if (!mul) return 0;
+  res_vreg = CtxAllocVreg(ctx);
+  mul->opcode = FBX_IR_OP_IMUL;
+  mul->width = width;
+  mul->dst_kind = FBX_IR_KIND_VREG;
+  mul->dst = res_vreg;
+  mul->src1_kind = FBX_IR_KIND_VREG;
+  mul->src1 = lhs_vreg;
+  mul->src2_kind = FBX_IR_KIND_VREG;
+  mul->src2 = rhs_vreg;
+  set_res = CtxEmit(ctx);
+  if (!set_res) return 0;
+  set_res->opcode = FBX_IR_OP_REG_SET;
+  set_res->width = width;
+  set_res->dst_kind = FBX_IR_KIND_GREG;
+  set_res->dst = (u32)RexrReg(rde);
+  set_res->src1_kind = FBX_IR_KIND_VREG;
+  set_res->src1 = res_vreg;
   return 1;
 }
 
@@ -918,6 +1115,29 @@ static int LiftOne(struct LiftCtx *ctx, const struct FbxTcEntry *e,
     case 0x080: return LiftAlui(ctx, rde, e->uimm0, 1);
     case 0x081:
     case 0x083: return LiftAlui(ctx, rde, e->uimm0, 0);
+    /* #794 — IMUL truncating forms.  3-operand imm (0x69 imm32-sx / 0x6B
+     * imm8-sx) → r = r/m * imm; 2-operand (0x0FAF → mopcode 0x1AF) → r =
+     * r * r/m.  No flag synthesis (correct-or-refuse at the emit gate). */
+    case 0x069:
+    case 0x06B: return LiftImul(ctx, rde, /*has_imm=*/1, e->uimm0);
+    case 0x1AF: return LiftImul(ctx, rde, /*has_imm=*/0, 0);
+    /* #794 — accumulator-immediate ALU forms (no modrm; dst/lhs = rAX).
+     * The assembler emits these short encodings for `add rax,imm` etc.
+     * Byte form (0x04/0x0C/0x24/0x2C/0x34/0x3C) → byte_op=1; word form
+     * (0x05/0x0D/0x25/0x2D/0x35/0x3D) → byte_op=0.  ADC/SBB (0x14/0x15/
+     * 0x1C/0x1D) intentionally omitted — same as AluSubOp's exclusion. */
+    case 0x004: return LiftAluAccImm(ctx, rde, e->uimm0, FBX_IR_OP_ADD, 1);
+    case 0x005: return LiftAluAccImm(ctx, rde, e->uimm0, FBX_IR_OP_ADD, 0);
+    case 0x00C: return LiftAluAccImm(ctx, rde, e->uimm0, FBX_IR_OP_OR,  1);
+    case 0x00D: return LiftAluAccImm(ctx, rde, e->uimm0, FBX_IR_OP_OR,  0);
+    case 0x024: return LiftAluAccImm(ctx, rde, e->uimm0, FBX_IR_OP_AND, 1);
+    case 0x025: return LiftAluAccImm(ctx, rde, e->uimm0, FBX_IR_OP_AND, 0);
+    case 0x02C: return LiftAluAccImm(ctx, rde, e->uimm0, FBX_IR_OP_SUB, 1);
+    case 0x02D: return LiftAluAccImm(ctx, rde, e->uimm0, FBX_IR_OP_SUB, 0);
+    case 0x034: return LiftAluAccImm(ctx, rde, e->uimm0, FBX_IR_OP_XOR, 1);
+    case 0x035: return LiftAluAccImm(ctx, rde, e->uimm0, FBX_IR_OP_XOR, 0);
+    case 0x03C: return LiftAluAccImm(ctx, rde, e->uimm0, FBX_IR_OP_CMP, 1);
+    case 0x03D: return LiftAluAccImm(ctx, rde, e->uimm0, FBX_IR_OP_CMP, 0);
     /* Conditional jumps — short (0x70-0x7F) and near (0x180-0x18F). */
     case 0x070: case 0x071: case 0x072: case 0x073:
     case 0x074: case 0x075: case 0x076: case 0x077:
@@ -1173,10 +1393,13 @@ void fbx_ir_block_sha256(const struct FbxIrBlock *ir, u8 out_sha256[32]) {
       b[k++] = (u8)(p->src2 >> 8);
       b[k++] = (u8)(p->src2 >> 16);
       b[k++] = (u8)(p->src2 >> 24);
-      b[k++] = (u8)(p->_pad2 >> 0);
-      b[k++] = (u8)(p->_pad2 >> 8);
-      b[k++] = (u8)(p->_pad2 >> 16);
-      b[k++] = (u8)(p->_pad2 >> 24);
+      /* Offset-20 word — formerly `_pad2`, now the LEA SIB `scale` (#778).
+       * Hashed in the same position; the FBX_IR_VERSION bump invalidates any
+       * sidecar built before the field carried meaning. */
+      b[k++] = (u8)(p->scale >> 0);
+      b[k++] = (u8)(p->scale >> 8);
+      b[k++] = (u8)(p->scale >> 16);
+      b[k++] = (u8)(p->scale >> 24);
       b[k++] = (u8)(p->imm >> 0);
       b[k++] = (u8)(p->imm >> 8);
       b[k++] = (u8)(p->imm >> 16);

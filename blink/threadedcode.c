@@ -493,6 +493,10 @@ static struct FbxTcBlock *CompileBlock(struct Machine *m, u64 start_pc) {
    * "no funcref" sentinel — 0 is a valid funcref. */
   b->t2_funcref = -1;
   b->t2_attempted = 0;
+  b->t2_pending_attempts = 0; /* #794 async escalation */
+  b->t2_retry_at_hits = 0;    /* #794 async escalation */
+  b->t2_dispatches = 0;       /* #794 3b — de-escalation feedback */
+  b->t2_filled = 0;
   b->next = NULL;
   return b;
 }
@@ -572,7 +576,11 @@ static void ExecuteBlock(struct Machine *m, struct FbxTcBlock *b) {
       {
         static _Atomic(long) dbg_n = 0;
         long n = atomic_fetch_add_explicit(&dbg_n, 1, memory_order_relaxed);
-        if (n < 40) {
+        /* firebox#738: log ONLY the dangerous resumes — a mid-block resume
+         * (resume_idx != 0) means the T2 block committed a prefix before
+         * bailing, the exact double-commit window. Start-of-block resumes are
+         * sound and flood the trace. Also flag found=0 (scan miss). */
+        if ((resume_idx != 0 || !found) && n < 2000) {
           fprintf(stderr,
                   "[t735 resume] ip=%#llx start=%#llx end=%#llx nent=%u "
                   "resume_idx=%u found=%d e0_ip=%#llx\n",
@@ -654,13 +662,22 @@ static void ExecuteBlock(struct Machine *m, struct FbxTcBlock *b) {
   }
 
 post_tier1:
-  /* Tier 2 §6.4 escalation — opportunistically try to escalate AFTER
-   * the Tier 1 dispatch returns.  Cost is amortised: only triggers once
-   * per block (t2_attempted latches at success or failure), only when
-   * the block has been hit `FBX_T2_HOTNESS_THRESHOLD` times.  The
-   * escalation pipeline (lift → synth → instantiate) can fail at any
-   * step; on failure t2_attempted stays latched and we never try again. */
-  if (!b->t2_attempted && b->hits >= Fbxt2HotnessThreshold()) {
+  /* Tier 2 §6.4 escalation — opportunistically try to escalate AFTER the Tier 1
+   * dispatch returns.  Cost is amortised: only when the block has been hit
+   * `FBX_T2_HOTNESS_THRESHOLD` times, and (for a TERMINAL outcome) only once —
+   * t2_attempted latches at success or permanent failure.
+   *
+   * firebox#794 async escalation: a host that compiles in the background
+   * returns PENDING (not terminal), leaving t2_attempted clear so we re-attempt.
+   * The `b->hits >= b->t2_retry_at_hits` guard bounds the retry cadence:
+   * Fbxt2TryEscalate sets `t2_retry_at_hits = hits + FBX_T2_PENDING_RETRY_STRIDE`
+   * on each PENDING outcome, so a self-loop (dispatched once per iteration)
+   * polls every STRIDE hits instead of re-lifting on every one.  t2_retry_at_hits
+   * is 0 for a fresh block, so the FIRST attempt still fires exactly at the
+   * threshold; a synchronous host never returns PENDING, so the guard is inert
+   * there (the block latches terminal on the first attempt as before). */
+  if (!b->t2_attempted && b->hits >= Fbxt2HotnessThreshold() &&
+      b->hits >= b->t2_retry_at_hits) {
     Fbxt2TryEscalate(m, b);
   }
 }

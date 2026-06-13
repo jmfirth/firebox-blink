@@ -495,6 +495,113 @@ TEST(FbxWasmEmit, LeaSimpleSynth) {
   FreeTc(tc);
 }
 
+/* #778 — the SIB-index LEA form `lea dst, [base + index*scale + disp]` now
+ * emits INLINE (it previously bailed to Tier 1 via the #738 correct-or-refuse).
+ * The emit must ACCEPT (return 1) and produce a non-empty module: src2 carries
+ * the index greg, `scale` the SIB scale.  The TC carries the SIB-index rde so
+ * the coverage gate's mop-switch sees a real LEA. */
+TEST(FbxWasmEmit, LeaSibIndexSynth) {
+  struct FbxIrBlock ir;
+  struct FbxIrInst insts[2];
+  struct FbxTcBlock *tc;
+  struct FbxWasmBuffer out;
+  memset(&ir, 0, sizeof ir);
+  memset(insts, 0, sizeof insts);
+  insts[0].opcode = FBX_IR_OP_PC_MARK;
+  insts[0].imm = 0x5000;
+  insts[1].opcode = FBX_IR_OP_LEA;
+  insts[1].width = 8;
+  insts[1].dst_kind = FBX_IR_KIND_GREG;
+  insts[1].dst = 14; /* r14 — the hot strcmp dst */
+  insts[1].src1_kind = FBX_IR_KIND_GREG;
+  insts[1].src1 = 9; /* base = r9 */
+  insts[1].src2_kind = FBX_IR_KIND_GREG;
+  insts[1].src2 = 0; /* index = rax */
+  insts[1].scale = 1;
+  insts[1].imm = 0;
+  ir.insts = insts;
+  ir.ninsts = 2;
+  ir.nvregs = 0;
+  ir.start_pc = 0x5000;
+  ir.end_pc = 0x5004;
+  /* SIB-index rde: ModrmRm=4 (0x200) | Rexb | SibBase=1 ⇒ r9 base. */
+  tc = MakeTc(0x08D, 0x200ull | 000000002000ull | (1ull << 040), 0, 0, 0x5000,
+              4, FBX_TC_KIND_NORMAL);
+  fbx_wasm_buffer_init(&out);
+  ASSERT_EQ(1, fbx_ir_emit_wasm(&ir, tc, &out));
+  ASSERT_NE((i64)0, (i64)out.len);
+  fbx_wasm_buffer_free(&out);
+  FreeTc(tc);
+}
+
+/* #778 — scale 8 (`[base + index*8]`) emits inline too. */
+TEST(FbxWasmEmit, LeaSibIndexScale8Synth) {
+  struct FbxIrBlock ir;
+  struct FbxIrInst insts[2];
+  struct FbxTcBlock *tc;
+  struct FbxWasmBuffer out;
+  memset(&ir, 0, sizeof ir);
+  memset(insts, 0, sizeof insts);
+  insts[0].opcode = FBX_IR_OP_PC_MARK;
+  insts[0].imm = 0x5000;
+  insts[1].opcode = FBX_IR_OP_LEA;
+  insts[1].width = 8;
+  insts[1].dst_kind = FBX_IR_KIND_GREG;
+  insts[1].dst = 1;
+  insts[1].src1_kind = FBX_IR_KIND_GREG;
+  insts[1].src1 = 0;
+  insts[1].src2_kind = FBX_IR_KIND_GREG;
+  insts[1].src2 = 2;
+  insts[1].scale = 8;
+  insts[1].imm = 0x20;
+  ir.insts = insts;
+  ir.ninsts = 2;
+  ir.nvregs = 0;
+  ir.start_pc = 0x5000;
+  ir.end_pc = 0x5004;
+  /* ModrmRm=4 (SIB) | SibScale=3 ⇒ scale 8. */
+  tc = MakeTc(0x08D, 0x200ull | (3ull << 046), 0, 0x20, 0x5000, 4,
+              FBX_TC_KIND_NORMAL);
+  fbx_wasm_buffer_init(&out);
+  ASSERT_EQ(1, fbx_ir_emit_wasm(&ir, tc, &out));
+  ASSERT_NE((i64)0, (i64)out.len);
+  fbx_wasm_buffer_free(&out);
+  FreeTc(tc);
+}
+
+/* #778 — defense: a GREG index with an INVALID scale (not 1/2/4/8) must be
+ * REFUSED by the acceptance gate (the whole block fails → Tier 1).  Guards
+ * against a malformed IR slipping a bad shift into the emit. */
+TEST(FbxWasmEmit, LeaSibIndexBadScaleRefused) {
+  struct FbxIrBlock ir;
+  struct FbxIrInst insts[2];
+  struct FbxTcBlock *tc;
+  struct FbxWasmBuffer out;
+  memset(&ir, 0, sizeof ir);
+  memset(insts, 0, sizeof insts);
+  insts[0].opcode = FBX_IR_OP_PC_MARK;
+  insts[0].imm = 0x5000;
+  insts[1].opcode = FBX_IR_OP_LEA;
+  insts[1].width = 8;
+  insts[1].dst_kind = FBX_IR_KIND_GREG;
+  insts[1].dst = 1;
+  insts[1].src1_kind = FBX_IR_KIND_GREG;
+  insts[1].src1 = 0;
+  insts[1].src2_kind = FBX_IR_KIND_GREG;
+  insts[1].src2 = 2;
+  insts[1].scale = 3; /* invalid SIB scale */
+  ir.insts = insts;
+  ir.ninsts = 2;
+  ir.nvregs = 0;
+  ir.start_pc = 0x5000;
+  ir.end_pc = 0x5004;
+  tc = MakeTc(0x08D, 0x200ull, 0, 0, 0x5000, 4, FBX_TC_KIND_NORMAL);
+  fbx_wasm_buffer_init(&out);
+  EXPECT_EQ(0, fbx_ir_emit_wasm(&ir, tc, &out)); /* refused */
+  fbx_wasm_buffer_free(&out);
+  FreeTc(tc);
+}
+
 TEST(FbxWasmEmit, BranchTakenTerminator) {
   /* JMP rel — opcode 0xE9.  IR: PC_MARK + BRANCH_TAKEN. */
   struct FbxIrBlock ir;
@@ -1405,8 +1512,14 @@ TEST(FbxWasm599, IrVersionBumped) {
    * #677 (MOV r/m memory-form) re-bumps to 4 — the lifter now emits
    * FBX_IR_OP_LOAD / FBX_IR_OP_STORE for MOV 0x88/0x89/0x8A/0x8B in the
    * `[base+disp]` form (previously bailed out at mod != 3), so stale v3
-   * sidecars must invalidate. */
-  ASSERT_EQ(4u, (u32)FBX_IR_VERSION);
+   * sidecars must invalidate.
+   *
+   * #778 (inline SIB-index LEA) re-bumps to 5 — the lifter now emits the
+   * indexed LEA form (src2=GREG index + the `scale` field, previously
+   * bailed), and the offset-20 IR word (formerly `_pad2`) now carries the
+   * SIB scale, so stale v4 sidecars (which assumed it was always zero) must
+   * invalidate. */
+  ASSERT_EQ(5u, (u32)FBX_IR_VERSION);
 }
 
 TEST(FbxWasm599, FlagSynthDifferentOpKindProducesDifferentBytes) {

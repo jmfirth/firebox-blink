@@ -20,6 +20,19 @@
 #if CAN_64BIT && (defined(__APPLE__) || defined(__COSMOPOLITAN__))
 #define kSkew 0x088800000000
 #else
+// firebox#796: wasm64 keeps kSkew==0 (ToHost(va)==va, the pure linear identity
+// the emit + interpreter fast-paths assume). A non-zero kSkew to relocate the
+// guest above blink's own low memory was prototyped (512MB) and IS the cleaner
+// long-term separation, but it exercises blink's general (kSkew!=0) interpreter
+// address path, which has a latent wasm64 bug: a small kSkew turns a
+// double-/missing-ToHost into SILENT corruption (a huge native kSkew would OOB
+// immediately), surfacing as a guest `rip=0` fault on larger workloads. Tracked
+// as the kSkew-separation hardening follow-up; the robustness win this session
+// came from disabling guest ASLR (map.c), which was the actual intermittent-
+// crash root cause. Known residual at kSkew==0: blink's --stack-first C stack
+// [0,8MB) overlaps the guest ELF at 0x400000; harmless while blink's flat
+// interpreter loop keeps its C stack shallow (<3MB), which it does for the
+// workloads measured.
 #define kSkew 0x000000000000
 #endif
 
