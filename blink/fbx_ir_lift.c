@@ -326,6 +326,41 @@ static int EmitBailout(struct LiftCtx *ctx, u64 pc, int reason) {
   return 1;
 }
 
+/* firebox#CM4 — unconditional fall-through terminator.  Emitted when a Tier-1
+ * block ends WITHOUT a control-flow op (blink split the block mid-stream; it
+ * falls through to the next block at `target_pc`).  Lowers exactly like an
+ * `jmp target_pc`: the T2 block stores `m->ip = target_pc` and returns exit=0,
+ * so the dispatcher continues to the next block — identical to how Tier-1
+ * advances past a fall-through boundary. */
+static int EmitFallthroughBranch(struct LiftCtx *ctx, u64 target_pc) {
+  struct FbxIrInst *i = CtxEmit(ctx);
+  if (!i) return 0;
+  i->opcode = FBX_IR_OP_BRANCH_TAKEN;
+  i->imm = target_pc;
+  return 1;
+}
+
+/* True iff `op` is a block terminator that advances (or hands off) m->ip.  Used
+ * to detect a lifted block that fell off the end of its Tier-1 entries WITHOUT
+ * a terminator — the fbx_wasm_emit.h / EmitFunctionBody contract ("every lifted
+ * block ends with a terminator") must hold, else the emit's un-terminated
+ * fallback returns exit=0 without advancing m->ip and the guest re-dispatches
+ * the SAME block forever (firebox#CM4 wedge). */
+static int LiftOpIsTerminator(u8 op) {
+  switch (op) {
+    case FBX_IR_OP_BRANCH_TAKEN:
+    case FBX_IR_OP_BRANCH_COND:
+    case FBX_IR_OP_CALL_DIRECT:
+    case FBX_IR_OP_CALL_INDIRECT:
+    case FBX_IR_OP_RET:
+    case FBX_IR_OP_BAILOUT:
+    case FBX_IR_OP_CALL_HOST:
+      return 1;
+    default:
+      return 0;
+  }
+}
+
 /* ────────────────────────────────────────────────────────────────────────── */
 /* Per-opcode lifters for the top-10.                                         */
 /*                                                                            */
@@ -1223,6 +1258,9 @@ struct FbxIrBlock *fbx_ir_lift(const struct FbxTcBlock *tc) {
   struct LiftCtx ctx;
   struct FbxIrBlock *blk;
   u32 i;
+  /* firebox#CM4 — the PC after the last op we successfully lifted; the target
+   * of the synthetic fall-through terminator if the block ends unterminated. */
+  u64 fallthrough_pc = 0;
   if (!tc || tc->nentries == 0) return NULL;
   /* Thunk blocks stay on Tier 1 — refuse to lift.  Spec §6.5. */
   if (tc->entries[0].kind == FBX_TC_KIND_THUNK) return NULL;
@@ -1269,6 +1307,23 @@ struct FbxIrBlock *fbx_ir_lift(const struct FbxTcBlock *tc) {
       if (!EmitBailout(&ctx, e->ip, FBX_IR_BAILOUT_UNSUPPORTED)) goto fail;
       break;
     }
+    /* firebox#CM4 — record the fall-through PC (after this successfully-lifted,
+     * non-terminating op) in case the block ends here without a terminator. */
+    fallthrough_pc = next_pc;
+  }
+  /* firebox#CM4 — a Tier-1 block whose entries end WITHOUT a control-flow op
+   * (a fall-through — blink split the run mid-stream, e.g. `mov rdi,rax` as its
+   * own block) lifts to IR with NO terminator.  The emit's un-terminated
+   * fallback (fbx_ir_emit_wasm.c EmitFunctionBody) then returns exit=0 WITHOUT
+   * advancing m->ip, so the dispatcher re-enters the SAME block at the
+   * unchanged m->ip forever (100%-CPU guest-wasm wedge; blocked every elf-perf
+   * th=1 bench).  Restore the "every lifted block ends with a terminator"
+   * contract: append an explicit unconditional jump to the fall-through PC so
+   * the T2 block advances m->ip to end_pc and control continues to the next
+   * block — byte-for-byte the Tier-1 fall-through behaviour. */
+  if (ctx.ninsts > 0 &&
+      !LiftOpIsTerminator(ctx.insts[ctx.ninsts - 1].opcode)) {
+    if (!EmitFallthroughBranch(&ctx, fallthrough_pc)) goto fail;
   }
   /* Allocate the FbxIrBlock + a tightly-sized inst array. */
   blk = (struct FbxIrBlock *)calloc(1, sizeof *blk);

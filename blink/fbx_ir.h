@@ -148,8 +148,19 @@ extern "C" {
  *     latent width-4 register-write bug (32-bit writes now zero-extend, x86-64
  *     semantics) — see EmitRegSlotStore.  IMUL carries no flag synthesis;
  *     blocks where its flags are live at a reader refuse (correct-or-refuse).
- *     See work/tasks/794-* for the closure narrative. */
-#define FBX_IR_VERSION 6u
+ *     See work/tasks/794-* for the closure narrative.
+ * v7: #CM4 (correctness) — the lifter now appends an explicit BRANCH_TAKEN to
+ *     the fall-through PC when a Tier-1 block ends WITHOUT a control-flow op
+ *     (blink split the run mid-stream, so the block flows into the next at
+ *     end_pc).  Previously such a block lifted to a terminator-less IR; the
+ *     emit's un-terminated fallback returned exit=0 without advancing m->ip, so
+ *     the guest re-dispatched the SAME block forever (a 100%-CPU wasm wedge that
+ *     blocked every elf-perf th=1 bench — the wedge fired only once a hot
+ *     fall-through block escalated, which is why the default threshold=100 hid
+ *     it).  Fall-through blocks now produce NEW IR (the appended BRANCH_TAKEN),
+ *     so stale v6 sidecars/caches must invalidate cleanly.  See work/tasks/CM4-*
+ *     for the RCA + closure narrative. */
+#define FBX_IR_VERSION 7u
 
 /* ────────────────────────────────────────────────────────────────────────── */
 /* IR opcodes.                                                                */
