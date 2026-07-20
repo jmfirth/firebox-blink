@@ -185,6 +185,38 @@ TEST(FbxIrLift, MovEvqpGvqpMemForm) {
   FreeTc(tc);
 }
 
+TEST(FbxIrLift, FallthroughBlockGetsBranchTakenTerminator) {
+  /* firebox#CM4 (regression) — a Tier-1 block that ends WITHOUT a control-flow
+   * op (blink split the run mid-stream; the exact wedging shape was a lone
+   * `mov rdi,rax`, opcode 0x89 mod=3) MUST lift to IR whose LAST inst is an
+   * unconditional BRANCH_TAKEN to the fall-through PC (end_pc = ip + oplen), so
+   * the T2 block advances m->ip.  Before the fix the block ended in REG_SET
+   * (terminator-less); the emit's un-terminated fallback returned exit=0
+   * WITHOUT advancing m->ip, so the guest re-dispatched the SAME block forever
+   * (a 100%-CPU wasm wedge that blocked every elf-perf th=1 bench).  This test
+   * fails on the pre-fix lifter (last opcode == REG_SET). */
+  u64 ip = 0x4c2fff;
+  u8 oplen = 3;
+  struct FbxTcBlock *tc = MakeTc(0x089, LIFT_RDE_MOD3, 0, 0, ip, oplen,
+                                 FBX_TC_KIND_NORMAL);
+  struct FbxIrBlock *ir = fbx_ir_lift(tc);
+  const struct FbxIrInst *last;
+  ASSERT_NOTNULL(ir);
+  /* The mov itself still lifts (REG_GET + REG_SET), and the block is fully
+   * translated — it falls through, it does not bail. */
+  EXPECT_NE(0, BlockHas(ir, FBX_IR_OP_REG_GET));
+  EXPECT_NE(0, BlockHas(ir, FBX_IR_OP_REG_SET));
+  EXPECT_EQ(0, BlockHas(ir, FBX_IR_OP_BAILOUT));
+  /* Contract: every lifted block ends with a terminator. */
+  ASSERT_GE((i64)ir->ninsts, (i64)1);
+  last = &ir->insts[ir->ninsts - 1];
+  EXPECT_EQ((i64)FBX_IR_OP_BRANCH_TAKEN, (i64)last->opcode);
+  /* …targeting the fall-through PC (the PC after the last lifted op). */
+  EXPECT_EQ((i64)(ip + oplen), (i64)last->imm);
+  fbx_ir_free(ir);
+  FreeTc(tc);
+}
+
 TEST(FbxIrLift, MovGvqpEvqpRegForm) {
   /* opcode 0x8B, modrm.mod==3: MOV r64, r/m64 reg-to-reg form. */
   struct FbxTcBlock *tc = MakeTc(0x08B, LIFT_RDE_MOD3, 0, 0, 0x400000, 3,
