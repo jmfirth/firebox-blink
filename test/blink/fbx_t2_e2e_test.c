@@ -93,6 +93,8 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/wait.h>
+#include <unistd.h>
 
 /* ────────────────────────────────────────────────────────────────────────── */
 /* Synthetic Tier 2 engine.  STRONG overrides of the weak default stubs in    */
@@ -458,4 +460,78 @@ TEST(FbxT2E2e, ScenarioEDefaultHotnessThreshold) {
   unsetenv("FBX_T2_HOTNESS_THRESHOLD");
   Fbxt2ResetEnvCacheForTest();
   ASSERT_EQ(100, (i64)Fbxt2HotnessThreshold());
+}
+
+/* Scenario F — firebox#WTT: the ONE `FIREBOX_T2` grammar.
+ *
+ * The host reads this same variable through
+ * `firebox_paths::env_bool_strict` (crates/firebox-paths/src/lib.rs), and
+ * THIS TABLE IS A COPY OF THE ONE FROZEN THERE. It is duplicated on
+ * purpose: two independent readers of one user-facing variable is the
+ * shape of the defect, so the two tables must be readable side by side
+ * and must be edited together. Before #WTT, `banana`, `2`, `00`, `OFF`,
+ * `False` and ` 0 ` were OFF host-side and ON here — MEASURED, not
+ * inferred — and nothing reported the disagreement.
+ *
+ * `-1` in this table means "must refuse": an unrecognised value is an
+ * operator mistake, and it is refused rather than resolved, because the
+ * two sides' DEFAULTS differ by ruling (firebox#ZVJ: ON here, OFF for
+ * the host's legacy field) and so any value routed to "the default"
+ * diverges by construction. */
+static const struct {
+  const char *value; /* NULL = unset */
+  int expect;        /* 1 = on, 0 = off, -1 = refuse (exit 2) */
+} kFbxT2GrammarTable[] = {
+    {NULL, 1},      {"", 1},        {"0", 0},        {"1", 1},
+    {"banana", -1}, {"true", 1},    {"false", 0},    {"2", -1},
+    {"00", -1},     {"TRUE", 1},    {"OFF", 0},      {"False", 0},
+    {" 0 ", 0},     {" true ", 1},  {"yes", 1},      {"no", 0},
+    {"on", 1},      {"off", 0},     {"enabled", -1},
+};
+
+/* Read `Fbxt2Enabled()` in a CHILD, so a refusal (which exits) is
+ * observed as an exit status instead of killing the test binary.
+ * Returns 1 (on), 0 (off), or -1 (refused with status 2). */
+static int FbxT2EnabledInChild(const char *value) {
+  pid_t pid;
+  int ws;
+  pid = fork();
+  if (pid == 0) {
+    if (value) {
+      setenv("FIREBOX_T2", value, 1);
+    } else {
+      unsetenv("FIREBOX_T2");
+    }
+    Fbxt2ResetEnvCacheForTest();
+    _exit(Fbxt2Enabled() ? 10 : 11);
+  }
+  waitpid(pid, &ws, 0);
+  if (!WIFEXITED(ws)) return -2;
+  if (WEXITSTATUS(ws) == 10) return 1;
+  if (WEXITSTATUS(ws) == 11) return 0;
+  if (WEXITSTATUS(ws) == 2) return -1;
+  return -3;
+}
+
+TEST(FbxT2E2e, ScenarioFGrammarTableMatchesHost) {
+  size_t i;
+  int saw_on = 0;
+  int saw_off = 0;
+  int saw_refuse = 0;
+  for (i = 0; i < sizeof(kFbxT2GrammarTable) / sizeof(*kFbxT2GrammarTable);
+       ++i) {
+    int got = FbxT2EnabledInChild(kFbxT2GrammarTable[i].value);
+    ASSERT_EQ((i64)kFbxT2GrammarTable[i].expect, (i64)got);
+    if (got == 1) saw_on = 1;
+    if (got == 0) saw_off = 1;
+    if (got == -1) saw_refuse = 1;
+  }
+  /* Positive control. All three answers must actually occur: a parser
+   * that answered ON for everything would satisfy an agreement check
+   * just as well as a correct one. */
+  ASSERT_TRUE(saw_on);
+  ASSERT_TRUE(saw_off);
+  ASSERT_TRUE(saw_refuse);
+  unsetenv("FIREBOX_T2");
+  Fbxt2ResetEnvCacheForTest();
 }

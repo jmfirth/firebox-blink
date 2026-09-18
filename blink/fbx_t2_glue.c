@@ -140,14 +140,105 @@ u32 Fbxt2HotnessThreshold(void) {
   return g_t2_threshold;
 }
 
+/* ────────────────────────────────────────────────────────────────────────── */
+/* firebox#WTT — the ONE boolean grammar for `FIREBOX_*`, mirrored from      */
+/* crates/firebox-paths/src/lib.rs `classify_bool`.                          */
+/*                                                                            */
+/* This used to be a bare deny-list (`0|off|false|no`, case-SENSITIVE,        */
+/* untrimmed, default ON) while the host read the same variable through an    */
+/* allow-list (`1|true|yes|on`, case-INsensitive, trimmed, default OFF).      */
+/* Two complementary parsers agree on the eight recognised spellings and      */
+/* disagree on EVERY other string: MEASURED over 19 values, `banana`, `2`,    */
+/* `00`, `OFF`, `False`, ` 0 ` and `enabled` were OFF host-side and ON here,  */
+/* silently. Invariant 4 calls that silent divergence a regression, and the   */
+/* failure mode is the bad one — a mistyped kill-switch reads as ON.          */
+/*                                                                            */
+/* ASCII trim and ASCII case-folding, deliberately: the Rust half matches     */
+/* this exactly rather than using its Unicode-aware `trim`, because a         */
+/* grammar one side can express and the other cannot is the same defect       */
+/* wearing a rarer input.                                                     */
+/*                                                                            */
+/* UNSPECIFIED is kept distinct from OFF so each side can keep the default    */
+/* firebox#ZVJ ruled for it (ON here, OFF for the host's legacy field)        */
+/* WITHOUT either side resolving an unrecognised value into that default —    */
+/* which would reproduce the divergence, since the defaults are what differ.  */
+/* ────────────────────────────────────────────────────────────────────────── */
+
+enum FbxBoolEnv {
+  kFbxBoolUnspecified,
+  kFbxBoolOn,
+  kFbxBoolOff,
+  kFbxBoolInvalid,
+};
+
+static int FbxIsAsciiSpace(char c) {
+  return c == ' ' || c == '\t' || c == '\n' || c == '\v' || c == '\f' ||
+         c == '\r';
+}
+
+static enum FbxBoolEnv FbxClassifyBoolEnv(const char *raw) {
+  char buf[8];
+  const char *beg;
+  const char *end;
+  size_t n;
+  size_t i;
+  if (!raw) return kFbxBoolUnspecified;
+  beg = raw;
+  while (*beg && FbxIsAsciiSpace(*beg)) ++beg;
+  end = beg + strlen(beg);
+  while (end > beg && FbxIsAsciiSpace(end[-1])) --end;
+  n = (size_t)(end - beg);
+  if (!n) return kFbxBoolUnspecified;
+  /* Longer than the longest recognised spelling ("false"), so it cannot be
+     one — and must not silently fall through to a default. */
+  if (n >= sizeof(buf)) return kFbxBoolInvalid;
+  for (i = 0; i < n; ++i) {
+    char c = beg[i];
+    if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
+    buf[i] = c;
+  }
+  buf[n] = '\0';
+  if (!strcmp(buf, "1") || !strcmp(buf, "true") || !strcmp(buf, "yes") ||
+      !strcmp(buf, "on")) {
+    return kFbxBoolOn;
+  }
+  if (!strcmp(buf, "0") || !strcmp(buf, "false") || !strcmp(buf, "no") ||
+      !strcmp(buf, "off")) {
+    return kFbxBoolOff;
+  }
+  return kFbxBoolInvalid;
+}
+
 bool Fbxt2Enabled(void) {
   if (!g_t2_enabled_cached) {
     const char *e = getenv("FIREBOX_T2");
     g_t2_enabled_cached = 1;
-    if (e && *e) {
-      if (!strcmp(e, "0") || !strcmp(e, "off") ||
-          !strcmp(e, "false") || !strcmp(e, "no")) {
+    switch (FbxClassifyBoolEnv(e)) {
+      case kFbxBoolOn:
+        g_t2_enabled = true;
+        break;
+      case kFbxBoolOff:
         g_t2_enabled = false;
+        break;
+      case kFbxBoolUnspecified:
+        /* firebox#ZVJ, ruled 2026-07-27: Tier 2 is default-ON. */
+        break;
+      case kFbxBoolInvalid: {
+        /* Refuse loudly. The host half (`firebox_paths::env_bool_strict`)
+           writes the same sentence and exits with the same status; a
+           silent pick here would be a false success either way, and a
+           warning-only line is how this family of no-ops survived before
+           (firebox#617, firebox#ZVJ). */
+        char msg[256];
+        int len = snprintf(msg, sizeof(msg),
+                           "firebox: FIREBOX_T2=%s is not a recognized boolean "
+                           "value (expected 1/true/yes/on or 0/false/no/off)\n",
+                           e);
+        if (len > 0) {
+          (void)write(2, msg, (size_t)(len < (int)sizeof(msg) ? len
+                                                              : (int)sizeof(msg) - 1));
+        }
+        exit(2);
       }
     }
   }
