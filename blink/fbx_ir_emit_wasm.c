@@ -499,9 +499,39 @@ static int CoverageGate(const struct FbxIrBlock *ir,
    * computation → refuse the block so Tier 1 runs it (correct-or-refuse, the
    * #677/#735 pattern).  When a real flag-writer (add/sub/and/or/xor/cmp/test)
    * follows the imul before the reader — the hot-loop shape `imul…dec;jnz` —
-   * imul's dead flags never matter and the block escalates.  (Flag-reader-free
+   * imul's dead flags never matter and the block escalates.
+   *
+   * firebox#3XY — the original parenthetical here read "(Flag-reader-free
    * blocks elide all SET_FLAGS_RAW anyway, so imul is no worse than the
-   * existing dead-flag-elision model there; nothing to gate.) */
+   * existing dead-flag-elision model there; nothing to gate.)"  That is the
+   * SAME premise #NRR withdrew one function over: a block boundary is not a
+   * reader.  It is wrong twice.
+   *
+   *   1. It was never true for correctness, only for parity with another bug.
+   *      m->flags outlives the block; a successor's `jo`/`jc`/`js` reads the
+   *      shadow whether or not this block contains a reader.  IMUL synthesizes
+   *      NO flags, so after `imul rax,rbx; <fallthrough>` the shadow holds
+   *      whatever the PREDECESSOR left — a value imul never wrote, where Tier 1
+   *      would have written imul's own CF/OF.  MEASURED pre-fix: that block
+   *      emitted 205 bytes with zero SET_FLAGS_RAW and no flag commit, while
+   *      the in-block control `imul; je` correctly refused.
+   *
+   *   2. Post-#NRR the parity it appealed to is gone, and the residue is worse
+   *      than a stale read.  `sub rax,rbx; imul rax,rbx; <fallthrough>` now
+   *      COMMITS the SUB's flags at block end — an active write of a wrong
+   *      value, freshly stamped, that no longer even looks stale.
+   *
+   * So block end IS a reader.  The scan below refuses when the pending shadow
+   * survives the loop, whatever the terminator (BRANCH_TAKEN, CALL_DIRECT, RET,
+   * BAILOUT, or none).  This costs Tier-2 coverage on straight-line blocks whose
+   * LAST flag-definer is an imul — an unmeasured loss, and deliberately paid:
+   * correct-or-refuse hands those to Tier 1, which computes imul's flags
+   * eagerly and correctly.  The hot-loop shape is untouched — a real flag-writer
+   * after the imul still clears the shadow and the block still escalates.
+   *
+   * The permanent close is flag synthesis for IMUL (CF/OF from full-product
+   * overflow), which needs a 128-bit-product decomposition in wasm and is a
+   * larger increment than this refuse. */
   {
     int imul_flags_pending = 0;
     for (i = 0; i < ir->ninsts; ++i) {
@@ -516,6 +546,12 @@ static int CoverageGate(const struct FbxIrBlock *ir,
           return 0;
         }
       }
+    }
+    /* firebox#3XY — block end is a reader. */
+    if (imul_flags_pending) {
+      SetFail(fail, FBX_IR_EMIT_IMUL_FLAGS_LIVE,
+              ir->ninsts ? ir->insts[ir->ninsts - 1].opcode : FBX_IR_OP_IMUL);
+      return 0;
     }
   }
 

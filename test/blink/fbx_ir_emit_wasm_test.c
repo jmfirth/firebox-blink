@@ -922,6 +922,133 @@ TEST(FbxWasmNrr, FlagFreeFallthroughBlockIsUnchanged) {
   FreeTc(tc);
 }
 
+/* ── firebox#3XY — IMUL flag-liveness at the BLOCK BOUNDARY ──────────────── */
+/* #794 refused `imul` only at an IN-BLOCK reader.  Its own comment argued the
+ * reader-free case was safe because such blocks elided all flags anyway — the
+ * same "a block boundary is not a reader" premise #NRR withdrew, and #NRR's fix
+ * cannot close it because IMUL produces no SET_FLAGS_RAW to conserve.  The
+ * refuse now also fires when the imul shadow survives to the block end.
+ * #794 shipped with no IMUL test at all; these are the first. */
+
+/* `imul rax, rbx` (0F AF /r), reg-form, then whatever the caller appends. */
+#define MOP_IMUL 0x1af
+
+static int Fbx3xyEmits(struct FbxTcBlock *tc, u8 *last_op, u32 *nsfr) {
+  struct FbxIrBlock *ir = fbx_ir_lift(tc);
+  struct FbxWasmBuffer out;
+  int ok;
+  if (!ir) return -1;
+  *last_op = ir->ninsts ? ir->insts[ir->ninsts - 1].opcode : 0;
+  *nsfr = NrrCountOp(ir, FBX_IR_OP_SET_FLAGS_RAW);
+  fbx_wasm_buffer_init(&out);
+  ok = fbx_ir_emit_wasm(ir, tc, &out);
+  fbx_wasm_buffer_free(&out);
+  fbx_ir_free(ir);
+  return ok;
+}
+
+TEST(FbxWasm3xy, ImulFallthroughRefusesBecauseBlockEndIsAReader) {
+  /* THE #3XY CASE.  `imul rax, rbx` alone; #CM4 appends the synthesized
+   * BRANCH_TAKEN.  No in-block reader, so #794's scan never fired; IMUL writes
+   * no flags, so the block committed none.  The successor's `jo`/`jc`/`js` then
+   * read a shadow imul never wrote, where Tier 1 writes imul's own CF/OF.
+   * MEASURED pre-fix: 205 bytes, zero SET_FLAGS_RAW, no flag commit. */
+  struct FbxTcBlock *tc = MakeTc(MOP_IMUL, RDE_MOD3, 0, 0, 0x10000, 3,
+                                 FBX_TC_KIND_NORMAL);
+  u8 last_op = 0;
+  u32 nsfr = 0;
+  int ok = Fbx3xyEmits(tc, &last_op, &nsfr);
+  ASSERT_NE(-1, ok);                                  /* control: it lifts */
+  ASSERT_EQ(0u, nsfr);                  /* IMUL synthesizes nothing to commit */
+  ASSERT_EQ(FBX_IR_OP_BRANCH_TAKEN, last_op);
+  ASSERT_EQ(0, ok);                                            /* REFUSED */
+  FreeTc(tc);
+}
+
+TEST(FbxWasm3xy, ImulBeforeExplicitJmpAndCallAlsoRefuse) {
+  /* Same fail-open reached by the two terminators #NRR found uncovered.  A
+   * `call` does not write EFLAGS, so the callee's entry reads the same shadow. */
+  u64 mops_jmp[2] = {MOP_IMUL, 0x0eb};
+  u64 mops_call[2] = {MOP_IMUL, 0x0e8};
+  u64 rdes[2] = {RDE_MOD3, 0};
+  u64 uimm0s[2] = {0, 0};
+  i64 disps_jmp[2] = {0, 0x10};
+  i64 disps_call[2] = {0, 0x40};
+  u64 ips[2] = {0x10000, 0x10003};
+  u8 oplens_jmp[2] = {3, 2};
+  u8 oplens_call[2] = {3, 5};
+  struct FbxTcBlock *tc;
+  u8 last_op = 0;
+  u32 nsfr = 0;
+  tc = MakeTcN(mops_jmp, rdes, uimm0s, disps_jmp, ips, oplens_jmp, 2);
+  ASSERT_EQ(0, Fbx3xyEmits(tc, &last_op, &nsfr));
+  ASSERT_EQ(FBX_IR_OP_BRANCH_TAKEN, last_op);
+  FreeTc(tc);
+  tc = MakeTcN(mops_call, rdes, uimm0s, disps_call, ips, oplens_call, 2);
+  ASSERT_EQ(0, Fbx3xyEmits(tc, &last_op, &nsfr));
+  ASSERT_EQ(FBX_IR_OP_CALL_DIRECT, last_op);
+  FreeTc(tc);
+}
+
+TEST(FbxWasm3xy, SetFlagsRawBeforeImulDoesNotClearTheShadow) {
+  /* ORDER test, and the case #NRR made WORSE rather than merely stale.
+   * `sub rax, rbx; imul rax, rbx` carries one SET_FLAGS_RAW, so post-#NRR the
+   * block now COMMITS the SUB's flags at block end — an active write of a wrong
+   * value, freshly stamped, after the imul redefined CF/OF.  The scan must be
+   * order-sensitive: only a flag-writer AFTER the imul clears it. */
+  u64 mops[2] = {0x029, MOP_IMUL};
+  u64 rdes[2] = {RDE_MOD3, RDE_MOD3};
+  u64 uimm0s[2] = {0, 0};
+  i64 disps[2] = {0, 0};
+  u64 ips[2] = {0x10000, 0x10003};
+  u8 oplens[2] = {3, 3};
+  struct FbxTcBlock *tc = MakeTcN(mops, rdes, uimm0s, disps, ips, oplens, 2);
+  u8 last_op = 0;
+  u32 nsfr = 0;
+  ASSERT_EQ(0, Fbx3xyEmits(tc, &last_op, &nsfr));               /* REFUSED */
+  ASSERT_EQ(1u, nsfr);           /* and it had a live commit to get wrong */
+  FreeTc(tc);
+}
+
+TEST(FbxWasm3xy, ImulFollowedByARealFlagWriterStillEmits) {
+  /* CONSERVATISM BOUND, and the positive control for the three refuses above:
+   * `imul rax, rbx; sub rax, rbx` is the hot-loop shape #794 deliberately keeps
+   * on Tier 2.  The SUB's SET_FLAGS_RAW is what the successor reads, so imul's
+   * dead flags never matter.  If this refuses, #3XY over-refused and the whole
+   * `imul…dec;jnz` class fell back to Tier 1. */
+  u64 mops[2] = {MOP_IMUL, 0x029};
+  u64 rdes[2] = {RDE_MOD3, RDE_MOD3};
+  u64 uimm0s[2] = {0, 0};
+  i64 disps[2] = {0, 0};
+  u64 ips[2] = {0x10000, 0x10003};
+  u8 oplens[2] = {3, 3};
+  struct FbxTcBlock *tc = MakeTcN(mops, rdes, uimm0s, disps, ips, oplens, 2);
+  u8 last_op = 0;
+  u32 nsfr = 0;
+  ASSERT_EQ(1, Fbx3xyEmits(tc, &last_op, &nsfr));                /* EMITS */
+  ASSERT_EQ(1u, nsfr);
+  ASSERT_EQ(FBX_IR_OP_BRANCH_TAKEN, last_op);
+  FreeTc(tc);
+}
+
+TEST(FbxWasm3xy, ImulWithInBlockReaderStillRefuses) {
+  /* #794's original arm, unchanged — it is the control that proves the probe
+   * can observe a refuse at all, and that #3XY widened the rule without
+   * disturbing it. */
+  u64 mops[2] = {MOP_IMUL, 0x074};
+  u64 rdes[2] = {RDE_MOD3, 0};
+  u64 uimm0s[2] = {0, 0};
+  i64 disps[2] = {0, 0x10};
+  u64 ips[2] = {0x10000, 0x10003};
+  u8 oplens[2] = {3, 2};
+  struct FbxTcBlock *tc = MakeTcN(mops, rdes, uimm0s, disps, ips, oplens, 2);
+  u8 last_op = 0;
+  u32 nsfr = 0;
+  ASSERT_EQ(0, Fbx3xyEmits(tc, &last_op, &nsfr));
+  ASSERT_EQ(FBX_IR_OP_BRANCH_COND, last_op);
+  FreeTc(tc);
+}
+
 TEST(FbxWasmEmit, RefusesMalformedSetFlagsRawWithBranchCond) {
   /* #599 (v2): SET_FLAGS_RAW followed by BRANCH_COND now synthesizes
    * end-to-end IFF the SET_FLAGS_RAW carries the v2 IR encoding
@@ -1704,8 +1831,14 @@ TEST(FbxWasm599, IrVersionBumped) {
    * in-block liveness test authorizing a cross-block drop), so every block with
    * a SET_FLAGS_RAW and no in-block flag-reader now emits one AluFlags sequence
    * where it previously emitted none.  Emit semantics flipped for a whole block
-   * class, so stale v7 sidecars must invalidate. */
-  ASSERT_EQ(8u, (u32)FBX_IR_VERSION);
+   * class, so stale v7 sidecars must invalidate.
+   *
+   * #3XY re-bumps to 9 — #794's IMUL flag-liveness refuse now also fires when
+   * the imul shadow survives to the BLOCK END, not just at an in-block reader.
+   * Emit flipped from synthesize to refuse for a whole block class (any block
+   * whose last flag-definer is an IMUL), so stale v8 sidecars must invalidate
+   * rather than serve the fail-open wasm they already hold. */
+  ASSERT_EQ(9u, (u32)FBX_IR_VERSION);
 }
 
 TEST(FbxWasm599, FlagSynthDifferentOpKindProducesDifferentBytes) {

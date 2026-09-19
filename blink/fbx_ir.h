@@ -174,8 +174,28 @@ extern "C" {
  *     sequence (SetFlagsRawIsLive, already cross-block-correct, drops all but
  *     the last).  Bumped on the v2/v3 precedent: emit semantics flipped for a
  *     whole block class, so stale v7 sidecars must invalidate rather than
- *     hit-on-stale.  See work/tasks/NRR-* for the closure narrative. */
-#define FBX_IR_VERSION 8u
+ *     hit-on-stale.  See work/tasks/NRR-* for the closure narrative.
+ * v9: #3XY (CORRECTNESS) — the SECOND instance of the same premise, one
+ *     function over from #NRR's and NOT closed by it.  #794's IMUL
+ *     flag-liveness refuse fired only at an IN-BLOCK reader, on the argument
+ *     that reader-free blocks elided all flags anyway; that is "a block
+ *     boundary is not a reader" again.  IMUL synthesizes NO flags, so there is
+ *     no SET_FLAGS_RAW for #NRR's conservation to carry — different mechanism,
+ *     same hole: `imul rax,rbx; <fallthrough>` emitted with no flag commit and
+ *     the successor's `jo`/`jc`/`js` read a shadow imul never wrote (MEASURED:
+ *     205 bytes, zero SET_FLAGS_RAW).  Worse after v8: `sub; imul;
+ *     <fallthrough>` now COMMITS the SUB's flags at block end — a wrong value
+ *     actively written rather than merely stale.  The refuse now also fires
+ *     when the imul shadow survives to the block END, whatever the terminator.
+ *     The IR shape and the LIFTER are unchanged; what changes is the EMIT for
+ *     every block whose last flag-definer is an IMUL — previously synthesized,
+ *     now refused to Tier 1, which computes imul's flags eagerly and correctly.
+ *     Bumped on the v8 precedent: emit semantics flipped for a whole block
+ *     class, so stale v8 sidecars must invalidate rather than serve the
+ *     fail-open wasm they already hold.  Costs Tier-2 coverage on straight-line
+ *     imul blocks (unmeasured, and deliberately paid); the permanent close is
+ *     IMUL flag synthesis, a larger increment.  See work/tasks/3XY-* . */
+#define FBX_IR_VERSION 9u
 
 /* ────────────────────────────────────────────────────────────────────────── */
 /* IR opcodes.                                                                */
