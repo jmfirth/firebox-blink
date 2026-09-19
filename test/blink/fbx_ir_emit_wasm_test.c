@@ -718,21 +718,28 @@ TEST(FbxWasmEmit, RefusesBranchCondJP) {
   FreeTc(tc);
 }
 
-TEST(FbxWasmEmit, SetFlagsRawAcceptedWhenNoReader) {
-  /* §13.5 — SET_FLAGS_RAW is now a benign semantic marker (dropped at emit
-   * time) when no flag-reader (BRANCH_COND / GET_FLAG) follows in the
-   * block.  This is the dead-flag-elision path that unblocks straight-line
-   * ALU code with implicit flag side-effects.  The synthesis pass treats
-   * the marker as a no-op; the runtime semantics are preserved because no
-   * subsequent IR inst observes the flag-shadow.
+TEST(FbxWasmEmit, MalformedSetFlagsRawRefusedEvenWithNoReader) {
+  /* firebox#NRR.  This test used to be `SetFlagsRawAcceptedWhenNoReader` and
+   * asserted 1: under the §13.5 whole-block dead-flag elision a reader-free
+   * block dropped every SET_FLAGS_RAW, so a MALFORMED one (legacy v1 shape,
+   * no operand vregs) was accepted because it was never emitted.
    *
-   * Pre-§13.5 this returned 0 (refused); the test name was
-   * `RefusesSetFlagsRaw`.  The shift is intentional + documented in
-   * #596's measurement.md (§"What §13.5's lift+emit need to cover"). */
+   * #NRR removed the whole-block elision — it was an in-block liveness test
+   * authorizing a cross-block drop; m->flags outlives the block and no exit
+   * path re-executes the dropped op.  A reader-free SET_FLAGS_RAW now reaches
+   * EmitFlagsAfterAlu, whose `default:` arm answers an unrecognized op_kind
+   * with an i64.and — a silently WRONG flags computation.  So the encoding
+   * validation had to widen out of its `if (saw_flag_reader)` guard, and this
+   * block must now REFUSE (correct-or-refuse: Tier 1 runs it).
+   *
+   * Note the guard was already too narrow before #NRR: a reader-free block
+   * containing RET / PUSH / POP / BAILOUT got needs_scratch == 1 from those
+   * arms and emitted unvalidated flags. */
   struct FbxIrBlock ir;
   struct FbxIrInst insts[1];
   struct FbxTcBlock *tc;
   struct FbxWasmBuffer out;
+  enum FbxIrEmitFailReason reason = FBX_IR_EMIT_OK;
   memset(&ir, 0, sizeof ir);
   memset(insts, 0, sizeof insts);
   insts[0].opcode = FBX_IR_OP_SET_FLAGS_RAW;
@@ -740,9 +747,178 @@ TEST(FbxWasmEmit, SetFlagsRawAcceptedWhenNoReader) {
   ir.ninsts = 1;
   tc = MakeTc(0x001, RDE_MOD3, 0, 0, 0x9000, 3, FBX_TC_KIND_NORMAL);
   fbx_wasm_buffer_init(&out);
-  ASSERT_EQ(1, fbx_ir_emit_wasm(&ir, tc, &out));
-  ASSERT_NE((i64)0, (i64)out.len);
+  ASSERT_EQ(0, fbx_ir_emit_wasm_with_reason(&ir, tc, &out, &reason, NULL));
+  ASSERT_EQ((i64)FBX_IR_EMIT_SET_FLAGS_RAW_BAD, (i64)reason);
   fbx_wasm_buffer_free(&out);
+  FreeTc(tc);
+}
+
+/* ────────────────────────────────────────────────────────────────────────── */
+/* firebox#NRR — the flag shadow outlives the block.                          */
+/*                                                                            */
+/* Discriminator shape, self-controlled: emit a lifted block, then emit the    */
+/* SAME block with its SET_FLAGS_RAW instructions spliced OUT, and compare     */
+/* lengths.  If the emitter commits the flags, the two differ; if it drops     */
+/* them (the pre-#NRR whole-block elision), they are byte-identical.  The      */
+/* splice is the positive control: it guarantees the delta can only come from  */
+/* the SET_FLAGS_RAW, and it makes the test independent of every other emit    */
+/* size in the file.                                                          */
+/* ────────────────────────────────────────────────────────────────────────── */
+
+/* Emit `ir` with every SET_FLAGS_RAW removed.  Returns the emitted length, or
+ * 0 if the emit refused. */
+static size_t EmitLenWithoutSetFlagsRaw(const struct FbxIrBlock *ir,
+                                        const struct FbxTcBlock *tc) {
+  struct FbxIrBlock stripped;
+  struct FbxIrInst *insts;
+  struct FbxWasmBuffer out;
+  size_t len = 0;
+  u32 i, n = 0;
+  insts = (struct FbxIrInst *)calloc(ir->ninsts ? ir->ninsts : 1,
+                                     sizeof(struct FbxIrInst));
+  for (i = 0; i < ir->ninsts; ++i) {
+    if (ir->insts[i].opcode == FBX_IR_OP_SET_FLAGS_RAW) continue;
+    insts[n++] = ir->insts[i];
+  }
+  stripped = *ir;
+  stripped.insts = insts;
+  stripped.ninsts = n;
+  fbx_wasm_buffer_init(&out);
+  if (fbx_ir_emit_wasm(&stripped, tc, &out)) len = out.len;
+  fbx_wasm_buffer_free(&out);
+  free(insts);
+  return len;
+}
+
+/* Count SET_FLAGS_RAW / flag-readers in a lifted block. */
+static u32 NrrCountOp(const struct FbxIrBlock *ir, u8 opcode) {
+  u32 i, n = 0;
+  for (i = 0; i < ir->ninsts; ++i) {
+    if (ir->insts[i].opcode == opcode) ++n;
+  }
+  return n;
+}
+
+TEST(FbxWasmNrr, FallthroughBlockCommitsFlagsForItsSuccessor) {
+  /* THE #NRR CASE, and after #CM4 the common one: a lone `cmp rax, rbx` that
+   * blink split mid-stream.  The lifter appends a synthesized BRANCH_TAKEN
+   * (EmitFallthroughBranch, #CM4 / FBX_IR_VERSION 7), so the block has a
+   * SET_FLAGS_RAW, NO in-block reader, and a terminator the pre-#NRR
+   * BlockNeedsScratchLocals did not enumerate → needs_scratch == 0 → the CMP
+   * the NEXT block's Jcc branches on was dropped.  Nothing re-runs it: the
+   * block exits and Tier 1 resumes at the next PC. */
+  struct FbxTcBlock *tc = MakeTc(0x039, RDE_MOD3, 0, 0, 0x10000, 3,
+                                 FBX_TC_KIND_NORMAL);
+  struct FbxIrBlock *ir = fbx_ir_lift(tc);
+  struct FbxWasmBuffer out;
+  size_t without;
+  ASSERT_NOTNULL(ir);
+  ASSERT_EQ(1u, NrrCountOp(ir, FBX_IR_OP_SET_FLAGS_RAW));
+  ASSERT_EQ(0u, NrrCountOp(ir, FBX_IR_OP_BRANCH_COND));
+  ASSERT_EQ(0u, NrrCountOp(ir, FBX_IR_OP_GET_FLAG));
+  ASSERT_EQ(FBX_IR_OP_BRANCH_TAKEN, ir->insts[ir->ninsts - 1].opcode);
+  fbx_wasm_buffer_init(&out);
+  ASSERT_EQ(1, fbx_ir_emit_wasm(ir, tc, &out));
+  without = EmitLenWithoutSetFlagsRaw(ir, tc);
+  ASSERT_NE((i64)0, (i64)without);          /* control: the strip still emits */
+  ASSERT_NE((i64)without, (i64)out.len);    /* the flags are COMMITTED */
+  fbx_wasm_buffer_free(&out);
+  fbx_ir_free(ir);
+  FreeTc(tc);
+}
+
+TEST(FbxWasmNrr, CallDirectBlockCommitsFlagsForItsSuccessor) {
+  /* CALL_DIRECT was the SECOND uncovered terminator.  The pre-#NRR comment in
+   * BlockNeedsScratchLocals read "CALL_DIRECT does NOT need scratch" — true
+   * about scratch locals, and exactly the conflation that made the predicate
+   * wrong.  Real x86 `call` does not write EFLAGS, so `cmp; call f` with a
+   * flag-reader at f's entry elided identically to the jmp case. */
+  u64 mops[2] = {0x039, 0x0e8};
+  u64 rdes[2] = {RDE_MOD3, 0};
+  u64 uimm0s[2] = {0, 0};
+  i64 disps[2] = {0, 0x40};
+  u64 ips[2] = {0x10000, 0x10003};
+  u8 oplens[2] = {3, 5};
+  struct FbxTcBlock *tc = MakeTcN(mops, rdes, uimm0s, disps, ips, oplens, 2);
+  struct FbxIrBlock *ir = fbx_ir_lift(tc);
+  struct FbxWasmBuffer out;
+  size_t without;
+  ASSERT_NOTNULL(ir);
+  ASSERT_EQ(1u, NrrCountOp(ir, FBX_IR_OP_SET_FLAGS_RAW));
+  ASSERT_EQ(0u, NrrCountOp(ir, FBX_IR_OP_BRANCH_COND));
+  ASSERT_EQ(FBX_IR_OP_CALL_DIRECT, ir->insts[ir->ninsts - 1].opcode);
+  fbx_wasm_buffer_init(&out);
+  ASSERT_EQ(1, fbx_ir_emit_wasm(ir, tc, &out));
+  without = EmitLenWithoutSetFlagsRaw(ir, tc);
+  ASSERT_NE((i64)0, (i64)without);
+  ASSERT_NE((i64)without, (i64)out.len);
+  fbx_wasm_buffer_free(&out);
+  fbx_ir_free(ir);
+  FreeTc(tc);
+}
+
+TEST(FbxWasmNrr, OnlyTheLastSetFlagsRawSurvivesInAReaderFreeBlock) {
+  /* The conservatism bound.  #NRR withdraws the WHOLE-BLOCK drop, not the
+   * per-instruction one: SetFlagsRawIsLive (#794) is already cross-block
+   * correct — it keeps the LAST SET_FLAGS_RAW because a next block may read
+   * it, and drops any earlier one a later in-block SET_FLAGS_RAW provably
+   * overwrites first.  So `add; sub; <fallthrough>` has TWO SET_FLAGS_RAW and
+   * must cost exactly ONE AluFlags sequence — the same delta as the
+   * single-SET_FLAGS_RAW block above.  If this ever asserts unequal, the
+   * elision has regressed to per-op flag materialization, which #794 measured
+   * as the dominant cost of a flag-reading loop. */
+  u64 mops2[2] = {0x001, 0x029};
+  u64 rdes2[2] = {RDE_MOD3, RDE_MOD3};
+  u64 uimm0s2[2] = {0, 0};
+  i64 disps2[2] = {0, 0};
+  u64 ips2[2] = {0x10000, 0x10003};
+  u8 oplens2[2] = {3, 3};
+  struct FbxTcBlock *tc2 = MakeTcN(mops2, rdes2, uimm0s2, disps2, ips2,
+                                   oplens2, 2);
+  struct FbxIrBlock *ir2 = fbx_ir_lift(tc2);
+  struct FbxTcBlock *tc1 = MakeTc(0x039, RDE_MOD3, 0, 0, 0x10000, 3,
+                                  FBX_TC_KIND_NORMAL);
+  struct FbxIrBlock *ir1 = fbx_ir_lift(tc1);
+  struct FbxWasmBuffer o1, o2;
+  size_t d1, d2;
+  ASSERT_NOTNULL(ir1);
+  ASSERT_NOTNULL(ir2);
+  ASSERT_EQ(2u, NrrCountOp(ir2, FBX_IR_OP_SET_FLAGS_RAW));
+  ASSERT_EQ(0u, NrrCountOp(ir2, FBX_IR_OP_BRANCH_COND));
+  fbx_wasm_buffer_init(&o1);
+  fbx_wasm_buffer_init(&o2);
+  ASSERT_EQ(1, fbx_ir_emit_wasm(ir1, tc1, &o1));
+  ASSERT_EQ(1, fbx_ir_emit_wasm(ir2, tc2, &o2));
+  d1 = o1.len - EmitLenWithoutSetFlagsRaw(ir1, tc1);
+  d2 = o2.len - EmitLenWithoutSetFlagsRaw(ir2, tc2);
+  ASSERT_NE((i64)0, (i64)d1);
+  ASSERT_EQ((i64)d1, (i64)d2); /* two SET_FLAGS_RAW, one AluFlags sequence */
+  fbx_wasm_buffer_free(&o1);
+  fbx_wasm_buffer_free(&o2);
+  fbx_ir_free(ir1);
+  fbx_ir_free(ir2);
+  FreeTc(tc1);
+  FreeTc(tc2);
+}
+
+TEST(FbxWasmNrr, FlagFreeFallthroughBlockIsUnchanged) {
+  /* Confinement control.  A block with NO SET_FLAGS_RAW and the same
+   * synthesized BRANCH_TAKEN terminator must be untouched by #NRR — the fix
+   * withdraws a liveness claim, it does not force scratch locals on every
+   * block.  `mov rdi, rax` is the shape #CM4's own comment names. */
+  struct FbxTcBlock *tc = MakeTc(0x089, RDE_MOD3, 0, 0, 0x10000, 3,
+                                 FBX_TC_KIND_NORMAL);
+  struct FbxIrBlock *ir = fbx_ir_lift(tc);
+  struct FbxWasmBuffer out;
+  ASSERT_NOTNULL(ir);
+  ASSERT_EQ(0u, NrrCountOp(ir, FBX_IR_OP_SET_FLAGS_RAW));
+  ASSERT_EQ(FBX_IR_OP_BRANCH_TAKEN, ir->insts[ir->ninsts - 1].opcode);
+  fbx_wasm_buffer_init(&out);
+  ASSERT_EQ(1, fbx_ir_emit_wasm(ir, tc, &out));
+  /* Stripping a SET_FLAGS_RAW that isn't there must be a no-op. */
+  ASSERT_EQ((i64)out.len, (i64)EmitLenWithoutSetFlagsRaw(ir, tc));
+  fbx_wasm_buffer_free(&out);
+  fbx_ir_free(ir);
   FreeTc(tc);
 }
 
@@ -1518,8 +1694,18 @@ TEST(FbxWasm599, IrVersionBumped) {
    * indexed LEA form (src2=GREG index + the `scale` field, previously
    * bailed), and the offset-20 IR word (formerly `_pad2`) now carries the
    * SIB scale, so stale v4 sidecars (which assumed it was always zero) must
-   * invalidate. */
-  ASSERT_EQ(5u, (u32)FBX_IR_VERSION);
+   * invalidate.
+   *
+   * #794 re-bumps to 6, #CM4 re-bumps to 7 — NEITHER updated this assertion,
+   * so this guard sat RED and unnoticed for two bumps (blink's unit tests need
+   * GNU make, which is not on every dev box).  Corrected here.
+   *
+   * #NRR re-bumps to 8 — the §599 whole-block dead-flag elision is removed (an
+   * in-block liveness test authorizing a cross-block drop), so every block with
+   * a SET_FLAGS_RAW and no in-block flag-reader now emits one AluFlags sequence
+   * where it previously emitted none.  Emit semantics flipped for a whole block
+   * class, so stale v7 sidecars must invalidate. */
+  ASSERT_EQ(8u, (u32)FBX_IR_VERSION);
 }
 
 TEST(FbxWasm599, FlagSynthDifferentOpKindProducesDifferentBytes) {

@@ -159,8 +159,23 @@ extern "C" {
  *     fall-through block escalated, which is why the default threshold=100 hid
  *     it).  Fall-through blocks now produce NEW IR (the appended BRANCH_TAKEN),
  *     so stale v6 sidecars/caches must invalidate cleanly.  See work/tasks/CM4-*
- *     for the RCA + closure narrative. */
-#define FBX_IR_VERSION 7u
+ *     for the RCA + closure narrative.
+ * v8: #NRR (CORRECTNESS) — the §599 whole-block dead-flag elision is REMOVED.
+ *     It was an IN-BLOCK liveness test authorizing a CROSS-BLOCK drop: a block
+ *     with no in-block flag-reader dropped every SET_FLAGS_RAW, but m->flags
+ *     outlives the block and no exit path re-executes the dropped op, so the
+ *     next block's Jcc read a stale shadow.  #735 patched the BAILOUT exit and
+ *     #CM4 (v7) made the hole universal — every mid-stream split now terminates
+ *     in a synthesized BRANCH_TAKEN, so the ordinary `…cmp` / `Jcc…` split
+ *     elided the CMP its successor branches on.  BRANCH_TAKEN and CALL_DIRECT
+ *     were both uncovered.  The IR shape and the LIFTER are unchanged; what
+ *     changes is the EMIT for every block that contains a SET_FLAGS_RAW and no
+ *     in-block reader — previously zero flag wasm, now exactly one AluFlags
+ *     sequence (SetFlagsRawIsLive, already cross-block-correct, drops all but
+ *     the last).  Bumped on the v2/v3 precedent: emit semantics flipped for a
+ *     whole block class, so stale v7 sidecars must invalidate rather than
+ *     hit-on-stale.  See work/tasks/NRR-* for the closure narrative. */
+#define FBX_IR_VERSION 8u
 
 /* ────────────────────────────────────────────────────────────────────────── */
 /* IR opcodes.                                                                */
