@@ -440,7 +440,16 @@ static int CoverageGate(const struct FbxIrBlock *ir,
     return 0;
   }
 #endif
-  if (saw_flag_reader) {
+  /* firebox#NRR — this validation was guarded by `if (saw_flag_reader)`, on the
+   * premise that a reader-free block dropped every SET_FLAGS_RAW and so never
+   * reached EmitFlagsAfterAlu.  That premise is gone (the whole-block elision
+   * is), and it was ALREADY false: a reader-free block containing RET / PUSH /
+   * POP / BAILOUT got needs_scratch == 1 from those arms and emitted flags with
+   * the encoding unvalidated.  EmitFlagsAfterAlu's `default:` arm answers an
+   * unknown op_kind with an i64.and — a silently WRONG flags computation, not a
+   * refusal.  Validate unconditionally so a malformed SET_FLAGS_RAW refuses the
+   * block (correct-or-refuse) instead of synthesizing wrong flags. */
+  {
     for (i = 0; i < ir->ninsts; ++i) {
       const struct FbxIrInst *p = &ir->insts[i];
       if (p->opcode == FBX_IR_OP_SET_FLAGS_RAW) {
@@ -474,6 +483,11 @@ static int CoverageGate(const struct FbxIrBlock *ir,
     }
   }
   (void)saw_flag_writer; /* presence-only; no further gating */
+  /* firebox#NRR — saw_flag_reader no longer gates the SET_FLAGS_RAW encoding
+   * validation (see above); both it and saw_flag_writer_local now survive only
+   * for the FBX735_DIAG_* localization builds. */
+  (void)saw_flag_reader;
+  (void)saw_flag_writer_local;
 
   /* #794 — IMUL flag-liveness refuse.  IMUL (FBX_IR_OP_IMUL) carries NO
    * synthesized flags at this increment: its CF/OF (full-product overflow)
@@ -2882,47 +2896,74 @@ static int EmitPop(struct FbxWasmBuffer *body, const struct FbxIrInst *p,
   return 1;
 }
 
-/* Decide whether this block needs the i64 + i32 scratch locals reserved
- * after the vreg block.  Any flag-reader (BRANCH_COND) is the trigger;
- * dead-flag-elision blocks (SET_FLAGS_RAW with no reader) still skip
- * scratch reservation because EmitFunctionBody drops SET_FLAGS_RAW in
- * that case (preserving the §13.5 fast-path).
+/* Decide whether this block needs the i64 + i32 scratch locals reserved after
+ * the vreg block.  This is a pure RESOURCE question — "does any op this block
+ * emits use scratch_z / scratch_flags" — and nothing more.
  *
- * §599: blocks with a flag-reader present trigger the eager-update path;
- * every SET_FLAGS_RAW in such a block expands into the AluFlags emit
- * sequence and needs scratch_z + scratch_flags.
+ * firebox#NRR (CORRECTNESS — load-bearing, and the reason this comment is not
+ * the one that used to be here): this predicate USED to double as a liveness
+ * test.  A block with no in-block flag-reader returned 0, and EmitFunctionBody
+ * read that 0 as authority to DROP every SET_FLAGS_RAW in the block (the §599
+ * "whole-block dead-flag elision").  That is an IN-BLOCK test authorizing a
+ * CROSS-BLOCK drop, and it is unsound for every terminator:
  *
- * firebox#735 (CORRECTNESS — load-bearing): a block that contains a BAILOUT
- * ALSO triggers flag emission, because the §735 Tier-1 handoff RESUMES at
- * m->ip (the bailout PC) instead of re-walking entries[] from index 0.  The
- * old re-walk-from-0 RE-RAN the CMP/TEST whose flags were dead-flag-elided in
- * the T2 block (their flag result is consumed CROSS-block by a later Jcc, so
- * within THIS block there is no reader → elision drops them).  With
- * resume-at-m->ip, Tier 1 SKIPS those elided ops → the flags would be LOST →
- * the next block's conditional branch reads stale flags → wrong control flow
- * → silent output corruption (witnessed: grep matched 82/7693 lines).  Forcing
- * flag emission here makes the T2 block COMMIT the flags before its BAILOUT,
- * so what Tier 1 skips on resume is exactly what T2 already applied — the
- * resume contract's invariant ("T2 commits exactly the entries Tier 1 skips").
- * (REG_GET into a vreg is block-local — vregs die at block end — so no other
- * elided op carries cross-block state; the dead-flag SET_FLAGS_RAW was the
- * only one.) */
+ *   - the flag shadow m->flags is machine state that OUTLIVES the block;
+ *   - every lifted block ends by LEAVING (fbx_ir_lift.c LiftOpIsTerminator),
+ *     and no exit path re-executes the block's own instructions;
+ *   - so a dropped SET_FLAGS_RAW is never recomputed by anyone, and the next
+ *     block's Jcc reads whatever some earlier block left in m->flags.
+ *
+ * The original soundness argument was that a Tier-1 handoff RE-WALKED the
+ * block's entries[] from index 0 and so re-ran the elided CMP/TEST.  firebox#735
+ * removed that for BAILOUT (Tier 1 now resumes at m->ip) and patched THIS
+ * predicate with a BAILOUT arm.  firebox#CM4 then made the hole universal:
+ * EmitFallthroughBranch appends a synthesized BRANCH_TAKEN to EVERY block blink
+ * split mid-stream, so the ordinary `…cmp` / `Jcc…` split — the single most
+ * common shape in compiled code — now terminates in BRANCH_TAKEN, gets
+ * needs_scratch == 0, and silently drops the CMP the next block branches on.
+ * BRANCH_TAKEN and CALL_DIRECT were both uncovered (real x86 `call` does not
+ * write EFLAGS either, so `cmp; call f` elides identically).
+ *
+ * Enumerating those two terminators would be the THIRD patch to a predicate
+ * whose SHAPE is wrong, and would still be one unenumerated terminator away
+ * from the same silent-wrong-branch failure.  So the authority is withdrawn
+ * instead: any block containing a SET_FLAGS_RAW needs the scratch pair, the
+ * whole-block elision is gone from EmitFunctionBody, and the ONLY surviving
+ * elision is SetFlagsRawIsLive() — which is already cross-block-correct by
+ * construction (it keeps the LAST SET_FLAGS_RAW precisely because a next block
+ * may read it, and drops one only when a later in-block SET_FLAGS_RAW provably
+ * overwrites the shadow first).  Net emit cost of the change is ONE AluFlags
+ * sequence per previously-eliding block, not one per ALU op.
+ *
+ * The BRANCH_COND / GET_FLAG / BAILOUT arms below are now SUBSUMED by the
+ * SET_FLAGS_RAW arm for their flag purpose (a block with no SET_FLAGS_RAW has
+ * no flags to commit).  They are kept because BRANCH_COND's own lowering uses
+ * the scratch pair, and because deleting firebox#735's arm would silently
+ * re-open a hole whose repro cost a witnessed corruption (grep matched 82/7693
+ * lines) to find.  #735's own mechanism, preserved: the Tier-1 handoff RESUMES
+ * at m->ip (the bailout PC) rather than re-walking entries[] from index 0, so
+ * Tier 1 SKIPS the entries T2 already ran; forcing flag emission makes the T2
+ * block COMMIT the flags before its BAILOUT, which is exactly the resume
+ * contract's invariant — "T2 commits exactly the entries Tier 1 skips".  (A
+ * REG_GET into a vreg is block-local — vregs die at block end — so the
+ * dead-flag SET_FLAGS_RAW was the only elided op carrying cross-block state.)
+ *
+ * #602 — RET/PUSH/POP stash the popped or to-be-pushed value in scratch_z to
+ * bridge the wasm-stack ordering between the load and the subsequent RSP
+ * adjust + store-to-ip / store-to-greg.  That is a genuine resource need, not a
+ * flag one. */
 static int BlockNeedsScratchLocals(const struct FbxIrBlock *ir) {
   u32 i;
   for (i = 0; i < ir->ninsts; ++i) {
     u8 op = ir->insts[i].opcode;
+    /* firebox#NRR — the flag shadow outlives the block, so ANY SET_FLAGS_RAW
+     * may be observed after the terminator.  Reserve the scratch pair; which
+     * of them actually emits is decided per-instruction by SetFlagsRawIsLive. */
+    if (op == FBX_IR_OP_SET_FLAGS_RAW) return 1;
     if (op == FBX_IR_OP_BRANCH_COND || op == FBX_IR_OP_GET_FLAG) return 1;
-    /* firebox#735 — a BAILOUT forces flag emission (see the block comment):
-     * resume-at-m->ip skips any flag-elided CMP/TEST, so T2 must commit the
-     * flags instead of eliding them. */
 #ifndef FBX735_DIAG_NO_BAILOUT_FLAG_FORCE
     if (op == FBX_IR_OP_BAILOUT) return 1;
 #endif
-    /* #602 — RET/PUSH/POP stash the popped or to-be-pushed value in
-     * scratch_z to bridge the wasm-stack ordering between the load
-     * and the subsequent RSP adjust + store-to-ip / store-to-greg.
-     * CALL_DIRECT does NOT need scratch (it stores a constant return_pc
-     * directly via EmitGuestMemStoreImm) but checking is cheap. */
     if (op == FBX_IR_OP_RET || op == FBX_IR_OP_PUSH ||
         op == FBX_IR_OP_POP) return 1;
   }
@@ -3127,11 +3168,21 @@ static int EmitFunctionBody(struct FbxWasmBuffer *body,
          * matches blink/alu.c:AluFlags byte-for-byte.  The IR encoding
          * carries (op_kind in imm) + (lhs_vreg in src1) + (rhs_vreg in
          * src2) + (width in width) — see LiftAlui + LiftAluRR. */
-        if (!needs_scratch) break; /* whole-block dead-flag elision (#599) */
-        /* #794 inc 2 — IN-BLOCK dead-flag elision: skip this SET_FLAGS_RAW if a
-         * later one overwrites m->flags before any reader (its full AluFlags
-         * computation would be unobservable).  Removes the redundant per-op
-         * flag materialization that dominates flag-reading loops. */
+        /* firebox#NRR — the §599 whole-block elision (`if (!needs_scratch)
+         * break;`) USED to sit here.  It was an IN-BLOCK liveness test
+         * authorizing a CROSS-BLOCK drop: m->flags outlives the block, every
+         * block exits, and no exit re-executes the dropped op — so the next
+         * block's Jcc read a shadow this block was supposed to have written.
+         * #735 patched the BAILOUT case, #CM4 made the hole universal by
+         * appending a synthesized BRANCH_TAKEN to every mid-stream split.
+         * Removed rather than extended; see BlockNeedsScratchLocals.
+         *
+         * #794 inc 2 — the surviving elision, and the only one that is sound:
+         * skip this SET_FLAGS_RAW iff a LATER in-block one overwrites m->flags
+         * before any reader.  SetFlagsRawIsLive keeps the LAST one exactly
+         * because a next block may read it, so the block still commits the
+         * shadow it owes its successor while paying for only one AluFlags
+         * sequence instead of one per ALU op. */
         if (!SetFlagsRawIsLive(ir, i)) break;
         if (p->src1_kind != FBX_IR_KIND_VREG ||
             p->src2_kind != FBX_IR_KIND_VREG) {
