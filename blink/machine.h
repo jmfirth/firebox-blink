@@ -260,7 +260,8 @@ struct FbxThunks {
  * bucket array lazily on first dispatch.  The hash bucket array and
  * each block's `entries[]` are heap allocations owned by this struct;
  * FbxTcReset frees them. */
-struct FbxTcBlock;  /* defined in blink/threadedcode.h */
+struct FbxTcBlock;         /* defined in blink/threadedcode.h */
+struct FbxT2MachineState;  /* defined in blink/threadedcode.h (firebox#HYS) */
 struct FbxTcCacheState {
   struct FbxTcBlock **buckets; /* nbuckets pointers; NULL when uninit */
   u32 nbuckets;                /* power of two for cheap masking */
@@ -269,6 +270,16 @@ struct FbxTcCacheState {
   u32 entry_cap;               /* 0 disables the cap */
   u8 enabled;                  /* 0 = TC disabled (FIREBOX_TC=0) */
   u8 initialised;              /* 1 once FbxTcInit ran */
+  /* firebox#HYS — TC generation counter.  Bumped by FbxTcReset (and so by
+   * FbxTcInvalidate) every time the block cache is emptied.  Each Machine's
+   * per-instance Tier-2 map (`m->fbx_t2`) records the epoch it was populated
+   * under and drops itself lazily, on its OWN next dispatch, when the epoch
+   * no longer matches.  This is the epoch half of the RCU mitigation the
+   * FbxTcInvalidate TODO already proposes, and it exists here because
+   * FbxTcReset cannot walk `sys->machines` to clean peer maps eagerly:
+   * FreeSystem destroys `machines_lock` BEFORE calling FbxTcReset, so taking
+   * that lock there is use-after-destroy.  Lazy + self-owned needs no lock. */
+  _Atomic(u32) epoch;
 };
 
 struct Elf {
@@ -484,6 +495,19 @@ struct Machine {                         //
   sigset_t spawn_sigmask;                //
   struct Dll elem;                       //
   struct SmcQueue smcqueue;              //
+  /* firebox#HYS: PER-INSTANCE Tier 2 dispatch state.  A `t2_funcref` is an
+   * index into `__indirect_function_table`, which is per WASM INSTANCE GROUP
+   * (wasmer linker.rs: "the indirect function table is PER instance group").
+   * It used to live on `struct FbxTcBlock`, i.e. in `sys->tc`, which every
+   * thread of the process shares — so a spawned thread read an index minted
+   * against another instance's table and `call_indirect`ed past the end of
+   * its own.  `struct Machine` is per-thread and a spawned thread gets a
+   * fresh instance, so this is the correct home.  Owned by this Machine;
+   * allocated lazily on the first hot block, freed in FreeMachineUnlocked.
+   * NewMachine explicitly clears it after the parent memcpy — inheriting the
+   * parent's map would reinstate the exact defect for fork() and
+   * pthread_create() alike. */
+  struct FbxT2MachineState *fbx_t2;      //
   struct OpCache opcache[1];             //
 };                                       //
 

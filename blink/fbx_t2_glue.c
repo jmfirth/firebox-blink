@@ -310,7 +310,8 @@ void Fbxt2ResetEnvCacheForTest(void) {
 /* Escalation pipeline — spec §6.2.                                           */
 /* ────────────────────────────────────────────────────────────────────────── */
 
-void Fbxt2TryEscalate(struct Machine *m, struct FbxTcBlock *b) {
+void Fbxt2TryEscalate(struct Machine *m, struct FbxTcBlock *b,
+                      struct FbxT2BlockState *st) {
   struct FbxIrBlock *ir;
   struct FbxWasmBuffer buf;
   u64 sys_id;
@@ -321,15 +322,17 @@ void Fbxt2TryEscalate(struct Machine *m, struct FbxTcBlock *b) {
    * the per-block FbxT2BlockCtx at instantiate time. */
   u64 consts[FBX_T2_BLOCK_CTX_MAX_CONSTS];
   u32 nconsts = 0;
-  /* The latch — spec §6.1 idempotence.  Set FIRST so a racing thread that
-   * also sees `hits >= threshold` short-circuits without re-running the
-   * pipeline (and, on a synchronous host, without a second cranelift compile).
-   * The leak-on-race is harmless per spec (the loser's funcref leaks but
-   * doesn't corrupt).  firebox#794: a PENDING async-compile outcome CLEARS this
-   * latch again (the only path that does) so the block re-attempts on a later
-   * hit; every terminal outcome leaves it set, exactly as before. */
-  if (b->t2_attempted) return;
-  b->t2_attempted = 1;
+  /* The latch — spec §6.1 idempotence.  Set FIRST so this Machine does not
+   * re-run the pipeline for this block.  firebox#HYS made the latch
+   * PER-INSTANCE along with the funcref it guards: it used to be shared, which
+   * meant the first thread to escalate latched every OTHER thread out of ever
+   * minting a translation in its own table — while leaving behind the funcref
+   * those threads would then dispatch.  Each instance now earns, and pays for,
+   * its own translation.  firebox#794: a PENDING async-compile outcome CLEARS
+   * this latch again (the only path that does) so the block re-attempts on a
+   * later hit; every terminal outcome leaves it set. */
+  if (st->attempted) return;
+  st->attempted = 1;
 
   T2EnsureTraceFlags();
 
@@ -475,17 +478,17 @@ void Fbxt2TryEscalate(struct Machine *m, struct FbxTcBlock *b) {
        * The whole branch is dead on a synchronous host (it never returns
        * PENDING), so non-async behavior is byte-identical. */
       free(ctx);
-      if (++b->t2_pending_attempts >= FBX_T2_PENDING_MAX_ATTEMPTS) {
+      if (++st->pending_attempts >= FBX_T2_PENDING_MAX_ATTEMPTS) {
         T2TraceLine(g_t2_trace_escalations,
                     "[t2 escalate] sys=%p pc=%#llx outcome=pending_gave_up\n",
                     (void *)m->system, (unsigned long long)b->start_pc);
       } else {
-        b->t2_attempted = 0; /* reopen — the ONLY path that clears the latch */
-        b->t2_retry_at_hits = b->hits + FBX_T2_PENDING_RETRY_STRIDE;
+        st->attempted = 0; /* reopen — the ONLY path that clears the latch */
+        st->retry_at_hits = b->hits + FBX_T2_PENDING_RETRY_STRIDE;
         T2TraceLine(g_t2_trace_escalations,
                     "[t2 escalate] sys=%p pc=%#llx outcome=pending attempts=%u\n",
                     (void *)m->system, (unsigned long long)b->start_pc,
-                    (unsigned)b->t2_pending_attempts);
+                    (unsigned)st->pending_attempts);
       }
       return;
     }
@@ -497,18 +500,21 @@ void Fbxt2TryEscalate(struct Machine *m, struct FbxTcBlock *b) {
       return;
     }
 
-    /* Step 5 — stash funcref + ctx on the block.  Future ExecuteBlock
-     * calls route through Fbxt2Dispatch instead of walking entries[].
-     * The ctx pointer is retained so it stays live for every dispatch. */
-    b->t2_block_ctx = ctx;
+    /* Step 5 — stash funcref + ctx on THIS MACHINE's state for the block
+     * (firebox#HYS; it used to be the block itself).  Future ExecuteBlock
+     * calls on this Machine route through Fbxt2Dispatch instead of walking
+     * entries[].  The ctx pointer is retained so it stays live for every
+     * dispatch, and is freed with this map entry. */
+    st->block_ctx = ctx;
   }
-  b->t2_funcref = funcref;
+  st->funcref = funcref;
   T2TraceLine(g_t2_trace_escalations,
               "[t2 escalate] sys=%p pc=%#llx outcome=success funcref=%d\n",
               (void *)m->system, (unsigned long long)b->start_pc, funcref);
 }
 
-int Fbxt2Dispatch(struct Machine *m, struct FbxTcBlock *b) {
+int Fbxt2Dispatch(struct Machine *m, struct FbxTcBlock *b,
+                  struct FbxT2BlockState *st) {
   u64 sys_id = (u64)(uintptr_t)m->system;
   /* `m_ptr` is the linear-memory offset of the Machine struct.  When Blink
    * runs inside wasm (production), truncating the `struct Machine *` to i32
@@ -542,14 +548,14 @@ int Fbxt2Dispatch(struct Machine *m, struct FbxTcBlock *b) {
    * guaranteed by the ExecuteBlock fast-path gate (threadedcode.c). */
   {
     typedef int (*FbxT2BlockFn)(i32, i32);
-    i32 ctx_ptr = (i32)(intptr_t)b->t2_block_ctx;
-    FbxT2BlockFn fn = (FbxT2BlockFn)(uintptr_t)(u32)b->t2_funcref;
+    i32 ctx_ptr = (i32)(intptr_t)st->block_ctx;
+    FbxT2BlockFn fn = (FbxT2BlockFn)(uintptr_t)(u32)st->funcref;
     exit_code = fn(m_ptr, ctx_ptr);
   }
 #else
   /* Native test bench: no in-guest table; keep the host-dispatch shim (the
    * synthetic dispatcher echoes integer-only opcodes for the unit tests). */
-  exit_code = fbx_t2_dispatch(sys_id, b->t2_funcref, m_ptr);
+  exit_code = fbx_t2_dispatch(sys_id, st->funcref, m_ptr);
 #endif
   /* #794 increment 3b — runtime-profitability feedback + de-escalation.  Exit
    * code 3 (a self-loop that exhausted the full iteration budget = a deep,
@@ -563,19 +569,19 @@ int Fbxt2Dispatch(struct Machine *m, struct FbxTcBlock *b) {
    * first dispatch and is KEPT; grep's short/straight-line blocks never fill
    * and revert. */
   if (exit_code == 3) {
-    if (b->t2_filled != 0xFFFFFFFFu) ++b->t2_filled;
+    if (st->filled != 0xFFFFFFFFu) ++st->filled;
     exit_code = 0;
   }
-  if (b->t2_dispatches != 0xFFFFFFFFu) ++b->t2_dispatches;
+  if (st->dispatches != 0xFFFFFFFFu) ++st->dispatches;
   if (Fbxt2DeescalateEnabled() &&
-      b->t2_dispatches == FBX_T2_DEESCALATE_AFTER && b->t2_filled == 0) {
-    b->t2_funcref = -1; /* revert to Tier 1; latch kept (no re-escalation) */
+      st->dispatches == FBX_T2_DEESCALATE_AFTER && st->filled == 0) {
+    st->funcref = -1; /* revert to Tier 1; latch kept (no re-escalation) */
     T2EnsureTraceFlags();
     T2TraceLine(g_t2_trace_escalations,
                 "[t2 deescalate] sys=%p pc=%#llx dispatches=%u "
                 "(never filled budget — unprofitable)\n",
                 (void *)m->system, (unsigned long long)b->start_pc,
-                (unsigned)b->t2_dispatches);
+                (unsigned)st->dispatches);
   }
   if (exit_code == 1 || exit_code == 2) {
     T2EnsureTraceFlags();
@@ -583,7 +589,7 @@ int Fbxt2Dispatch(struct Machine *m, struct FbxTcBlock *b) {
                 "[t2 bailout] sys=%#llx pc=%#llx funcref=%d exit=%d\n",
                 (unsigned long long)sys_id,
                 (unsigned long long)b->start_pc,
-                b->t2_funcref, exit_code);
+                st->funcref, exit_code);
   }
   return exit_code;
 }

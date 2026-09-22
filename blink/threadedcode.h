@@ -88,63 +88,92 @@ struct FbxTcEntry {
  * ending at the first branching/precious/serializing op (or at a thunk
  * hit).  Indexed by start_pc in the hash table; chained via `next`.
  *
- * Tier 2 §13.4 extensions (`t2_funcref`, `t2_attempted`): when a block
- * has executed `Fbxt2HotnessThreshold()` times, `ExecuteBlock` calls
- * `Fbxt2TryEscalate` which lifts → synthesises → instantiates → stashes
- * a funcref here.  On subsequent hits, ExecuteBlock dispatches through
- * `Fbxt2Dispatch(b)` instead of walking `entries[]`.  Spec §6.3 + §6.4.
+ * ⛔ firebox#HYS — THE TIER 2 STATE IS NOT HERE ANY MORE, AND MUST NOT COME
+ * BACK.  This struct hangs off `sys->tc`, i.e. `struct System`, which every
+ * thread of the process shares.  A Tier-2 `funcref` is an index into
+ * `__indirect_function_table`, which is per WASM INSTANCE GROUP — a spawned
+ * thread re-instantiates the module into a new Store with a FRESH table at the
+ * module's declared minimum.  Storing the index in shared memory meant thread 2
+ * read thread 1's index and `call_indirect`ed past the end of its own table:
+ * "undefined element: out of bounds table access".  Nothing about the two
+ * lifetimes matches, so the state moved to `struct FbxT2BlockState`, held in a
+ * per-`Machine` map (`m->fbx_t2`) keyed by `start_pc`.  See that struct below.
  *
- *   t2_funcref:   -1 = no translation; >=0 = funcref into the host's
- *                 per-System translated-module table.  The funcref's
- *                 namespace is per-System (sys_id = (u64)m->system);
- *                 the same funcref under a different System refers to
- *                 a different module.
- *   t2_attempted: 0 = never tried; 1 = tried (success or failure).
- *                 Once set, escalation never re-attempts (idempotent
- *                 latch — spec §6.1 concurrency assumption).
- *
- * Size impact: +8 bytes per block (one i32, one u8, 3 bytes padding to
- * preserve the natural alignment of `entries`).  Spec §13.4 calls out
- * the bounded-size constraint; this fits. */
+ * What legitimately REMAINS shared here is everything about the DECODE: the
+ * entries[], the pc bounds, and `hits`.  `hits` stays shared on purpose — it is
+ * a best-effort hotness signal, and a thread arriving at an already-hot block
+ * should escalate its OWN translation immediately rather than re-earn the
+ * count.  It is also what keeps the cold path cheap: `hits < threshold` proves
+ * no Machine anywhere holds Tier-2 state for this block, so ExecuteBlock skips
+ * the map lookup entirely on every cold block. */
 struct FbxTcBlock {
   u64 start_pc;            /* guest PC of the first instruction */
   u64 end_pc;              /* guest PC immediately after the last instruction */
   u64 page;                /* (start_pc & ~0xfff) — used by SMC invalidation */
   u32 nentries;            /* number of entries */
   u32 hits;                /* execution count (best-effort; not atomic) */
-  i32 t2_funcref;          /* Tier 2 funcref or -1 (spec §6.3) */
-  u8 t2_attempted;         /* Tier 2 escalation TERMINAL latch (success or
-                            * permanent failure); a PENDING async compile does
-                            * NOT set it (firebox#794) so the block retries. */
-  u8 t2_pending_attempts;  /* firebox#794 — count of PENDING async-compile polls
-                            * so far; gives up at FBX_T2_PENDING_MAX_ATTEMPTS. */
-  u8 t2_reserved[2];       /* padding to keep the pointer naturally aligned */
-  /* firebox#719: the per-block FbxT2BlockCtx now lives in the GUEST's own
-   * heap (Blink owns the allocation) instead of a bridge-owned scratch
-   * arena.  Its guest-memory address IS the `block_ctx_ptr` the bridge
-   * records per-funcref and replays as the 2nd `translated_block` arg.
-   * It MUST outlive every dispatch of `t2_funcref`, so we stash it on the
-   * block; freed in `FbxTcInvalidate` alongside the funcref drop.  NULL
-   * until a successful escalation. */
-  void *t2_block_ctx;
-  /* #794 increment 3b — runtime-profitability de-escalation feedback.  A T2
-   * block only beats the interpreter when it does enough work per dispatch to
-   * amortize the dispatch cost; a self-loop signals "full budget of work" by
-   * returning exit code 3 (EmitBranchCondSelfLoop).  Fbxt2Dispatch counts
-   * dispatches + budget-fills since escalation; a block that NEVER fills the
-   * budget in its first FBX_T2_DEESCALATE_AFTER dispatches (short loop or
-   * non-self-loop) is de-escalated (t2_funcref → -1, latch kept). */
-  u32 t2_dispatches;
-  u32 t2_filled;
-  /* firebox#794 async escalation — the hit count at which a PENDING block may
-   * next re-attempt escalation (the lift+emit+instantiate poll).  Set to
-   * `hits + FBX_T2_PENDING_RETRY_STRIDE` on each PENDING outcome so a fast
-   * self-loop polls at a bounded cadence instead of re-lifting every iteration.
-   * 0 (init) lets the first attempt fire at the hotness threshold. */
-  u32 t2_retry_at_hits;
   struct FbxTcEntry *entries; /* malloc'd array of nentries entries */
   struct FbxTcBlock *next; /* next block in the same hash bucket */
 };
+
+/* firebox#HYS — the per-INSTANCE half of a Tier-2-translated block.  One of
+ * these exists per (Machine, block) pair that actually escalated; the fields
+ * are verbatim the ones that used to sit on FbxTcBlock.
+ *
+ *   funcref:          -1 = no translation; >=0 = an index into THIS instance's
+ *                     `__indirect_function_table`.  Meaningless in any other
+ *                     instance — that is the whole point of the move.
+ *   attempted:        TERMINAL escalation latch (success or permanent
+ *                     failure).  A PENDING async compile does NOT set it
+ *                     (firebox#794) so the block retries.
+ *   pending_attempts: firebox#794 — count of PENDING async-compile polls so
+ *                     far; gives up at FBX_T2_PENDING_MAX_ATTEMPTS.
+ *   block_ctx:        firebox#719 — the guest-heap FbxT2BlockCtx whose address
+ *                     IS the `block_ctx_ptr` replayed as `translated_block`'s
+ *                     2nd arg.  It must outlive every dispatch of `funcref`,
+ *                     so it is owned here and freed with this entry.  Because
+ *                     the funcref it pairs with is per-instance, so is this.
+ *   dispatches/filled: #794 3b de-escalation feedback.
+ *   retry_at_hits:    #794 async escalation retry cadence, compared against the
+ *                     SHARED `b->hits`. */
+struct FbxT2BlockState {
+  u64 start_pc;            /* key; matches FbxTcBlock::start_pc.  A live block
+                            * is uniquely identified by start_pc (FbxTcLookup
+                            * hashes on it), so this keys without ever holding
+                            * a pointer to memory another thread may free. */
+  void *block_ctx;
+  i32 funcref;
+  u8 attempted;
+  u8 pending_attempts;
+  u8 used;                 /* 0 = empty slot (open addressing), 1 = live */
+  u8 reserved;
+  u32 dispatches;
+  u32 filled;
+  u32 retry_at_hits;
+};
+
+/* firebox#HYS — a Machine's Tier-2 map.  Open-addressed, linear-probed,
+ * power-of-two sized, keyed by `start_pc`.  Deliberately has no delete: the
+ * only removal event is a whole-cache invalidation, which drops every entry at
+ * once via the epoch check, so tombstones would be dead weight. */
+struct FbxT2MachineState {
+  struct FbxT2BlockState *slots; /* nslots entries; calloc'd */
+  u32 nslots;                    /* power of two, 0 when unallocated */
+  u32 nused;
+  u32 epoch;                     /* sys->tc.epoch this map was built under */
+};
+
+/* Look up — creating on demand — this Machine's Tier-2 state for `b`.
+ * Returns NULL only on allocation failure, which degrades to "stay Tier 1"
+ * and is never fatal.  Drops the whole map first if `sys->tc.epoch` moved
+ * (the block cache was invalidated under us), which is what keeps the
+ * `start_pc` keys from naming blocks that no longer exist. */
+struct FbxT2BlockState *FbxT2StateFor(struct Machine *m,
+                                      struct FbxTcBlock *b);
+
+/* Free this Machine's Tier-2 map and every guest-heap block_ctx it owns.
+ * Idempotent; safe on a Machine that never escalated. */
+void FbxT2StateFree(struct Machine *m);
 
 /* Initialise the cache embedded in `sys->tc`.  Idempotent.  Reads
  * FIREBOX_TC env var: empty/missing/"1"/"on"/"true" → enabled;

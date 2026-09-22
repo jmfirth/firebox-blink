@@ -24,6 +24,7 @@
 #include <unistd.h>
 
 #include "blink/assert.h"
+#include "blink/atomic.h"
 #include "blink/builtin.h"
 #include "blink/endian.h"
 #include "blink/fbx_t2_glue.h"
@@ -280,13 +281,12 @@ void FbxTcInit(struct System *sys) {
 static void FreeBlockChain(struct FbxTcBlock *b) {
   while (b) {
     struct FbxTcBlock *next = b->next;
-    /* firebox#719: free the guest-owned per-block FbxT2BlockCtx (NULL
-     * unless the block escalated to Tier 2).  Allocated in
-     * Fbxt2TryEscalate; outlives every dispatch of t2_funcref and is
-     * reclaimed here when the block itself is dropped (FbxTcInvalidate /
-     * SMC).  The matching funcref's host-side module is dropped via
-     * fbx_t2_drop_all on the same invalidate path. */
-    free(b->t2_block_ctx);
+    /* firebox#HYS: the guest-owned FbxT2BlockCtx (firebox#719) is no longer
+     * freed here — it moved, with the funcref it pairs with, into the
+     * per-Machine FbxT2BlockState.  Each Machine reclaims its own on the
+     * epoch drop below (or in FbxT2StateFree at thread teardown).  Freeing it
+     * here would have been a cross-instance free of an allocation this thread
+     * does not own. */
     free(b->entries);
     free(b);
     b = next;
@@ -296,6 +296,15 @@ static void FreeBlockChain(struct FbxTcBlock *b) {
 void FbxTcReset(struct System *sys) {
   u32 i;
   if (!sys->tc.initialised) return;
+  /* firebox#HYS — retire every Machine's Tier-2 map by bumping the generation.
+   * The blocks these maps key by start_pc are about to be freed, so the keys
+   * would otherwise name blocks that no longer exist (and, worse, start_pcs a
+   * RECOMPILED block could legitimately reuse — pairing a fresh block with a
+   * stale funcref).  Each Machine notices on its own next dispatch and drops
+   * its map there.  Relaxed is sufficient: the only correctness requirement is
+   * that the bump is eventually observed, and a Machine that has not yet
+   * observed it is running blocks it is about to stop running anyway. */
+  atomic_fetch_add_explicit(&sys->tc.epoch, 1, memory_order_relaxed);
   if (sys->tc.buckets) {
     for (i = 0; i < sys->tc.nbuckets; ++i) {
       FreeBlockChain(sys->tc.buckets[i]);
@@ -489,16 +498,127 @@ static struct FbxTcBlock *CompileBlock(struct Machine *m, u64 start_pc) {
   b->page = start_pc & ~(u64)4095;
   b->nentries = n;
   b->hits = 0;
-  /* Tier 2 §6.3: fresh block has no translation.  -1 (NOT 0) is the
-   * "no funcref" sentinel — 0 is a valid funcref. */
-  b->t2_funcref = -1;
-  b->t2_attempted = 0;
-  b->t2_pending_attempts = 0; /* #794 async escalation */
-  b->t2_retry_at_hits = 0;    /* #794 async escalation */
-  b->t2_dispatches = 0;       /* #794 3b — de-escalation feedback */
-  b->t2_filled = 0;
+  /* firebox#HYS: no Tier-2 fields to initialise here any more.  A fresh block
+   * simply has no FbxT2BlockState in any Machine's map, and FbxT2StateFor
+   * mints one with funcref = -1 (spec §6.3: -1, NOT 0, is the "no funcref"
+   * sentinel — 0 is a valid funcref). */
   b->next = NULL;
   return b;
+}
+
+/* ────────────────────────────────────────────────────────────────────────── */
+/* firebox#HYS — the per-Machine Tier 2 map.                                  */
+/*                                                                            */
+/* Why a map and not a field: the state is per (instance, block), the block   */
+/* is shared and the instance is not, so neither side alone can hold it.      */
+/* Open addressing with linear probing over a power-of-two table keyed by     */
+/* `start_pc`; no deletes (see the struct comment), so a probe stops at the   */
+/* first empty slot with no tombstone logic.  Every allocation failure here   */
+/* degrades to "this block stays Tier 1", never to a fault.                   */
+/* ────────────────────────────────────────────────────────────────────────── */
+
+#define FBX_T2_MAP_INIT_SLOTS 64u
+
+/* Fibonacci-ratio multiplicative hash — start_pc values are dense and 
+ * 16-byte-ish aligned, so the low bits alone bucket badly. */
+static u32 T2MapHash(u64 start_pc, u32 nslots) {
+  u64 h = start_pc * (u64)0x9E3779B97F4A7C15ull;
+  return (u32)(h >> 32) & (nslots - 1u);
+}
+
+static void T2MapDropAll(struct FbxT2MachineState *ms) {
+  u32 i;
+  if (!ms->slots) return;
+  for (i = 0; i < ms->nslots; ++i) {
+    if (ms->slots[i].used) {
+      /* firebox#719 ctx, owned by this Machine alone. */
+      free(ms->slots[i].block_ctx);
+      ms->slots[i].block_ctx = NULL;
+      ms->slots[i].used = 0;
+    }
+  }
+  ms->nused = 0;
+}
+
+/* Insert a key known to be absent into a slot array known to have room. */
+static struct FbxT2BlockState *T2MapPlace(struct FbxT2BlockState *slots,
+                                          u32 nslots, u64 start_pc) {
+  u32 i = T2MapHash(start_pc, nslots);
+  for (;;) {
+    if (!slots[i].used) {
+      memset(&slots[i], 0, sizeof(slots[i]));
+      slots[i].used = 1;
+      slots[i].start_pc = start_pc;
+      slots[i].funcref = -1; /* spec §6.3 sentinel */
+      return &slots[i];
+    }
+    i = (i + 1u) & (nslots - 1u);
+  }
+}
+
+/* Grow to `nslots * 2` and rehash.  Returns false on OOM, leaving the map
+ * intact and usable at its current size (callers then stay Tier 1 for the
+ * block that could not be inserted). */
+static bool T2MapGrow(struct FbxT2MachineState *ms) {
+  u32 nslots = ms->nslots ? ms->nslots * 2u : FBX_T2_MAP_INIT_SLOTS;
+  struct FbxT2BlockState *slots;
+  u32 i;
+  if (nslots < ms->nslots) return false; /* u32 overflow — absurd, but total */
+  slots = (struct FbxT2BlockState *)calloc(nslots, sizeof(*slots));
+  if (!slots) return false;
+  for (i = 0; i < ms->nslots; ++i) {
+    if (ms->slots[i].used) {
+      struct FbxT2BlockState *dst =
+          T2MapPlace(slots, nslots, ms->slots[i].start_pc);
+      *dst = ms->slots[i];
+    }
+  }
+  free(ms->slots);
+  ms->slots = slots;
+  ms->nslots = nslots;
+  return true;
+}
+
+struct FbxT2BlockState *FbxT2StateFor(struct Machine *m,
+                                      struct FbxTcBlock *b) {
+  struct FbxT2MachineState *ms = m->fbx_t2;
+  u32 epoch = atomic_load_explicit(&m->system->tc.epoch, memory_order_relaxed);
+  u32 i;
+  if (!ms) {
+    ms = (struct FbxT2MachineState *)calloc(1, sizeof(*ms));
+    if (!ms) return NULL;
+    ms->epoch = epoch;
+    m->fbx_t2 = ms;
+  } else if (ms->epoch != epoch) {
+    /* The block cache was reset under us; every key we hold names a block
+     * that is gone.  Drop the lot (freeing our own ctx allocations) and
+     * re-key against the new generation. */
+    T2MapDropAll(ms);
+    ms->epoch = epoch;
+  }
+  if (ms->slots) {
+    i = T2MapHash(b->start_pc, ms->nslots);
+    for (;;) {
+      if (!ms->slots[i].used) break;
+      if (ms->slots[i].start_pc == b->start_pc) return &ms->slots[i];
+      i = (i + 1u) & (ms->nslots - 1u);
+    }
+  }
+  /* Absent — insert, growing at 3/4 load to keep probes short. */
+  if (!ms->slots || (ms->nused + 1u) * 4u > ms->nslots * 3u) {
+    if (!T2MapGrow(ms)) return NULL;
+  }
+  ++ms->nused;
+  return T2MapPlace(ms->slots, ms->nslots, b->start_pc);
+}
+
+void FbxT2StateFree(struct Machine *m) {
+  struct FbxT2MachineState *ms = m->fbx_t2;
+  if (!ms) return;
+  T2MapDropAll(ms);
+  free(ms->slots);
+  free(ms);
+  m->fbx_t2 = NULL;
 }
 
 /* ────────────────────────────────────────────────────────────────────────── */
@@ -512,7 +632,18 @@ static void ExecuteBlock(struct Machine *m, struct FbxTcBlock *b) {
    * returned).  On a T2 bailout (exit=1) we resume at the entry whose
    * pc == m->ip — see the resume-scan below. */
   u32 resume_idx = 0;
+  /* firebox#HYS: THIS Machine's Tier-2 state for this block, or NULL while the
+   * block is still cold.  `b->hits` is shared and monotonic, so `hits <
+   * threshold` proves no Machine anywhere has escalated this block — which is
+   * what lets the cold path stay a single shared load, exactly as it was when
+   * the funcref lived on the block.  Past the threshold we pay one probe of
+   * our own map per dispatch, and that is precisely the population the Tier-2
+   * fast path exists to serve. */
+  struct FbxT2BlockState *t2 = NULL;
   ++b->hits;
+  if (b->hits >= Fbxt2HotnessThreshold()) {
+    t2 = FbxT2StateFor(m, b);
+  }
 
   /* Tier 2 §6.4 fast path — if we have a Tier-2-translated funcref,
    * dispatch through it instead of walking entries[].  Bailout (exit=1)
@@ -538,12 +669,12 @@ static void ExecuteBlock(struct Machine *m, struct FbxTcBlock *b) {
    * any BAILOUT-after-commit block to dodge this; #735 fixes the handoff
    * so those blocks (and the §13.5 memory-operand blocks) are sound.
    *
-   * We deliberately do NOT clear `b->t2_funcref` — the translation is
+   * We deliberately do NOT clear `t2->funcref` — the translation is
    * still valid for the common case; a bailout on one dispatch (e.g. a
    * cold-TLB miss) isn't evidence of pervasive corruption, and the next
    * hit may translate cleanly. */
-  if (b->t2_funcref >= 0) {
-    int exit_code = Fbxt2Dispatch(m, b);
+  if (t2 && t2->funcref >= 0) {
+    int exit_code = Fbxt2Dispatch(m, b, t2);
     if (exit_code == 0 || exit_code == 2) {
       /* Normal completion or host-call escape — both leave m->ip in
        * the right state for the outer dispatch loop. */
@@ -676,9 +807,11 @@ post_tier1:
    * is 0 for a fresh block, so the FIRST attempt still fires exactly at the
    * threshold; a synchronous host never returns PENDING, so the guard is inert
    * there (the block latches terminal on the first attempt as before). */
-  if (!b->t2_attempted && b->hits >= Fbxt2HotnessThreshold() &&
-      b->hits >= b->t2_retry_at_hits) {
-    Fbxt2TryEscalate(m, b);
+  if (t2 && !t2->attempted && b->hits >= t2->retry_at_hits) {
+    /* firebox#HYS: the hotness gate is now the `t2 != NULL` test itself —
+     * FbxT2StateFor above runs only past the threshold.  A NULL t2 is either a
+     * still-cold block or an OOM in the map, and both mean "stay Tier 1". */
+    Fbxt2TryEscalate(m, b, t2);
   }
 }
 

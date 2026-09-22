@@ -253,6 +253,10 @@ static void FreeMachineUnlocked(struct Machine *m) {
   m->sysdepth = 0;
   CollectPageLocks(m);
   CollectGarbage(m, 0);
+  /* firebox#HYS: this thread's Tier-2 map and the guest-heap FbxT2BlockCtx
+   * allocations it owns.  Owned per-Machine precisely because the funcrefs
+   * they pair with index THIS instance's table; nothing else may free them. */
+  FbxT2StateFree(m);
   free(m->pagelocks.p);
   free(m->freelist.p);
   free(m);
@@ -377,6 +381,16 @@ struct Machine *NewMachine(struct System *system, struct Machine *parent) {
   LOCK(&system->machines_lock);
   if (parent) {
     memcpy(m, parent, sizeof(*m));
+    /* firebox#HYS — MUST NOT INHERIT.  The memcpy above would hand the child
+     * the parent's Tier-2 map, whose funcrefs index the PARENT instance's
+     * `__indirect_function_table`.  A pthread_create child gets a fresh
+     * instance group whose table is at the module's declared minimum, and a
+     * fork() child gets a fresh table too; either way every inherited index
+     * names a slot the child does not have.  That inheritance, through the
+     * SHARED block cache rather than through this memcpy, was the whole of
+     * #HYS.  Clearing it here is also a double-free guard: two Machines
+     * pointing at one map would both FbxT2StateFree it. */
+    m->fbx_t2 = NULL;
     memset(&m->path, 0, sizeof(m->path));
     memset(&m->freelist, 0, sizeof(m->freelist));
     memset(&m->pagelocks, 0, sizeof(m->pagelocks));

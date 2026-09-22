@@ -82,6 +82,7 @@
 │   §13.6 owns the multi-System invalidation work.                             │
 ╚─────────────────────────────────────────────────────────────────────────────*/
 
+#include "blink/atomic.h"
 #include "blink/fbx_t2_glue.h"
 #include "blink/fbx_ir.h"
 #include "blink/fbx_wasm_emit.h"
@@ -172,11 +173,21 @@ static void ResetT2Stubs(void) {
 
 static struct System g_test_sys;
 static struct Machine g_test_m;
+static struct Machine g_test_m2; /* firebox#HYS — the "second thread" */
 
 static void InitTestMachine(void) {
+  /* firebox#HYS: release the previous test's Tier-2 map BEFORE the memset,
+   * which would otherwise drop the only pointer to it. */
+  FbxT2StateFree(&g_test_m);
+  FbxT2StateFree(&g_test_m2);
   memset(&g_test_sys, 0, sizeof(g_test_sys));
   memset(&g_test_m, 0, sizeof(g_test_m));
+  memset(&g_test_m2, 0, sizeof(g_test_m2));
   g_test_m.system = &g_test_sys;
+  /* firebox#HYS: a SECOND Machine on the SAME System — the shape the defect
+   * lived in.  A spawned thread is exactly this: same System (same block
+   * cache, same shared guest memory), different wasm instance. */
+  g_test_m2.system = &g_test_sys;
   /* No-op Tier 1 dispatch + no thunks means we never need the rest. */
 }
 
@@ -214,9 +225,7 @@ static struct FbxTcBlock *MakeSyntheticBlock(int nentries) {
   b->page = 0;
   b->nentries = (u32)nentries;
   b->hits = 0;
-  b->t2_funcref = -1;
-  b->t2_attempted = 0;
-  b->next = NULL;
+  b->next = NULL; /* firebox#HYS: Tier-2 state is per-Machine, not on the block */
   return b;
 }
 
@@ -248,10 +257,14 @@ static u32 g_test_tier2_dispatches = 0;
 
 static void TestExecuteBlock(struct Machine *m, struct FbxTcBlock *b) {
   u32 i;
+  /* firebox#HYS: mirror ExecuteBlock's gate — the per-Machine state is only
+   * materialised once the SHARED hit count reaches the threshold. */
+  struct FbxT2BlockState *t2 = NULL;
   ++b->hits;
+  if (b->hits >= Fbxt2HotnessThreshold()) t2 = FbxT2StateFor(m, b);
 
-  if (b->t2_funcref >= 0) {
-    int exit_code = Fbxt2Dispatch(m, b);
+  if (t2 && t2->funcref >= 0) {
+    int exit_code = Fbxt2Dispatch(m, b, t2);
     ++g_test_tier2_dispatches;
     if (exit_code == 0 || exit_code == 2) return;
     /* exit_code == 1: fall through to Tier 1 */
@@ -265,9 +278,19 @@ static void TestExecuteBlock(struct Machine *m, struct FbxTcBlock *b) {
   }
   ++g_test_tier1_walks;
 
-  if (!b->t2_attempted && b->hits >= Fbxt2HotnessThreshold()) {
-    Fbxt2TryEscalate(m, b);
+  if (t2 && !t2->attempted) {
+    Fbxt2TryEscalate(m, b, t2);
   }
+}
+
+/* firebox#HYS: read this Machine's Tier-2 state for `b`, materialising it
+ * unconditionally (the tests that pre-stash a synthetic funcref must be able
+ * to do so before the block is hot). */
+static struct FbxT2BlockState *TestT2(struct Machine *m,
+                                      struct FbxTcBlock *b) {
+  struct FbxT2BlockState *st = FbxT2StateFor(m, b);
+  ASSERT_NOTNULL(st);
+  return st;
 }
 
 /* ────────────────────────────────────────────────────────────────────────── */
@@ -309,8 +332,10 @@ TEST(FbxT2E2e, ScenarioASubstrateComposesEndToEnd) {
    * are valid — what we're discriminating is that the escalation path
    * FIRED, not its outcome on this synthetic input.  Tighten when
    * Scenario A2 (real busybox block) lands in §13.5+. */
-  ASSERT_EQ(1, (i64)b->t2_attempted);
-  if (b->t2_funcref >= 0) {
+  {
+  struct FbxT2BlockState *st = TestT2(&g_test_m, b);
+  ASSERT_EQ(1, (i64)st->attempted);
+  if (st->funcref >= 0) {
     /* Escalation succeeded — verify the dispatch path is now wired. */
     ASSERT_EQ(1, (i64)g_t2_instantiate_calls);
     /* Next dispatch returns 0 (normal completion). */
@@ -323,10 +348,11 @@ TEST(FbxT2E2e, ScenarioASubstrateComposesEndToEnd) {
     /* Escalation bailed (lift refused or emit refused) — that's the
      * supported-opcode-set narrow.  Subsequent dispatches stay on
      * Tier 1; the t2_attempted latch prevents re-escalation. */
-    ASSERT_EQ(-1, (i64)b->t2_funcref);
+    ASSERT_EQ(-1, (i64)st->funcref);
     TestExecuteBlock(&g_test_m, b);
     ASSERT_EQ(11, (i64)g_test_tier1_walks);
     ASSERT_EQ(0, (i64)g_test_tier2_dispatches);
+  }
   }
   FreeSyntheticBlock(b);
 }
@@ -339,8 +365,11 @@ TEST(FbxT2E2e, ScenarioAExplicitSuccessDispatchPath) {
   struct FbxTcBlock *b;
   int i;
   b = MakeSyntheticBlock(3);
-  b->t2_funcref = 42; /* synthetic funcref */
-  b->t2_attempted = 1; /* skip escalation */
+  /* Force the block hot so ExecuteBlock's gate materialises the state, then
+   * stash a synthetic funcref on THIS Machine's entry. */
+  b->hits = Fbxt2HotnessThreshold();
+  TestT2(&g_test_m, b)->funcref = 42;  /* synthetic funcref */
+  TestT2(&g_test_m, b)->attempted = 1; /* skip escalation */
 
   /* Tier 2 dispatch with exit_code=0 (normal): Tier 1 NOT walked. */
   g_t2_next_dispatch_exit = 0;
@@ -350,7 +379,7 @@ TEST(FbxT2E2e, ScenarioAExplicitSuccessDispatchPath) {
   ASSERT_EQ(0, (i64)g_test_tier1_walks);
   ASSERT_EQ(5, (i64)g_test_tier2_dispatches);
   ASSERT_EQ(5, (i64)g_t2_dispatch_calls);
-  ASSERT_EQ(5, (i64)b->hits);
+  ASSERT_EQ((i64)Fbxt2HotnessThreshold() + 5, (i64)b->hits);
   FreeSyntheticBlock(b);
 }
 
@@ -358,8 +387,9 @@ TEST(FbxT2E2e, ScenarioAExplicitSuccessDispatchPath) {
 TEST(FbxT2E2e, ScenarioBBailoutFallsThroughToTier1) {
   struct FbxTcBlock *b;
   b = MakeSyntheticBlock(3);
-  b->t2_funcref = 7; /* synthetic funcref */
-  b->t2_attempted = 1;
+  b->hits = Fbxt2HotnessThreshold();
+  TestT2(&g_test_m, b)->funcref = 7; /* synthetic funcref */
+  TestT2(&g_test_m, b)->attempted = 1;
 
   /* Tier 2 dispatch returns 1 (bailout) — Tier 1 MUST also walk. */
   g_t2_next_dispatch_exit = 1;
@@ -368,7 +398,7 @@ TEST(FbxT2E2e, ScenarioBBailoutFallsThroughToTier1) {
   ASSERT_EQ(1, (i64)g_test_tier1_walks);
   ASSERT_EQ(1, (i64)g_t2_dispatch_calls);
   /* funcref preserved — bailout doesn't invalidate the translation. */
-  ASSERT_EQ(7, (i64)b->t2_funcref);
+  ASSERT_EQ(7, (i64)TestT2(&g_test_m, b)->funcref);
   FreeSyntheticBlock(b);
 }
 
@@ -376,8 +406,9 @@ TEST(FbxT2E2e, ScenarioBBailoutFallsThroughToTier1) {
 TEST(FbxT2E2e, ScenarioBPrimeHostCallEscapeReturnsImmediately) {
   struct FbxTcBlock *b;
   b = MakeSyntheticBlock(3);
-  b->t2_funcref = 7;
-  b->t2_attempted = 1;
+  b->hits = Fbxt2HotnessThreshold();
+  TestT2(&g_test_m, b)->funcref = 7;
+  TestT2(&g_test_m, b)->attempted = 1;
 
   g_t2_next_dispatch_exit = 2;
   TestExecuteBlock(&g_test_m, b);
@@ -405,8 +436,8 @@ TEST(FbxT2E2e, ScenarioCInstantiateFailureLatches) {
   }
   ASSERT_EQ(6, (i64)g_test_tier1_walks);
   ASSERT_EQ(0, (i64)g_test_tier2_dispatches);
-  ASSERT_EQ(1, (i64)b->t2_attempted); /* latched */
-  ASSERT_EQ(-1, (i64)b->t2_funcref);  /* never set */
+  ASSERT_EQ(1, (i64)TestT2(&g_test_m, b)->attempted); /* latched */
+  ASSERT_EQ(-1, (i64)TestT2(&g_test_m, b)->funcref);  /* never set */
   /* Drive more — t2_attempted is latched, escalation must NOT retry. */
   for (i = 0; i < 10; ++i) {
     TestExecuteBlock(&g_test_m, b);
@@ -437,12 +468,103 @@ TEST(FbxT2E2e, ScenarioDKillSwitchPreventsEscalation) {
   /* t2_attempted DOES latch (the latch is set before the kill-switch
    * check — spec §6.1 idempotence requirement; setting first prevents
    * a racing thread from looping past the latch). */
-  ASSERT_EQ(1, (i64)b->t2_attempted);
-  ASSERT_EQ(-1, (i64)b->t2_funcref);
+  ASSERT_EQ(1, (i64)TestT2(&g_test_m, b)->attempted);
+  ASSERT_EQ(-1, (i64)TestT2(&g_test_m, b)->funcref);
   ASSERT_EQ(0, (i64)g_t2_instantiate_calls); /* kill-switch short-circuited */
 
   unsetenv("FIREBOX_T2");
   unsetenv("FBX_T2_HOTNESS_THRESHOLD");
+  FreeSyntheticBlock(b);
+}
+
+/* ────────────────────────────────────────────────────────────────────────── */
+/* firebox#HYS regression — a funcref minted by one Machine must NEVER be     */
+/* reachable from another Machine sharing the same System.                    */
+/*                                                                            */
+/* This is the defect frozen as a test.  A `t2_funcref` indexes               */
+/* `__indirect_function_table`, which is per WASM INSTANCE GROUP; a spawned   */
+/* guest thread re-instantiates into a fresh Store whose table is at the      */
+/* module's declared minimum.  While the funcref lived on `FbxTcBlock` (i.e.  */
+/* in `sys->tc`, shared), Machine 2 read Machine 1's index and                */
+/* `call_indirect`ed past the end of its own table:                           */
+/* "undefined element: out of bounds table access".                           */
+/*                                                                            */
+/* The assertion is deliberately about REACHABILITY, not about counters: it   */
+/* would fail against the pre-fix code on the very first dispatch from m2,    */
+/* which is the property the guest trap was reporting.                        */
+/* ────────────────────────────────────────────────────────────────────────── */
+TEST(FbxT2E2e, HysFuncrefIsNeverVisibleToASecondMachine) {
+  struct FbxTcBlock *b;
+  struct FbxT2BlockState *s1, *s2;
+  int i;
+  b = MakeSyntheticBlock(3);
+  b->hits = Fbxt2HotnessThreshold();
+
+  /* Machine 1 escalates: a funcref valid in ITS instance's table. */
+  s1 = TestT2(&g_test_m, b);
+  s1->funcref = 4242;
+  s1->attempted = 1;
+
+  /* Machine 2 — same System, same block, different instance.  It must see a
+   * VIRGIN state: no funcref, no latch.  Pre-fix these were one storage
+   * location and this read 4242. */
+  s2 = TestT2(&g_test_m2, b);
+  ASSERT_TRUE(s1 != s2);
+  ASSERT_EQ(-1, (i64)s2->funcref);
+  ASSERT_EQ(0, (i64)s2->attempted);
+
+  /* And it must STAY virgin as Machine 2 actually runs the block: every
+   * dispatch walks Tier 1, none crosses into Machine 1's translation. */
+  g_t2_next_dispatch_exit = 0;
+  for (i = 0; i < 5; ++i) {
+    TestExecuteBlock(&g_test_m2, b);
+  }
+  ASSERT_EQ(0, (i64)g_test_tier2_dispatches);
+  ASSERT_EQ(0, (i64)g_t2_dispatch_calls);
+  ASSERT_EQ(5, (i64)g_test_tier1_walks);
+  /* Machine 1's translation is untouched by any of that. */
+  ASSERT_EQ(4242, (i64)TestT2(&g_test_m, b)->funcref);
+  FreeSyntheticBlock(b);
+}
+
+/* firebox#HYS — the map must survive many distinct blocks (grow + rehash)
+ * and keep every key separable, because a real guest escalates hundreds of
+ * blocks per thread (the filed trace showed funcrefs 563..753 in ONE run). */
+TEST(FbxT2E2e, HysMapGrowsAndKeepsKeysSeparable) {
+  enum { kN = 500 };
+  struct FbxTcBlock *blocks[kN];
+  int i;
+  for (i = 0; i < kN; ++i) {
+    blocks[i] = MakeSyntheticBlock(1);
+    /* Distinct start_pc per block — that is the map key. */
+    blocks[i]->start_pc = 0x400000 + (u64)i * 0x40;
+    TestT2(&g_test_m, blocks[i])->funcref = 1000 + i;
+  }
+  /* Re-read every key: the grow/rehash must have preserved each mapping,
+   * and no two blocks may collide onto one slot. */
+  for (i = 0; i < kN; ++i) {
+    ASSERT_EQ(1000 + i, (i64)TestT2(&g_test_m, blocks[i])->funcref);
+    /* The second Machine still knows none of them. */
+    ASSERT_EQ(-1, (i64)TestT2(&g_test_m2, blocks[i])->funcref);
+  }
+  for (i = 0; i < kN; ++i) FreeSyntheticBlock(blocks[i]);
+}
+
+/* firebox#HYS — a TC invalidation (SMC / mmap over executable pages) frees
+ * every block, so every key a Machine holds is stale.  The epoch bump must
+ * drop the whole map lazily on that Machine's next lookup; otherwise a
+ * RECOMPILED block reusing a start_pc would inherit the dead block's funcref
+ * — a fresh block dispatching a translation of different code. */
+TEST(FbxT2E2e, HysTcEpochBumpRetiresTheMap) {
+  struct FbxTcBlock *b;
+  b = MakeSyntheticBlock(3);
+  TestT2(&g_test_m, b)->funcref = 99;
+  ASSERT_EQ(99, (i64)TestT2(&g_test_m, b)->funcref);
+
+  /* What FbxTcReset does to the System, without needing a live bucket array. */
+  atomic_fetch_add_explicit(&g_test_sys.tc.epoch, 1, memory_order_relaxed);
+
+  ASSERT_EQ(-1, (i64)TestT2(&g_test_m, b)->funcref);
   FreeSyntheticBlock(b);
 }
 

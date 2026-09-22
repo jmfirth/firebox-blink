@@ -57,6 +57,7 @@ extern "C" {
 
 struct Machine;
 struct FbxTcBlock;
+struct FbxT2BlockState;  /* firebox#HYS — blink/threadedcode.h */
 struct FbxT2BlockCtx;
 
 /* ────────────────────────────────────────────────────────────────────────── */
@@ -189,7 +190,12 @@ bool Fbxt2Enabled(void);
  * or bailed; on success also sets `b->t2_funcref` to the host-returned
  * funcref (>=0).  Safe to call multiple times — the latch + funcref
  * stashing make subsequent calls a fast no-op. */
-void Fbxt2TryEscalate(struct Machine *m, struct FbxTcBlock *b);
+/* firebox#HYS: `st` is THIS Machine's per-instance Tier-2 state for `b`
+ * (blink/threadedcode.h).  Every field this function writes — funcref,
+ * block_ctx, the latch and the retry cadence — is per-instance, because a
+ * funcref indexes a table owned by one wasm instance group.  Non-NULL. */
+void Fbxt2TryEscalate(struct Machine *m, struct FbxTcBlock *b,
+                      struct FbxT2BlockState *st);
 
 /* Dispatch a Tier-2-translated block.  Wraps `fbx_t2_dispatch` with the
  * §6.4 exit-code semantics.  Returns:
@@ -200,7 +206,8 @@ void Fbxt2TryEscalate(struct Machine *m, struct FbxTcBlock *b);
  *   2 — host-call escape: caller returns; outer dispatcher resumes
  * The funcref MUST be the value previously stashed onto `b` by
  * `Fbxt2TryEscalate` (we don't validate it here for hot-path cost). */
-int Fbxt2Dispatch(struct Machine *m, struct FbxTcBlock *b);
+int Fbxt2Dispatch(struct Machine *m, struct FbxTcBlock *b,
+                  struct FbxT2BlockState *st);
 
 /* Test/diagnostic helper — resets the cached `Fbxt2HotnessThreshold`
  * and `Fbxt2Enabled` values so a subsequent call re-reads the env.
