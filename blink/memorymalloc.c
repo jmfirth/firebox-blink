@@ -906,7 +906,15 @@ i64 ReserveVirtual(struct System *s, i64 virt, i64 size, u64 flags, int fd,
     // please note we need to take off the seatbelt after an execve().
     errno = 0;
     want = virt ? ToHost(virt) : 0;
-    if ((got = Mmap(want, size, sysprot,                    //
+    // firebox#86C: ask the host for the whole 4096-byte pages this mapping
+    // is accounted as (`pages` above), not the guest's byte length. Every
+    // later Munmap() of these pages (guest munmap, FreeVirtual at exit) is
+    // page-granular, and a host whose munmap matches the mapping's recorded
+    // byte length (wasix-libc's emulated mman) refuses a page-rounded unmap
+    // of an odd-length map with EINVAL -- which killed every such guest at
+    // teardown with `!FreeVirtual(...)`. A kernel rounds the length up the
+    // same way, so this is identical on a native host.
+    if ((got = Mmap(want, pages * 4096, sysprot,            //
                     (method |                               //
                      (fd == -1 ? MAP_ANONYMOUS_ : 0) |      //
                      (shared ? MAP_SHARED : MAP_PRIVATE)),  //
