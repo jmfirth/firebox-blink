@@ -922,6 +922,20 @@ i64 ReserveVirtual(struct System *s, i64 virt, i64 size, u64 flags, int fd,
       if (got == MAP_FAILED && errno == ENOMEM && !mutated) {
         LOGF("host system returned ENOMEM");
         return -1;
+      } else if (got == MAP_FAILED && method == MAP_DEMAND && MAP_DENIED &&
+                 errno == MAP_DENIED && !mutated) {
+        // firebox#RZA: the host refused a MAP_DEMAND (no-clobber) request
+        // because something already occupies that address -- on wasm, the
+        // host heap shares blink's one linear memory, and wasix-libc now
+        // answers EEXIST instead of overwriting it. Nothing was changed on
+        // this path (a linear mapping removes nothing first), so this is an
+        // ordinary collision, not a crisis: fail the reservation and let the
+        // caller answer the guest. For brk() that is exactly Linux's
+        // behaviour when the extension collides -- the break stays put and
+        // the guest's malloc falls back to mmap.
+        LOGF("host refused to clobber %#" PRIx64 "+%#" PRIx64 ": %s", virt,
+             size, DescribeHostErrno(errno));
+        return -1;
       } else if (got != MAP_FAILED && !want) {
         virt = ToGuest(got);
         unassert(IsValidAddrSize(virt, size));
