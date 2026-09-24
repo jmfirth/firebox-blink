@@ -266,6 +266,17 @@ _Noreturn static void PrintVersion(void) {
 static void GetOpts(int argc, char *argv[]) {
   int opt;
   FLAG_nolinear = !CanHaveLinearMemory();
+#if defined(__wasm__)
+  // firebox#RZA: on wasm the software MMU is the default, and the only mode.
+  // Linear mode maps guest VA onto the one linear memory at kSkew==0, so a
+  // fixed-address guest image (0x400000, 0x1000000) and the guest brk land on
+  // blink's own data, stack and heap. That "worked" only while wasix-libc's
+  // MAP_FIXED_NOREPLACE silently clobbered owned memory; with the honest
+  // EEXIST it cannot load a guest at all. A sound linear mode needs a guest
+  // region disjoint from the host's (kSkew separation), tracked as a
+  // performance follow-up. -m keeps its meaning (it is now the default).
+  FLAG_nolinear = true;
+#endif
 #ifndef DISABLE_OVERLAYS
   FLAG_overlays = getenv("BLINK_OVERLAYS");
   if (!FLAG_overlays) FLAG_overlays = DEFAULT_OVERLAYS;
