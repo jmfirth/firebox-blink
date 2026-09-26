@@ -42,6 +42,48 @@
 #include "blink/machine.h"
 #include "blink/threadedcode.h"
 
+#ifdef __wasm__
+/* firebox#FSZ — Blink's OWN Tier-2 dispatch table.
+ *
+ * Guest-side dispatch (#786) used to `call_indirect` through
+ * `__indirect_function_table` with the host appending one slot per hot block.
+ * That only works while that table is Blink's alone, i.e. the static link.
+ * Under Route C (a -pie thin main over libc.so) the table is IMPORTED: it is the
+ * dynamic linker's, `--export-table` is refused, and the linker allocates
+ * indices in it in lockstep across every instance group.  The host therefore
+ * found no table to append to, fell back to host dispatch, and handed back a
+ * HOST registry index that this file then `call_indirect`ed into the LINKER's
+ * table: blink32 died on "indirect call type mismatch", blink64 panicked the
+ * whole runtime before it got that far.
+ *
+ * A second table that Blink defines and exports gives T2 slots nobody else
+ * allocates in, in both link shapes, with no linker coordination.  It is not
+ * reachable from C (clang cannot name a second table from a function-pointer
+ * call), so the table and its one caller are declared here in assembly.  The
+ * host (`crates/firebox-wasix/src/t2_bridge.rs`) binds the `fbx_t2_table`
+ * export in preference to `__indirect_function_table`.  On wasm64 a defined
+ * table is a table64, so its index is i64 there; the block ABI is unchanged:
+ * `(i32 m_ptr, i32 block_ctx_ptr) -> (i32 exit)`. */
+#ifdef __wasm64__
+#define FBX_T2_TABLE_INDEX_TYPE "i64"
+#else
+#define FBX_T2_TABLE_INDEX_TYPE "i32"
+#endif
+__asm__("  .tabletype fbx_t2_table, funcref\n"
+        "  .globl fbx_t2_table\n"
+        "fbx_t2_table:\n"
+        "  .globl fbx_t2_call\n"
+        "  .type fbx_t2_call,@function\n"
+        "fbx_t2_call:\n"
+        "  .functype fbx_t2_call (" FBX_T2_TABLE_INDEX_TYPE ", i32, i32) -> (i32)\n"
+        "  local.get 1\n"
+        "  local.get 2\n"
+        "  local.get 0\n"
+        "  call_indirect fbx_t2_table, (i32, i32) -> (i32)\n"
+        "  end_function\n");
+int fbx_t2_call(uintptr_t index, i32 m_ptr, i32 block_ctx_ptr);
+#endif
+
 /* ────────────────────────────────────────────────────────────────────────── */
 /* Trace flag — `FIREBOX_T2_TRACE=escalations,bailouts,verbose,all` per      */
 /* spec §11.2 table.  Categories not in that table are silently dropped       */
@@ -454,6 +496,21 @@ void Fbxt2TryEscalate(struct Machine *m, struct FbxTcBlock *b,
                   (void *)m->system, (unsigned long long)b->start_pc);
       return;
     }
+    /* firebox#FSZ — the block ABI carries `m_ptr` and `block_ctx_ptr` as i32
+     * linear offsets and the block imports a 32-bit memory view.  A wasm64
+     * Blink's memory is not bounded at 4 GiB (Route C blink64: 8 GiB), so a
+     * Machine or ctx allocated above it would be TRUNCATED and the block would
+     * read and write some other object — silently.  Stay Tier 1 instead. */
+    if ((u64)(uintptr_t)m + sizeof(*m) > 0x100000000ull ||
+        (u64)(uintptr_t)ctx + sizeof(*ctx) > 0x100000000ull) {
+      free(ctx);
+      fbx_ir_free(ir);
+      fbx_wasm_buffer_free(&buf);
+      T2TraceLine(g_t2_trace_escalations,
+                  "[t2 escalate] sys=%p pc=%#llx outcome=ptr_above_4g\n",
+                  (void *)m->system, (unsigned long long)b->start_pc);
+      return;
+    }
     ctx->version = FBX_T2_BLOCK_CTX_VERSION;
     ctx->nconsts = nconsts;
     for (ci = 0; ci < FBX_T2_BLOCK_CTX_MAX_CONSTS; ++ci) {
@@ -547,10 +604,10 @@ int Fbxt2Dispatch(struct Machine *m, struct FbxTcBlock *b,
    * host computed under the old host-dispatch path.  `t2_funcref >= 0` is
    * guaranteed by the ExecuteBlock fast-path gate (threadedcode.c). */
   {
-    typedef int (*FbxT2BlockFn)(i32, i32);
+    /* firebox#FSZ: through Blink's own `fbx_t2_table`, never the (possibly
+     * linker-owned) `__indirect_function_table` — see the table's comment. */
     i32 ctx_ptr = (i32)(intptr_t)st->block_ctx;
-    FbxT2BlockFn fn = (FbxT2BlockFn)(uintptr_t)(u32)st->funcref;
-    exit_code = fn(m_ptr, ctx_ptr);
+    exit_code = fbx_t2_call((uintptr_t)(u32)st->funcref, m_ptr, ctx_ptr);
   }
 #else
   /* Native test bench: no in-guest table; keep the host-dispatch shim (the

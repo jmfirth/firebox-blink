@@ -627,7 +627,17 @@ static int CoverageGate(const struct FbxIrBlock *ir,
      * follow-on (work/tasks/737).  REG_GET/REG_SET/LEA were never refused
      * (they touch only `m_ptr + offsetof` into the Machine struct, a real
      * linear-memory C object). */
+    /* firebox#FSZ: a wasm64 Blink's memory is not bounded at 4 GiB (Route C
+     * blink64: 8 GiB), so even a LINEAR guest VA cannot be `i32.wrap_i64`ed
+     * into the block's 32-bit view without aliasing.  The stack ops below do
+     * exactly that wrap, so on wasm64 they take the refusal whatever the
+     * mapping mode.  LOAD/STORE are safe: they translate and bail above 4 GiB
+     * (EmitGuestVaToHostOffsetOrBailout, check (f)). */
+#ifdef __wasm64__
+    if (1) {
+#else
     if (!HasLinearMapping()) {
+#endif
       /* firebox#738 — the wide (8-byte / i64) guest LOAD is RE-ENABLED here.
        * SESSION 4 proved the wide LOAD INNOCENT (the LOAD value is byte-faithful
        * to the host's own read at the same translated offset, three independent
@@ -2497,6 +2507,25 @@ static void EmitGuestVaToHostOffsetOrBailout(struct FbxWasmBuffer *body,
   /* i64.gt_u (0x56). */
   fbx_wasm_buffer_u8(body, 0x56u);                       /* → i32 */
   fbx_wasm_buffer_u8(body, WASM_OP_I32_OR);
+
+#ifdef __wasm64__
+  /* (f) firebox#FSZ: host page at or above 4 GiB.  The block addresses a
+   * 32-bit view of Blink's memory (the `i32.wrap_i64` below), but a wasm64
+   * Blink's memory is not bounded there (Route C blink64: 8 GiB), so such a
+   * page would WRAP onto an unrelated low address and the access would
+   * silently hit the wrong bytes.  The access cannot cross the page (check
+   * above), so a page base <= 0xFFFFF000 keeps the whole access below 4 GiB. */
+  fbx_wasm_buffer_u8(body, WASM_OP_LOCAL_GET);
+  fbx_wasm_buffer_uleb(body, mmu_entry);
+  fbx_wasm_buffer_u8(body, WASM_OP_I64_CONST);
+  fbx_wasm_buffer_sleb(body, (i64)M_PAGE_TA);
+  fbx_wasm_buffer_u8(body, WASM_OP_I64_AND);
+  fbx_wasm_buffer_u8(body, WASM_OP_I64_CONST);
+  fbx_wasm_buffer_sleb(body, (i64)0xFFFFF000ll);
+  /* i64.gt_u (0x56). */
+  fbx_wasm_buffer_u8(body, 0x56u);                       /* → i32 */
+  fbx_wasm_buffer_u8(body, WASM_OP_I32_OR);
+#endif
 
   /* if (fail) { m->ip = bailout_pc; return 1 } */
   fbx_wasm_buffer_u8(body, WASM_OP_IF);

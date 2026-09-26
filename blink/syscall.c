@@ -78,6 +78,7 @@
 #include "blink/strace.h"
 #include "blink/swap.h"
 #include "blink/thread.h"
+#include "blink/threadedcode.h"
 #include "blink/timespec.h"
 #include "blink/util.h"
 #include "blink/vfs.h"
@@ -456,6 +457,14 @@ static int Fork(struct Machine *m, u64 flags, u64 stack, u64 ctid) {
     m->tid = m->system->pid = newpid;
     m->system->isfork = true;
     RemoveOtherThreads(m->system);
+    /* firebox#FSZ: this Machine's Tier-2 translations are funcrefs in the
+     * PARENT instance's `fbx_t2_table`.  A fork child is a new instance: under
+     * a static link wasmer regrows the table and firebox refills it with
+     * bailout stubs (#7MX), but under a dynamic link (Route C) the linker
+     * rebuilds the child from scratch and the table comes back EMPTY, so an
+     * inherited index traps out of bounds.  Drop the map; hot blocks simply
+     * re-escalate in the child against its own table. */
+    FbxT2StateFree(m);
 #ifdef __CYGWIN__
     // Cygwin doesn't seem to properly set the PROT_EXEC
     // protection for JIT blocks after forking.
