@@ -18,6 +18,7 @@
 #include "blink/fbx_ir.h"
 #include "blink/rde.h"
 #include "blink/threadedcode.h"
+#include "blink/x86.h"
 #include "blink/types.h"
 #include "test/test.h"
 
@@ -1190,4 +1191,124 @@ TEST(FbxIrLiftRat, MovImmByteFormWritesOneByte) {
   EXPECT_EQ(0, RatRefused(0x0C7, LIFT_RDE_MOD3, &first));
   EXPECT_EQ(FBX_IR_OP_REG_SET, first.opcode);
   EXPECT_EQ(4, (i64)first.width);
+}
+
+/* ────────────────────────────────────────────────────────────────────────── */
+/* firebox#RAT, second-lineage review — refusals that only REAL BYTES show.   */
+/*                                                                            */
+/* These go through the decoder (blink/x86.c), because two of the shapes are  */
+/* invisible in a hand-built `rde`: a VEX prefix is folded into the map and   */
+/* prefix fields (so `c5 f8 b6 c0` decodes to Mopcode 0x1B6), and the LOCK    */
+/* bit is one modrm.h's Lock() cannot read in a build without HAVE_THREADS.   */
+/* ────────────────────────────────────────────────────────────────────────── */
+
+/* Decode `n` bytes as one long-mode instruction, lift it alone, and report
+ * whether the lifter REFUSED it (PC_MARK + BAILOUT at its own PC). */
+static int RatBytesRefused(const u8 *bytes, unsigned n) {
+  struct FbxTcBlock *b = (struct FbxTcBlock *)calloc(1, sizeof *b);
+  struct FbxTcEntry *e = (struct FbxTcEntry *)calloc(1, sizeof *e);
+  struct FbxIrBlock *ir;
+  u8 buf[15];
+  int refused;
+  memset(buf, 0x90, sizeof buf);
+  memcpy(buf, bytes, n);
+  ASSERT_EQ(0, DecodeInstruction(&e->xedd, buf, sizeof buf, XED_MODE_LONG));
+  ASSERT_EQ((i64)n, (i64)e->xedd.length);
+  e->ip = 0x400000;
+  e->rde = e->xedd.op.rde;
+  e->uimm0 = e->xedd.op.uimm0;
+  e->disp = e->xedd.op.disp;
+  e->oplen = (u16)n;
+  e->kind = FBX_TC_KIND_NORMAL;
+  b->start_pc = 0x400000;
+  b->end_pc = 0x400000 + n;
+  b->page = 0x400000;
+  b->nentries = 1;
+  b->entries = e;
+  ir = fbx_ir_lift(b);
+  ASSERT_NOTNULL(ir);
+  refused = BlockHas(ir, FBX_IR_OP_BAILOUT);
+  if (refused) {
+    EXPECT_EQ(2, (i64)ir->ninsts);
+    EXPECT_EQ(FBX_IR_OP_BAILOUT, ir->insts[1].opcode);
+    EXPECT_EQ((i64)0x400000, (i64)ir->insts[1].imm);
+  }
+  fbx_ir_free(ir);
+  FreeTc(b);
+  return refused;
+}
+#define RAT_BYTES(...) \
+  RatBytesRefused((const u8[]){__VA_ARGS__}, sizeof((const u8[]){__VA_ARGS__}))
+
+TEST(FbxIrLiftRat, DecodedControlsAreLiftedAsTheirOwnRegisters) {
+  /* The decoder agrees with the hand-built rde tests above. */
+  EXPECT_EQ(1, RAT_BYTES(0x80, 0xf4, 0x40));       /* xor $0x40,%ah       */
+  EXPECT_EQ(0, RAT_BYTES(0x40, 0x80, 0xf4, 0x40)); /* xor $0x40,%spl      */
+  EXPECT_EQ(1, RAT_BYTES(0x0f, 0xb6, 0xce));       /* movzbl %dh,%ecx     */
+  EXPECT_EQ(0, RAT_BYTES(0x40, 0x0f, 0xb6, 0xce)); /* movzbl %sil,%ecx    */
+  /* REX.B / REX.R: rm = r8b, reg = r9b..r15b — never a high byte. */
+  EXPECT_EQ(0, RAT_BYTES(0x41, 0x0f, 0xb6, 0xc0)); /* movzbl %r8b,%eax    */
+  EXPECT_EQ(0, RAT_BYTES(0x41, 0x0f, 0xb6, 0xc4)); /* movzbl %r12b,%eax   */
+  EXPECT_EQ(0, RAT_BYTES(0x44, 0x88, 0xe0));       /* mov %r12b,%al       */
+  EXPECT_EQ(0, RAT_BYTES(0x45, 0x30, 0xec));       /* xor %r13b,%r12b     */
+  EXPECT_EQ(0, RAT_BYTES(0x88, 0xc8));             /* mov %cl,%al         */
+}
+
+TEST(FbxIrLiftRat, LockPrefixIsAlwaysRefused) {
+  EXPECT_EQ(1, RAT_BYTES(0xf0, 0x88, 0x03));       /* lock mov %al,(%rbx)  #UD */
+  EXPECT_EQ(1, RAT_BYTES(0xf0, 0x00, 0xc0));       /* lock add %al,%al     #UD */
+  EXPECT_EQ(1, RAT_BYTES(0xf0, 0x48, 0x01, 0xd8)); /* lock add %rbx,%rax   #UD */
+  EXPECT_EQ(1, RAT_BYTES(0xf0, 0x48, 0x8b, 0x03)); /* lock mov (%rbx),%rax #UD */
+  /* The same instructions without the prefix stay lifted. */
+  EXPECT_EQ(0, RAT_BYTES(0x88, 0x03));
+  EXPECT_EQ(0, RAT_BYTES(0x00, 0xc0));
+  EXPECT_EQ(0, RAT_BYTES(0x48, 0x01, 0xd8));
+  /* A hand-built rde with the raw LOCK bit is refused too. */
+  EXPECT_EQ(1, RatRefused(0x001, LIFT_RDE_MOD3 | (u64)020000000000, 0));
+}
+
+TEST(FbxIrLiftRat, VexEncodedInstructionsAreRefused) {
+  /* c5 f8 b6 c0: a 2-byte VEX prefix in front of map-0F opcode B6.  It
+   * decodes to Mopcode 0x1B6 — MOVZX's — and was lifted as MOVZX. */
+  EXPECT_EQ(1, RAT_BYTES(0xc5, 0xf8, 0xb6, 0xc0));
+  /* c4 e1 78 b6 c0: the same through the 3-byte prefix. */
+  EXPECT_EQ(1, RAT_BYTES(0xc4, 0xe1, 0x78, 0xb6, 0xc0));
+  /* c5 f8 af c0: VEX in front of 0F AF (IMUL's opcode). */
+  EXPECT_EQ(1, RAT_BYTES(0xc5, 0xf8, 0xaf, 0xc0));
+  /* The legacy encodings stay lifted. */
+  EXPECT_EQ(0, RAT_BYTES(0x0f, 0xb6, 0xc0));
+  EXPECT_EQ(0, RAT_BYTES(0x0f, 0xaf, 0xc0));
+}
+
+TEST(FbxIrLiftRat, MovImmGroupAdmitsOnlySlashZero) {
+  unsigned reg;
+  EXPECT_EQ(1, RAT_BYTES(0xc6, 0xc8, 0x55));                   /* C6 /1 reserved */
+  EXPECT_EQ(1, RAT_BYTES(0xc6, 0xf8, 0x55));                   /* XABORT         */
+  EXPECT_EQ(1, RAT_BYTES(0xc7, 0xf8, 0x00, 0x00, 0x00, 0x00)); /* XBEGIN         */
+  EXPECT_EQ(0, RAT_BYTES(0xc6, 0xc0, 0x55));                   /* mov $0x55,%al  */
+  EXPECT_EQ(0, RAT_BYTES(0xc7, 0xc0, 0x55, 0x00, 0x00, 0x00)); /* mov $0x55,%eax */
+  for (reg = 0; reg < 8; ++reg) {
+    EXPECT_EQ(reg != 0, RatRefused(0x0C6, LIFT_RDE_MOD3 | RAT_REX | RAT_REG(reg), 0));
+    EXPECT_EQ(reg != 0, RatRefused(0x0C7, LIFT_RDE_MOD3 | RAT_REG(reg), 0));
+    /* Group 1: ADC (/2) and SBB (/3) are the members not lifted. */
+    EXPECT_EQ(reg == 2 || reg == 3,
+              RatRefused(0x083, LIFT_RDE_MOD3 | RAT_REG(reg), 0));
+    EXPECT_EQ(reg == 2 || reg == 3,
+              RatRefused(0x081, LIFT_RDE_MOD3 | RAT_REG(reg), 0));
+    EXPECT_EQ(reg == 2 || reg == 3,
+              RatRefused(0x080, LIFT_RDE_MOD3 | RAT_REX | RAT_REG(reg), 0));
+  }
+}
+
+TEST(FbxIrLiftRat, OtherOpcodeGroupsAreNotAdmittedAtAll) {
+  /* 0x82, shifts C0/C1/D0-D3, F6/F7, FE/FF, 0F BA, 8F: every /digit refused. */
+  static const u16 kGroups[] = {0x082, 0x0C0, 0x0C1, 0x0D0, 0x0D1, 0x0D2,
+                                0x0D3, 0x0F6, 0x0F7, 0x0FE, 0x0FF, 0x1BA,
+                                0x08F};
+  unsigned i, reg;
+  for (i = 0; i < sizeof kGroups / sizeof kGroups[0]; ++i) {
+    for (reg = 0; reg < 8; ++reg) {
+      EXPECT_EQ(1, RatRefused(kGroups[i], LIFT_RDE_MOD3 | RAT_REG(reg), 0));
+    }
+  }
 }

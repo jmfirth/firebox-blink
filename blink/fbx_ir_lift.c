@@ -523,11 +523,55 @@ static int LiftIsHighByteReg(u64 rde, u32 reg3) {
   return !Rex(rde) && (reg3 & 4u);
 }
 
+/* firebox#RAT (second-lineage review) — the LOCK bit of `rde`, read RAW.
+ * blink/modrm.h's Lock() is the constant 0 in a build without HAVE_THREADS,
+ * but the decoder (blink/x86.c, prefix 0xF0) sets the bit in every build. */
+#define FBX_LIFT_RDE_LOCK ((u64)020000000000)
+
+/* True iff the instruction was VEX- or EVEX-encoded.  `rde` does not say so:
+ * the decoder folds a VEX prefix into the map/rep/osz/rex fields, so
+ * `c5 f8 b6 c0` arrives here with Mopcode 0x1B6 and looks like MOVZX.  The
+ * raw bytes do say so: in long mode, C4/C5 (LES/LDS) and 62 (BOUND) are not
+ * instructions, so one of them as the first byte after the legacy and REX
+ * prefixes can only be the escape.  XOP (8F with map >= 8) needs no arm: its
+ * opcode byte is 0x8F, which has no role entry and is refused as unclassified.
+ * An entry carrying no bytes (a unit-test fixture built from `rde` alone) is
+ * not VEX. */
+static int LiftIsVexEncoded(const struct FbxTcEntry *e) {
+  unsigned i;
+  unsigned n = e->xedd.length;
+  if (n > sizeof e->xedd.bytes) n = sizeof e->xedd.bytes;
+  for (i = 0; i < n; ++i) {
+    u8 b = e->xedd.bytes[i];
+    switch (b) {
+      case 0x66: case 0x67: case 0x2E: case 0x36: case 0x3E: case 0x26:
+      case 0x64: case 0x65: case 0xF0: case 0xF2: case 0xF3:
+        continue;
+      case 0xC4: case 0xC5: case 0x62:
+        return 1;
+      default:
+        if ((b & 0xF0) == 0x40) continue; /* REX */
+        return 0;
+    }
+  }
+  return 0;
+}
+
 /* Returns 1 if `rde` uses an operand shape the IR cannot express (see above);
  * the caller must BAILOUT rather than lift. */
 static int LiftOperandShapeUnmodelled(u64 rde, u64 mop) {
   int roles = LiftOperandRoles(mop);
   if (roles == FBX_LIFT_UNCLASSIFIED) return 1;
+  /* LOCK.  No lifter here models an atomic read-modify-write, and on every
+   * form this file CAN lift (register destinations, MOV, LEA, branches) the
+   * prefix is #UD — which is Tier 1's to raise.  Refuse them all. */
+  if (rde & FBX_LIFT_RDE_LOCK) return 1;
+  /* Opcode GROUPS: ModRM.reg selects the instruction, so each admitted group
+   * names its members.  C6/C7 are MOV only as /0 — C6 /7 is XABORT, C7 /7 is
+   * XBEGIN, /1../6 are reserved.  0x80/0x81/0x83 name theirs in AluSubOp
+   * (ADC /2 and SBB /3 are refused there).  No other group opcode (0x82,
+   * C0/C1, D0-D3, F6/F7, FE/FF, 0F BA, 8F) has a role entry at all. */
+  if ((mop == 0x0C6 || mop == 0x0C7) && ModrmReg(rde) != 0) return 1;
   if (!(roles & FBX_LIFT_HAS_MODRM)) return 0;
   if ((roles & FBX_LIFT_REG_BYTE) &&
       LiftIsHighByteReg(rde, (u32)ModrmReg(rde))) {
@@ -1204,6 +1248,7 @@ static int LiftOne(struct LiftCtx *ctx, const struct FbxTcEntry *e,
   u64 mop = Mopcode(rde);
   /* firebox#RAT — refuse the operand shapes the IR cannot express BEFORE any
    * lifter reads a register number or an addressing form out of `rde`. */
+  if (LiftIsVexEncoded(e)) return -1;
   if (LiftOperandShapeUnmodelled(rde, mop)) return -1;
   switch (mop) {
     /* MOV r/m, r — opcode 0x88 (byte) and 0x89 (word).  #677 routes the

@@ -830,8 +830,15 @@ static int CoverageGate(const struct FbxIrBlock *ir,
       case 0x024: case 0x025: case 0x02C: case 0x02D:
       case 0x034: case 0x035: case 0x03C: case 0x03D:
         break;
-      /* MOV r/m, imm and group-1 r/m, imm: require modrm.mod==3 as well. */
+      /* MOV r/m, imm and group-1 r/m, imm: require modrm.mod==3 as well.
+       * firebox#RAT: C6/C7 are MOV only as /0 (/7 is XABORT / XBEGIN); the
+       * lifter refuses the rest, and this gate does not rely on that. */
       case 0x0C6: case 0x0C7:
+        if (ModrmReg(rde) != 0) {
+          SetFail(fail, FBX_IR_EMIT_UNSUPPORTED_MOPCODE, (u8)(mop & 0xFF));
+          return 0;
+        }
+        /* fallthrough */
       case 0x080: case 0x081: case 0x083:
         if (!Mod3(rde)) {
           SetFail(fail, FBX_IR_EMIT_MOD3_REQUIRED, (u8)(mop & 0xFF));
