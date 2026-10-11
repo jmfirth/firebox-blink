@@ -1033,3 +1033,161 @@ TEST(FbxIrLift, Movzx8Rexw) {
   fbx_ir_free(ir);
   FreeTc(tc);
 }
+
+/* ────────────────────────────────────────────────────────────────────────── */
+/* firebox#RAT — operand shapes a register NUMBER cannot express.             */
+/*                                                                            */
+/* rde fields used below (blink/rde.h):                                       */
+/*   ModrmReg  bits 0-2      Rex       bit 4 (any REX prefix present)         */
+/*   ModrmRm   bits 7-9      Sego      bits 18-20 (5 = %fs, 6 = %gs)          */
+/*   Asz       bit 21        ModrmMod  bits 22-23                             */
+/* ────────────────────────────────────────────────────────────────────────── */
+
+#define RAT_REG(n) ((u64)(n))
+#define RAT_RM(n)  ((u64)(n) << 7)
+#define RAT_REX    ((u64)0x10)
+#define RAT_GS     ((u64)6 << 18)
+#define RAT_ASZ    ((u64)1 << 21)
+
+/* Lift one instruction and report whether it was REFUSED (a BAILOUT at its
+ * own PC with nothing translated).  *out_first receives the first non-marker
+ * IR inst of a lifted instruction, zeroed otherwise. */
+static int RatRefused(u64 mop, u64 rde_extra, struct FbxIrInst *out_first) {
+  struct FbxTcBlock *tc = MakeTc(mop, rde_extra, 0x40, 0x18, 0x400000, 3,
+                                 FBX_TC_KIND_NORMAL);
+  struct FbxIrBlock *ir = fbx_ir_lift(tc);
+  int refused;
+  u32 i;
+  if (out_first) memset(out_first, 0, sizeof *out_first);
+  ASSERT_NOTNULL(ir);
+  refused = BlockHas(ir, FBX_IR_OP_BAILOUT);
+  if (refused) {
+    /* Refusal means NOTHING of the instruction was translated. */
+    EXPECT_EQ(2, (i64)ir->ninsts);
+    EXPECT_EQ(FBX_IR_OP_PC_MARK, ir->insts[0].opcode);
+    EXPECT_EQ(FBX_IR_OP_BAILOUT, ir->insts[1].opcode);
+    EXPECT_EQ((i64)0x400000, (i64)ir->insts[1].imm);
+  } else if (out_first) {
+    for (i = 0; i < ir->ninsts; ++i) {
+      if (ir->insts[i].opcode != FBX_IR_OP_PC_MARK) {
+        *out_first = ir->insts[i];
+        break;
+      }
+    }
+  }
+  fbx_ir_free(ir);
+  FreeTc(tc);
+  return refused;
+}
+
+TEST(FbxIrLiftRat, AwkXorAhIsRefusedNotLiftedAsSpl) {
+  /* 80 f4 40 = xor $0x40,%ah: ModRM f4 → mod=3 reg=6 (/6 XOR) rm=4, no REX.
+   * This is the busybox awk instruction.  Lifted by number it was
+   * `xor $0x40,%spl`. */
+  struct FbxIrInst first;
+  EXPECT_EQ(1, RatRefused(0x080, LIFT_RDE_MOD3 | RAT_REG(6) | RAT_RM(4), 0));
+  /* 40 80 f4 40 = xor $0x40,%spl: the SAME number with a REX prefix really is
+   * SPL, and stays lifted — as a byte read of greg 4. */
+  EXPECT_EQ(0, RatRefused(0x080,
+                          LIFT_RDE_MOD3 | RAT_REX | RAT_REG(6) | RAT_RM(4),
+                          &first));
+  EXPECT_EQ(FBX_IR_OP_REG_GET, first.opcode);
+  EXPECT_EQ(1, (i64)first.width);
+  EXPECT_EQ(4, (i64)first.src1);
+  /* 80 f0 40 = xor $0x40,%al: a low byte needs no REX and stays lifted. */
+  EXPECT_EQ(0, RatRefused(0x080, LIFT_RDE_MOD3 | RAT_REG(6) | RAT_RM(0), 0));
+}
+
+TEST(FbxIrLiftRat, HighByteInRmFieldIsRefusedForEveryByteOpcode) {
+  /* r/m = 4..7 without REX is AH/CH/DH/BH for every opcode whose r/m operand
+   * is a byte.  reg = 0 (AL, or the /0 extension) keeps the other field out
+   * of the picture. */
+  static const u16 kRmByte[] = {0x088, 0x08A, 0x000, 0x008, 0x020, 0x028,
+                                0x030, 0x038, 0x002, 0x00A, 0x022, 0x02A,
+                                0x032, 0x03A, 0x084, 0x080, 0x0C6, 0x1B6};
+  unsigned i, rm;
+  for (i = 0; i < sizeof kRmByte / sizeof kRmByte[0]; ++i) {
+    for (rm = 0; rm < 8; ++rm) {
+      EXPECT_EQ(rm >= 4, RatRefused(kRmByte[i], LIFT_RDE_MOD3 | RAT_RM(rm), 0));
+      EXPECT_EQ(0, RatRefused(kRmByte[i], LIFT_RDE_MOD3 | RAT_REX | RAT_RM(rm),
+                              0));
+    }
+  }
+}
+
+TEST(FbxIrLiftRat, HighByteInRegFieldIsRefusedInRegAndMemForms) {
+  /* reg = 4..7 without REX is a high byte only where ModRM.reg IS a byte
+   * register — including the memory forms: `mov %ah,0x18(%rax)` reads AH,
+   * `mov 0x18(%rax),%ah` writes it. */
+  static const u16 kRegByte[] = {0x088, 0x08A, 0x000, 0x008, 0x020,
+                                 0x028, 0x030, 0x038, 0x002, 0x00A,
+                                 0x022, 0x02A, 0x032, 0x03A, 0x084};
+  unsigned i, reg;
+  for (i = 0; i < sizeof kRegByte / sizeof kRegByte[0]; ++i) {
+    for (reg = 0; reg < 8; ++reg) {
+      EXPECT_EQ(reg >= 4,
+                RatRefused(kRegByte[i], LIFT_RDE_MOD3 | RAT_REG(reg), 0));
+      EXPECT_EQ(0, RatRefused(kRegByte[i],
+                              LIFT_RDE_MOD3 | RAT_REX | RAT_REG(reg), 0));
+    }
+  }
+  EXPECT_EQ(1, RatRefused(0x088, LIFT_RDE_MEM_BASE_DISP8 | RAT_REG(4), 0));
+  EXPECT_EQ(1, RatRefused(0x08A, LIFT_RDE_MEM_BASE_DISP8 | RAT_REG(4), 0));
+  EXPECT_EQ(0, RatRefused(0x088, LIFT_RDE_MEM_BASE_DISP8 | RAT_REG(3), 0));
+  /* ModRM.reg of MOVZX is the WIDE destination and of 0x80 an opcode
+   * extension: numbers 4..7 there are not high bytes. */
+  EXPECT_EQ(0, RatRefused(0x1B6, LIFT_RDE_MOD3 | RAT_REG(6), 0));
+  EXPECT_EQ(0, RatRefused(0x080, LIFT_RDE_MOD3 | RAT_REG(6), 0));
+}
+
+TEST(FbxIrLiftRat, WideOpcodesKeepRegisterNumbersFourToSeven) {
+  /* Negative control: in a 16/32/64-bit operand, numbers 4..7 are
+   * SP/BP/SI/DI with or without REX.  These must NOT be refused. */
+  static const u16 kWide[] = {0x089, 0x08B, 0x001, 0x029, 0x031, 0x039,
+                              0x003, 0x02B, 0x085, 0x1B7, 0x1AF};
+  unsigned i, n;
+  for (i = 0; i < sizeof kWide / sizeof kWide[0]; ++i) {
+    for (n = 4; n < 8; ++n) {
+      EXPECT_EQ(0, RatRefused(kWide[i], LIFT_RDE_MOD3 | RAT_REG(n) | RAT_RM(n),
+                              0));
+    }
+  }
+}
+
+TEST(FbxIrLiftRat, SegmentOverrideOnMemoryOperandIsRefused) {
+  struct FbxIrInst first;
+  /* 65 48 8b 40 18 = mov %gs:0x18(%rax),%rax and its store twin. */
+  EXPECT_EQ(1, RatRefused(0x08B, LIFT_RDE_MEM_BASE_DISP8 | RAT_GS, 0));
+  EXPECT_EQ(1, RatRefused(0x089, LIFT_RDE_MEM_BASE_DISP8 | RAT_GS, 0));
+  /* The same access without the prefix is still a LOAD. */
+  EXPECT_EQ(0, RatRefused(0x08B, LIFT_RDE_MEM_BASE_DISP8, &first));
+  EXPECT_EQ(FBX_IR_OP_LOAD, first.opcode);
+  /* A prefix on a register-form instruction addresses nothing. */
+  EXPECT_EQ(0, RatRefused(0x089, LIFT_RDE_MOD3 | RAT_GS, 0));
+  /* LEA never applies a segment base. */
+  EXPECT_EQ(0, RatRefused(0x08D, LIFT_RDE_MEM_BASE_DISP8 | RAT_GS, &first));
+  EXPECT_EQ(FBX_IR_OP_LEA, first.opcode);
+}
+
+TEST(FbxIrLiftRat, AddressSizeOverrideIsRefusedIncludingLea) {
+  /* 67 8b 40 18 = mov 0x18(%eax),%eax ; 67 48 8d 40 18 = lea 0x18(%eax),%rax:
+   * a 32-bit effective address in both. */
+  EXPECT_EQ(1, RatRefused(0x08B, LIFT_RDE_MEM_BASE_DISP8 | RAT_ASZ, 0));
+  EXPECT_EQ(1, RatRefused(0x089, LIFT_RDE_MEM_BASE_DISP8 | RAT_ASZ, 0));
+  EXPECT_EQ(1, RatRefused(0x08D, LIFT_RDE_MEM_BASE_DISP8 | RAT_ASZ, 0));
+  EXPECT_EQ(0, RatRefused(0x08D, LIFT_RDE_MEM_BASE_DISP8, 0));
+}
+
+TEST(FbxIrLiftRat, MovImmByteFormWritesOneByte) {
+  struct FbxIrInst first;
+  /* c6 c0 40 = mov $0x40,%al: a ONE-byte register write.  It was lifted at
+   * the 0xC7 width (4), which replaces eAX and zero-extends into rAX. */
+  EXPECT_EQ(0, RatRefused(0x0C6, LIFT_RDE_MOD3, &first));
+  EXPECT_EQ(FBX_IR_OP_REG_SET, first.opcode);
+  EXPECT_EQ(1, (i64)first.width);
+  EXPECT_EQ(0x40, (i64)first.imm);
+  /* c7 c0 imm32 keeps the operand-size width. */
+  EXPECT_EQ(0, RatRefused(0x0C7, LIFT_RDE_MOD3, &first));
+  EXPECT_EQ(FBX_IR_OP_REG_SET, first.opcode);
+  EXPECT_EQ(4, (i64)first.width);
+}

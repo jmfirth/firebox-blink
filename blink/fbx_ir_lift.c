@@ -427,6 +427,122 @@ static int ClassifyMemBaseDisp(u64 rde, u32 *out_base_greg) {
   return 0; /* indexed or no-base SIB — refuse */
 }
 
+/* ────────────────────────────────────────────────────────────────────────── */
+/* Operand-shape guard (firebox#RAT).                                         */
+/*                                                                            */
+/* Every lifter below names a register operand by its 4-bit NUMBER            */
+/* (`RexrReg` / `RexbRm`) and a memory operand by `base [+ index*scale] +     */
+/* disp`, and the emitter turns a register number into `weg[n]`.  Three x86   */
+/* operand shapes mean something those two descriptions cannot express, and   */
+/* until this guard the lifter translated all three as if they did not exist: */
+/*                                                                            */
+/*   1. HIGH-BYTE REGISTERS.  In a byte-sized operand WITHOUT a REX prefix,   */
+/*      register numbers 4..7 are AH/CH/DH/BH — byte 1 of rAX/rCX/rDX/rBX —   */
+/*      not SPL/BPL/SIL/DIL (blink/breg.c kByteReg, which the interpreter     */
+/*      indexes with `Rex << 4 | number`).  Lifted by number, `xor $0x40,%ah` */
+/*      became `xor $0x40,%spl`: busybox awk's RSP moved by 0x40 and its next */
+/*      `ret` popped a heap pointer into RIP.  `movzbl %dh,%ecx` read SIL and */
+/*      simply computed a wrong value.                                        */
+/*   2. SEGMENT OVERRIDES.  `mov %gs:(%rsi),%rax` addresses GS.base + rsi     */
+/*      (blink/modrm.c AddSegment); lifted without the base it read — and the */
+/*      store form wrote — a different object.  LEA is exempt: it computes an */
+/*      offset and never applies a segment base.                              */
+/*   3. ADDRESS-SIZE OVERRIDE (0x67).  The effective address is truncated to  */
+/*      32 bits (blink/modrm.c LoadEffectiveAddress, XED_MODE_LEGACY), for    */
+/*      LEA as well as for a real access.                                     */
+/*                                                                            */
+/* Correct-or-refuse, the #677/#738 pattern: an instruction with any of these */
+/* shapes is not lifted, the block gets a BAILOUT at its PC, and Tier 1 —     */
+/* which implements all three — executes it.  Modelling them (a byte-offset   */
+/* register operand for 1, a segment-base term for 2, an i32 wrap for 3) is   */
+/* a coverage increment on top of this, not a precondition for correctness.   */
+/*                                                                            */
+/* The guard is keyed on the opcode's operand ROLES rather than applied per   */
+/* lifter, and an opcode with no entry here is refused outright, so a new     */
+/* opcode has to state which of its fields are bytes before LiftOne's switch  */
+/* can reach its lifter at all.                                               */
+/* ────────────────────────────────────────────────────────────────────────── */
+
+#define FBX_LIFT_UNCLASSIFIED (-1)
+#define FBX_LIFT_NO_MODRM  0 /* no ModRM operand                         */
+#define FBX_LIFT_HAS_MODRM 1 /* opcode carries a ModRM byte              */
+#define FBX_LIFT_REG_BYTE  2 /* ModRM.reg names a byte-sized register    */
+#define FBX_LIFT_RM_BYTE   4 /* ModRM.rm, when a register, is byte-sized */
+#define FBX_LIFT_NO_SEG    8 /* memory operand ignores segment overrides */
+
+static int LiftOperandRoles(u64 mop) {
+  switch (mop) {
+    /* Byte ops with two byte registers: MOV, ALU r/m8,r8 and r8,r/m8, TEST. */
+    case 0x088: case 0x08A:
+    case 0x000: case 0x008: case 0x020: case 0x028: case 0x030: case 0x038:
+    case 0x002: case 0x00A: case 0x022: case 0x02A: case 0x032: case 0x03A:
+    case 0x084:
+      return FBX_LIFT_HAS_MODRM | FBX_LIFT_REG_BYTE | FBX_LIFT_RM_BYTE;
+    /* ModRM.reg is an opcode extension (0x80, 0xC6) or a wide register
+     * (MOVZX r, r/m8); only r/m is a byte. */
+    case 0x080: case 0x0C6: case 0x1B6:
+      return FBX_LIFT_HAS_MODRM | FBX_LIFT_RM_BYTE;
+    /* Word/dword/qword ModRM ops — no byte register in either field. */
+    case 0x089: case 0x08B: case 0x0C7:
+    case 0x001: case 0x009: case 0x021: case 0x029: case 0x031: case 0x039:
+    case 0x003: case 0x00B: case 0x023: case 0x02B: case 0x033: case 0x03B:
+    case 0x085: case 0x1B7: case 0x081: case 0x083:
+    case 0x069: case 0x06B: case 0x1AF:
+      return FBX_LIFT_HAS_MODRM;
+    case 0x08D:
+      return FBX_LIFT_HAS_MODRM | FBX_LIFT_NO_SEG;
+    /* No ModRM: MOV reg,imm; accumulator-immediate ALU (AL is number 0, never
+     * a high byte); Jcc; CALL/JMP rel; PUSH/POP reg; RET. */
+    case 0x0B8: case 0x0B9: case 0x0BA: case 0x0BB:
+    case 0x0BC: case 0x0BD: case 0x0BE: case 0x0BF:
+    case 0x004: case 0x005: case 0x00C: case 0x00D:
+    case 0x024: case 0x025: case 0x02C: case 0x02D:
+    case 0x034: case 0x035: case 0x03C: case 0x03D:
+    case 0x070: case 0x071: case 0x072: case 0x073:
+    case 0x074: case 0x075: case 0x076: case 0x077:
+    case 0x078: case 0x079: case 0x07A: case 0x07B:
+    case 0x07C: case 0x07D: case 0x07E: case 0x07F:
+    case 0x180: case 0x181: case 0x182: case 0x183:
+    case 0x184: case 0x185: case 0x186: case 0x187:
+    case 0x188: case 0x189: case 0x18A: case 0x18B:
+    case 0x18C: case 0x18D: case 0x18E: case 0x18F:
+    case 0x0E8: case 0x0E9: case 0x0EB: case 0x0C3:
+    case 0x050: case 0x051: case 0x052: case 0x053:
+    case 0x054: case 0x055: case 0x056: case 0x057:
+    case 0x058: case 0x059: case 0x05A: case 0x05B:
+    case 0x05C: case 0x05D: case 0x05E: case 0x05F:
+      return FBX_LIFT_NO_MODRM;
+    default:
+      return FBX_LIFT_UNCLASSIFIED;
+  }
+}
+
+/* True iff byte-register number `reg3` (a raw 3-bit ModRM field) names
+ * AH/CH/DH/BH under `rde`: no REX prefix, and bit 2 set. */
+static int LiftIsHighByteReg(u64 rde, u32 reg3) {
+  return !Rex(rde) && (reg3 & 4u);
+}
+
+/* Returns 1 if `rde` uses an operand shape the IR cannot express (see above);
+ * the caller must BAILOUT rather than lift. */
+static int LiftOperandShapeUnmodelled(u64 rde, u64 mop) {
+  int roles = LiftOperandRoles(mop);
+  if (roles == FBX_LIFT_UNCLASSIFIED) return 1;
+  if (!(roles & FBX_LIFT_HAS_MODRM)) return 0;
+  if ((roles & FBX_LIFT_REG_BYTE) &&
+      LiftIsHighByteReg(rde, (u32)ModrmReg(rde))) {
+    return 1;
+  }
+  if (IsModrmRegister(rde)) {
+    return (roles & FBX_LIFT_RM_BYTE) &&
+           LiftIsHighByteReg(rde, (u32)ModrmRm(rde));
+  }
+  /* Memory operand. */
+  if (Asz(rde)) return 1;
+  if (Sego(rde) && !(roles & FBX_LIFT_NO_SEG)) return 1;
+  return 0;
+}
+
 /* Lift MOV r/m, r in the memory-store direction (0x88/0x89, mod != 3):
  *   REG_GET (src reg → vreg) ; STORE (mem[base+disp] = vreg).
  * Returns 1 on success, 0 on alloc failure, -1 to request BAILOUT. */
@@ -596,10 +712,15 @@ static int LiftMovZvqpIvqp(struct LiftCtx *ctx, u64 rde, u64 uimm0) {
   return 1;
 }
 
-/* Lift MOV r/m, imm (opcode 0xC7: OpMovImm).  Approximate as REG_SET when
- * modrm.mod==3, leave §13.2 to handle the memory store case. */
-static int LiftMovImm(struct LiftCtx *ctx, u64 rde, u64 uimm0) {
-  u8 width = WidthFromRde(rde, 0);
+/* Lift MOV r/m, imm (opcode 0xC6 byte / 0xC7 word: OpMovImm).  Approximate as
+ * REG_SET when modrm.mod==3, leave §13.2 to handle the memory store case.
+ *
+ * firebox#RAT: 0xC6 is the BYTE form.  It was lifted at the 0xC7 width, so
+ * `c6 c0 5a` (mov $0x5a,%al) became a 32-bit register write: it replaced all
+ * of eAX and, by the 32-bit zero-extension rule, cleared the upper half of
+ * rAX as well. */
+static int LiftMovImm(struct LiftCtx *ctx, u64 rde, u64 uimm0, int byte_op) {
+  u8 width = WidthFromRde(rde, byte_op);
   struct FbxIrInst *set = CtxEmit(ctx);
   if (!set) return 0;
   set->opcode = FBX_IR_OP_REG_SET;
@@ -1081,6 +1202,9 @@ static int LiftOne(struct LiftCtx *ctx, const struct FbxTcEntry *e,
                    u64 next_pc) {
   u64 rde = e->rde;
   u64 mop = Mopcode(rde);
+  /* firebox#RAT — refuse the operand shapes the IR cannot express BEFORE any
+   * lifter reads a register number or an addressing form out of `rde`. */
+  if (LiftOperandShapeUnmodelled(rde, mop)) return -1;
   switch (mop) {
     /* MOV r/m, r — opcode 0x88 (byte) and 0x89 (word).  #677 routes the
      * memory-store form (mod != 3) through LiftMovStoreMem; the call may
@@ -1098,8 +1222,8 @@ static int LiftOne(struct LiftCtx *ctx, const struct FbxTcEntry *e,
     case 0x0BC: case 0x0BD: case 0x0BE: case 0x0BF:
       return LiftMovZvqpIvqp(ctx, rde, e->uimm0);
     /* MOV r/m, imm — opcode 0xC6 (byte) / 0xC7 (word). */
-    case 0x0C6:
-    case 0x0C7: return LiftMovImm(ctx, rde, e->uimm0);
+    case 0x0C6: return LiftMovImm(ctx, rde, e->uimm0, 1);
+    case 0x0C7: return LiftMovImm(ctx, rde, e->uimm0, 0);
     /* ALU group r/m, r — ADD/OR/AND/SUB/XOR/CMP at 0x00/01, 0x08/09, etc.
      * Operand-direction = r/m is destination (op_dir=RM_R). */
     case 0x000: return LiftAluRR(ctx, rde, FBX_IR_OP_ADD, 1, FBX_ALU_DIR_RM_R);
