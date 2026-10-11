@@ -444,9 +444,9 @@ static int ClassifyMemBaseDisp(u64 rde, u32 *out_base_greg) {
 /*      `ret` popped a heap pointer into RIP.  `movzbl %dh,%ecx` read SIL and */
 /*      simply computed a wrong value.                                        */
 /*   2. SEGMENT OVERRIDES.  `mov %gs:(%rsi),%rax` addresses GS.base + rsi     */
-/*      (blink/modrm.c AddSegment); lifted without the base it read — and the */
-/*      store form wrote — a different object.  LEA is exempt: it computes an */
-/*      offset and never applies a segment base.                              */
+/*      (blink/address.c AddSegment); lifted without the base it read — and   */
+/*      the store form wrote — a different object.  LEA is exempt: it         */
+/*      computes an offset and never applies a segment base.                  */
 /*   3. ADDRESS-SIZE OVERRIDE (0x67).  The effective address is truncated to  */
 /*      32 bits (blink/modrm.c LoadEffectiveAddress, XED_MODE_LEGACY), for    */
 /*      LEA as well as for a real access.                                     */
