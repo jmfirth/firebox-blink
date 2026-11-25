@@ -296,6 +296,7 @@ static void FreeBlockChain(struct FbxTcBlock *b) {
 void FbxTcReset(struct System *sys) {
   u32 i;
   if (!sys->tc.initialised) return;
+  Fbxt2RegionReport(); /* firebox#JJJ: no-op unless FBX_T2_REGION=1 */
   /* firebox#HYS — retire every Machine's Tier-2 map by bumping the generation.
    * The blocks these maps key by start_pc are about to be freed, so the keys
    * would otherwise name blocks that no longer exist (and, worse, start_pcs a

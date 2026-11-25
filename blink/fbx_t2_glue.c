@@ -36,6 +36,7 @@
 #include <string.h>
 #include <unistd.h>
 
+#include "blink/atomic.h"
 #include "blink/fbx_ir.h"
 #include "blink/fbx_t2_block_ctx.h"
 #include "blink/fbx_wasm_emit.h"
@@ -167,6 +168,11 @@ static bool g_t2_enabled = true;
  *   3 = self-loop AND no-memory */
 static int g_t2_selective_cached = 0;
 static int g_t2_selective_mode = 0;
+/* firebox#JJJ — Tier-2 region knobs; see Fbxt2RegionEnv. */
+static int g_t2_region_cached = 0;
+static bool g_t2_region = false;
+static bool g_t2_region_count = false;
+static u32 g_t2_region_verify_every = 0;
 
 u32 Fbxt2HotnessThreshold(void) {
   if (!g_t2_threshold_cached) {
@@ -342,6 +348,10 @@ void Fbxt2ResetEnvCacheForTest(void) {
   g_t2_selective_mode = 0;
   g_t2_deescalate_cached = 0;
   g_t2_deescalate = false;
+  g_t2_region_cached = 0;
+  g_t2_region = false;
+  g_t2_region_count = false;
+  g_t2_region_verify_every = 0;
   g_t2_trace_init = 0;
   g_t2_trace_escalations = 0;
   g_t2_trace_bailouts = 0;
@@ -351,6 +361,287 @@ void Fbxt2ResetEnvCacheForTest(void) {
 /* ────────────────────────────────────────────────────────────────────────── */
 /* Escalation pipeline — spec §6.2.                                           */
 /* ────────────────────────────────────────────────────────────────────────── */
+
+
+/* ────────────────────────────────────────────────────────────────────────── */
+/* firebox#JJJ — Tier-2 regions.                                             */
+/*                                                                            */
+/* When a block escalates, try first to compile it together with the hot     */
+/* Tier-1 blocks it statically reaches (depth-first, fall-through first, so  */
+/* the layout follows the fall-through chain) into one region module         */
+/* (fbx_ir_emit_region_wasm).  The region is attached to the escalating      */
+/* block only; it is entered there and exits to Tier 1 everywhere else.  A   */
+/* block that cannot head a region of at least two members takes the         */
+/* per-block path unchanged.                                                  */
+/*                                                                            */
+/*   FBX_T2_REGION=1          enable (default off while this is measured)    */
+/*   FBX_T2_REGION_VERIFY=N   replay every Nth region dispatch through        */
+/*                            FbxInterpretOne and compare registers, flags   */
+/*                            and ip; report at teardown                      */
+/*   FBX_T2_REGION_COUNT=1    count guest instructions run inside regions     */
+/* ────────────────────────────────────────────────────────────────────────── */
+
+#define FBX_T2_REGION_BUDGET 4096u
+/* FbxT2BlockState::region.  ABANDONED: the region compile stayed pending for
+ * every attempt; the block takes the per-block path, with fresh attempts. */
+#define FBX_T2_REGION_NONE 0u
+#define FBX_T2_REGION_INSTALLED 1u
+#define FBX_T2_REGION_ABANDONED 2u
+
+static struct {
+  _Atomic(unsigned long long) built, members, calls, insns;
+  _Atomic(unsigned long long) verified, verify_insns, mismatches, tick;
+} g_t2_region_stats;
+
+static bool Fbxt2RegionBoolEnv(const char *name, const char *e) {
+  switch (FbxClassifyBoolEnv(e)) {
+    case kFbxBoolOn:
+      return true;
+    case kFbxBoolOff:
+    case kFbxBoolUnspecified:
+      return false;
+    default: {
+      char msg[256];
+      int len = snprintf(msg, sizeof(msg),
+                         "firebox: %s=%s is not a recognized boolean value "
+                         "(expected 1/true/yes/on or 0/false/no/off)\n",
+                         name, e);
+      if (len > 0) {
+        (void)write(2, msg, (size_t)(len < (int)sizeof(msg) ? len
+                                                            : (int)sizeof(msg) - 1));
+      }
+      exit(2);
+    }
+  }
+}
+
+static void Fbxt2RegionEnv(void) {
+  const char *e;
+  if (g_t2_region_cached) return;
+  g_t2_region = Fbxt2RegionBoolEnv("FBX_T2_REGION", getenv("FBX_T2_REGION"));
+  g_t2_region_count =
+      Fbxt2RegionBoolEnv("FBX_T2_REGION_COUNT", getenv("FBX_T2_REGION_COUNT"));
+  e = getenv("FBX_T2_REGION_VERIFY");
+  if (e && *e) {
+    char *end = NULL;
+    long v = strtol(e, &end, 10);
+    if (!end || *end || v < 0 || v > 1000000000L) {
+      (void)write(2, "firebox: FBX_T2_REGION_VERIFY must be a count\n", 46);
+      exit(2);
+    }
+    g_t2_region_verify_every = (u32)v;
+  }
+  g_t2_region_cached = 1;
+}
+
+static bool Fbxt2RegionCounting(void) {
+  return g_t2_region_count || g_t2_region_verify_every != 0;
+}
+
+void Fbxt2RegionReport(void) {
+  char buf[400];
+  int n;
+  /* Only when asked for counts: the line goes to the guest's stderr. */
+  if (!g_t2_region_cached || !g_t2_region || !Fbxt2RegionCounting()) return;
+  n = snprintf(buf, sizeof(buf),
+               "[t2 region] built=%llu members=%llu calls=%llu insns=%llu "
+               "verified=%llu verify_insns=%llu mismatches=%llu\n",
+               (unsigned long long)g_t2_region_stats.built,
+               (unsigned long long)g_t2_region_stats.members,
+               (unsigned long long)g_t2_region_stats.calls,
+               (unsigned long long)g_t2_region_stats.insns,
+               (unsigned long long)g_t2_region_stats.verified,
+               (unsigned long long)g_t2_region_stats.verify_insns,
+               (unsigned long long)g_t2_region_stats.mismatches);
+  if (n > 0) (void)write(2, buf, (size_t)(n < (int)sizeof(buf) ? n : (int)sizeof(buf) - 1));
+}
+
+/* Returns 1 when the escalation was handled here (a region was installed, or
+ * its compile is pending and the latch was reopened), 0 to take the
+ * per-block path. */
+static int Fbxt2TryRegion(struct Machine *m, struct FbxTcBlock *b,
+                          struct FbxIrBlock *entry_ir,
+                          struct FbxT2BlockState *st) {
+  const struct FbxIrBlock *irs[FBX_REGION_MAX_MEMBERS];
+  const struct FbxTcBlock *tcs[FBX_REGION_MAX_MEMBERS];
+  struct FbxIrBlock *owned[FBX_REGION_MAX_MEMBERS];
+  u64 stack[2u * FBX_REGION_MAX_MEMBERS + 2u];
+  u64 succ[2];
+  u32 sp = 0, n = 0, i, k, ns;
+  u32 min_hits = Fbxt2HotnessThreshold() / 2u;
+  struct FbxWasmBuffer buf;
+  struct FbxT2BlockCtx *ctx;
+  int funcref, handled = 0;
+  enum FbxIrEmitFailReason why = FBX_IR_EMIT_OK;
+  u8 why_op = 0;
+  if (!fbx_ir_region_member_ok(entry_ir, b, &why, &why_op)) {
+    T2TraceLine(g_t2_trace_verbose,
+                "[t2 region] pc=%#llx entry_refused reason=%s op=0x%02x\n",
+                (unsigned long long)b->start_pc, fbx_ir_fail_reason_name(why),
+                (unsigned)why_op);
+    return 0;
+  }
+  irs[0] = entry_ir;
+  tcs[0] = b;
+  owned[0] = NULL;
+  n = 1;
+  ns = fbx_ir_region_successors(entry_ir, b, succ);
+  for (k = ns; k-- > 0;) stack[sp++] = succ[k];
+  while (sp > 0 && n < FBX_REGION_MAX_MEMBERS) {
+    u64 pc = stack[--sp];
+    struct FbxTcBlock *t;
+    struct FbxIrBlock *ir;
+    int seen = 0;
+    for (i = 0; i < n; ++i) seen |= tcs[i]->start_pc == pc;
+    if (seen) continue;
+    t = FbxTcLookup(m->system, pc);
+    if (!t || t->hits < min_hits) continue;
+    ir = fbx_ir_lift(t);
+    if (!ir) continue;
+    if (!fbx_ir_region_member_ok(ir, t, NULL, NULL)) {
+      fbx_ir_free(ir);
+      continue;
+    }
+    irs[n] = ir;
+    tcs[n] = t;
+    owned[n] = ir;
+    ++n;
+    ns = fbx_ir_region_successors(ir, t, succ);
+    for (k = ns; k-- > 0;) {
+      if (sp < sizeof(stack) / sizeof(stack[0])) stack[sp++] = succ[k];
+    }
+  }
+  if (n < 2) {
+    T2TraceLine(g_t2_trace_verbose, "[t2 region] pc=%#llx alone\n",
+                (unsigned long long)b->start_pc);
+    goto done;
+  }
+  fbx_wasm_buffer_init(&buf);
+  if (!fbx_ir_emit_region_wasm(irs, tcs, n, Fbxt2RegionCounting(),
+                               FBX_T2_REGION_BUDGET, &buf)) {
+    fbx_wasm_buffer_free(&buf);
+    T2TraceLine(g_t2_trace_verbose, "[t2 region] pc=%#llx emit_failed\n",
+                (unsigned long long)b->start_pc);
+    goto done;
+  }
+  ctx = (struct FbxT2BlockCtx *)calloc(1, sizeof(struct FbxT2BlockCtx));
+  if (!ctx || (u64)(uintptr_t)m + sizeof(*m) > 0x100000000ull ||
+      (u64)(uintptr_t)ctx + sizeof(*ctx) > 0x100000000ull) {
+    /* firebox#FSZ: the block ABI's i32 pointers must not truncate. */
+    free(ctx);
+    fbx_wasm_buffer_free(&buf);
+    goto done;
+  }
+  ctx->version = FBX_T2_BLOCK_CTX_VERSION;
+  ctx->nconsts = 1; /* consts[0]: the instruction count, when counting */
+  funcref = fbx_t2_instantiate((u64)(uintptr_t)m->system, buf.data,
+                               (u32)buf.len, ctx);
+  fbx_wasm_buffer_free(&buf);
+  if (funcref == FBX_T2_INSTANTIATE_PENDING) {
+    /* Same bounded retry as the per-block path (see Fbxt2TryEscalate). */
+    free(ctx);
+    T2TraceLine(g_t2_trace_escalations,
+                "[t2 escalate] sys=%p pc=%#llx outcome=region_pending "
+                "members=%u attempts=%u\n",
+                (void *)m->system, (unsigned long long)b->start_pc,
+                (unsigned)n, (unsigned)st->pending_attempts + 1u);
+    if (++st->pending_attempts < FBX_T2_PENDING_MAX_ATTEMPTS) {
+      st->attempted = 0;
+      st->retry_at_hits = b->hits + FBX_T2_PENDING_RETRY_STRIDE;
+      handled = 1;
+    } else {
+      /* Out of attempts (membership may have kept changing the bytes): stop
+       * trying regions here and give the per-block path its own attempts. */
+      st->region = FBX_T2_REGION_ABANDONED;
+      st->pending_attempts = 0;
+    }
+    goto done;
+  }
+  if (funcref < 0) {
+    free(ctx);
+    goto done;
+  }
+  st->block_ctx = ctx;
+  st->funcref = funcref;
+  st->region = FBX_T2_REGION_INSTALLED;
+  atomic_fetch_add_explicit(&g_t2_region_stats.built, 1, memory_order_relaxed);
+  atomic_fetch_add_explicit(&g_t2_region_stats.members, n,
+                            memory_order_relaxed);
+  T2TraceLine(g_t2_trace_escalations,
+              "[t2 escalate] sys=%p pc=%#llx outcome=region members=%u "
+              "funcref=%d\n",
+              (void *)m->system, (unsigned long long)b->start_pc, (unsigned)n,
+              funcref);
+  handled = 1;
+done:
+  for (i = 1; i < n; ++i) fbx_ir_free(owned[i]);
+  return handled;
+}
+
+#ifdef __wasm__
+/* Run the region, then replay the same number of guest instructions from the
+ * same starting state through FbxInterpretOne, and compare.  The region
+ * stores nothing to guest memory (fbx_ir_region_member_ok refuses STORE), so
+ * the guest-visible state a region can change is the general registers,
+ * flags and ip; those are compared whole.  The interpreter's result is kept. */
+static int Fbxt2RegionVerifiedCall(struct Machine *m,
+                                   struct FbxT2BlockState *st, i32 m_ptr) {
+  struct FbxT2BlockCtx *ctx = (struct FbxT2BlockCtx *)st->block_ctx;
+  u8 pre_weg[16][8], post_weg[16][8];
+  u32 pre_flags, post_flags;
+  u64 pre_ip, post_ip, n, k;
+  int rc;
+  memcpy(pre_weg, m->weg, sizeof pre_weg);
+  pre_flags = m->flags;
+  pre_ip = m->ip;
+  ctx->consts[0] = 0;
+  rc = fbx_t2_call((uintptr_t)(u32)st->funcref, m_ptr,
+                   (i32)(intptr_t)st->block_ctx);
+  n = ctx->consts[0];
+  memcpy(post_weg, m->weg, sizeof post_weg);
+  post_flags = m->flags;
+  post_ip = m->ip;
+  memcpy(m->weg, pre_weg, sizeof pre_weg);
+  m->flags = pre_flags;
+  m->ip = pre_ip;
+  for (k = 0; k < n; ++k) FbxInterpretOne(m);
+  atomic_fetch_add_explicit(&g_t2_region_stats.verified, 1,
+                            memory_order_relaxed);
+  atomic_fetch_add_explicit(&g_t2_region_stats.verify_insns, n,
+                            memory_order_relaxed);
+  if ((rc != 0 && rc != 1) || memcmp(post_weg, m->weg, sizeof post_weg) ||
+      post_flags != m->flags || post_ip != m->ip) {
+    unsigned long long nm = atomic_fetch_add_explicit(
+        &g_t2_region_stats.mismatches, 1, memory_order_relaxed);
+    /* A region that disagreed once is not run again: back to Tier 1 for
+     * this block (latch kept, no re-escalation). */
+    st->funcref = -1;
+    if (nm < 16) {
+      char line[200];
+      int len;
+      u32 r;
+      len = snprintf(line, sizeof(line),
+                     "[t2 region MISMATCH] entry=%#llx n=%llu rc=%d ip "
+                     "region=%#llx interp=%#llx flags region=%#x interp=%#x\n",
+                     (unsigned long long)pre_ip, (unsigned long long)n, rc,
+                     (unsigned long long)post_ip, (unsigned long long)m->ip,
+                     post_flags, m->flags);
+      if (len > 0) (void)write(2, line, (size_t)len);
+      for (r = 0; r < 16; ++r) {
+        u64 a, c;
+        memcpy(&a, post_weg[r], 8);
+        memcpy(&c, m->weg[r], 8);
+        if (a == c) continue;
+        len = snprintf(line, sizeof(line),
+                       "[t2 region MISMATCH]   r%u region=%#llx interp=%#llx\n",
+                       r, (unsigned long long)a, (unsigned long long)c);
+        if (len > 0) (void)write(2, line, (size_t)len);
+      }
+    }
+  }
+  return rc == 1 ? 1 : 0; /* ip agreed: Tier 1 resumes there either way */
+}
+#endif
 
 void Fbxt2TryEscalate(struct Machine *m, struct FbxTcBlock *b,
                       struct FbxT2BlockState *st) {
@@ -435,6 +726,14 @@ void Fbxt2TryEscalate(struct Machine *m, struct FbxTcBlock *b,
                   (void *)m->system, (unsigned long long)b->start_pc);
       return;
     }
+  }
+
+  /* firebox#JJJ — a region headed by this block, when enabled. */
+  Fbxt2RegionEnv();
+  if (g_t2_region && st->region != FBX_T2_REGION_ABANDONED &&
+      Fbxt2TryRegion(m, b, ir, st)) {
+    fbx_ir_free(ir);
+    return;
   }
 
   /* Step 2a — build the per-block consts[] table (#635). */
@@ -607,7 +906,22 @@ int Fbxt2Dispatch(struct Machine *m, struct FbxTcBlock *b,
     /* firebox#FSZ: through Blink's own `fbx_t2_table`, never the (possibly
      * linker-owned) `__indirect_function_table` — see the table's comment. */
     i32 ctx_ptr = (i32)(intptr_t)st->block_ctx;
-    exit_code = fbx_t2_call((uintptr_t)(u32)st->funcref, m_ptr, ctx_ptr);
+    if (st->region == FBX_T2_REGION_INSTALLED && g_t2_region_verify_every &&
+        atomic_fetch_add_explicit(&g_t2_region_stats.tick, 1,
+                                  memory_order_relaxed) %
+                g_t2_region_verify_every == 0) {
+      exit_code = Fbxt2RegionVerifiedCall(m, st, m_ptr);
+    } else {
+      exit_code = fbx_t2_call((uintptr_t)(u32)st->funcref, m_ptr, ctx_ptr);
+      if (st->region == FBX_T2_REGION_INSTALLED && g_t2_region_count) {
+        atomic_fetch_add_explicit(&g_t2_region_stats.calls, 1,
+                                  memory_order_relaxed);
+        atomic_fetch_add_explicit(
+            &g_t2_region_stats.insns,
+            ((struct FbxT2BlockCtx *)st->block_ctx)->consts[0],
+            memory_order_relaxed);
+      }
+    }
   }
 #else
   /* Native test bench: no in-guest table; keep the host-dispatch shim (the
@@ -630,7 +944,9 @@ int Fbxt2Dispatch(struct Machine *m, struct FbxTcBlock *b,
     exit_code = 0;
   }
   if (st->dispatches != 0xFFFFFFFFu) ++st->dispatches;
-  if (Fbxt2DeescalateEnabled() &&
+  /* A region never returns 3 (it has no single self-loop to fill), so the
+   * fill-based de-escalation would revert every region: exempt them. */
+  if (Fbxt2DeescalateEnabled() && st->region != FBX_T2_REGION_INSTALLED &&
       st->dispatches == FBX_T2_DEESCALATE_AFTER && st->filled == 0) {
     st->funcref = -1; /* revert to Tier 1; latch kept (no re-escalation) */
     T2EnsureTraceFlags();

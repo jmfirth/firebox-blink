@@ -538,6 +538,7 @@ nexgen32e_f GetOp(long);
 void LoadInstruction(struct Machine *, u64);
 int LoadInstruction2(struct Machine *, u64);
 void ExecuteInstruction(struct Machine *);
+void FbxInterpretOne(struct Machine *);
 u64 AllocatePageTable(struct System *);
 u64 AllocateAnonymousPage(struct System *);
 void FreeAnonymousPage(struct System *, u8 *);

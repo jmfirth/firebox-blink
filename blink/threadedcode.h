@@ -146,7 +146,8 @@ struct FbxT2BlockState {
   u8 attempted;
   u8 pending_attempts;
   u8 used;                 /* 0 = empty slot (open addressing), 1 = live */
-  u8 reserved;
+  u8 region;               /* firebox#JJJ: FBX_T2_REGION_{NONE,INSTALLED,
+                            * ABANDONED} — see Fbxt2TryRegion */
   u32 dispatches;
   u32 filled;
   u32 retry_at_hits;

@@ -27,6 +27,7 @@
 #include "blink/rde.h"
 #include "blink/threadedcode.h"
 #include "blink/types.h"
+#include "blink/x86.h"
 #include "test/test.h"
 
 #include <string.h>
@@ -2436,4 +2437,224 @@ TEST(FbxWasmEmit, SelfLoopEmitDeterministic) {
   fbx_wasm_buffer_free(&a);
   fbx_wasm_buffer_free(&b);
   FreeTc(tc);
+}
+
+/* ────────────────────────────────────────────────────────────────────────── */
+/* firebox#JJJ — Tier-2 regions.                                             */
+/*                                                                            */
+/* The subject is the real hot loop of the shipped rg binary (rg -j1, the    */
+/* dense-DFA transition loop, 4x unrolled; MEASURED top blocks 0-3, 9, 10):  */
+/* six Tier-1 blocks decoded from the bytes rg executes, at their PCs.       */
+/* ────────────────────────────────────────────────────────────────────────── */
+
+struct RgInsn {
+  u64 ip;
+  u8 len;
+  u8 bytes[8];
+};
+
+static const struct RgInsn kRgDfa[] = {
+    /* block 0x8813b145 */
+    {0x8813b145, 6, {0x43, 0x0f, 0xb6, 0x54, 0x25, 0x00}},
+    {0x8813b14b, 6, {0x41, 0x0f, 0xb6, 0x54, 0x16, 0x78}},
+    {0x8813b151, 2, {0x89, 0xee}},
+    {0x8813b153, 3, {0x48, 0x01, 0xd6}},
+    {0x8813b156, 3, {0x8b, 0x2c, 0xb1}},
+    {0x8813b159, 2, {0x39, 0xc5}},
+    {0x8813b15b, 2, {0x76, 0x65}},
+    /* block 0x8813b15d */
+    {0x8813b15d, 5, {0x49, 0x8d, 0x54, 0x24, 0x03}},
+    {0x8813b162, 3, {0x4c, 0x39, 0xfa}},
+    {0x8813b165, 2, {0x73, 0x5b}},
+    /* block 0x8813b167 */
+    {0x8813b167, 6, {0x43, 0x0f, 0xb6, 0x74, 0x25, 0x01}},
+    {0x8813b16d, 6, {0x41, 0x0f, 0xb6, 0x74, 0x36, 0x78}},
+    {0x8813b173, 3, {0x48, 0x01, 0xee}},
+    {0x8813b176, 3, {0x8b, 0x2c, 0xb1}},
+    {0x8813b179, 2, {0x39, 0xc5}},
+    {0x8813b17b, 2, {0x76, 0x37}},
+    /* block 0x8813b17d */
+    {0x8813b17d, 6, {0x43, 0x0f, 0xb6, 0x74, 0x25, 0x02}},
+    {0x8813b183, 6, {0x41, 0x0f, 0xb6, 0x74, 0x36, 0x78}},
+    {0x8813b189, 3, {0x48, 0x01, 0xee}},
+    {0x8813b18c, 3, {0x8b, 0x2c, 0xb1}},
+    {0x8813b18f, 2, {0x39, 0xc5}},
+    {0x8813b191, 2, {0x76, 0x26}},
+    /* block 0x8813b193 */
+    {0x8813b193, 6, {0x43, 0x0f, 0xb6, 0x74, 0x25, 0x03}},
+    {0x8813b199, 6, {0x41, 0x0f, 0xb6, 0x74, 0x36, 0x78}},
+    {0x8813b19f, 3, {0x48, 0x01, 0xee}},
+    {0x8813b1a2, 3, {0x8b, 0x2c, 0xb1}},
+    {0x8813b1a5, 2, {0x39, 0xc5}},
+    {0x8813b1a7, 2, {0x76, 0x16}},
+    /* block 0x8813b1a9 */
+    {0x8813b1a9, 4, {0x49, 0x83, 0xc4, 0x04}},
+    {0x8813b1ad, 3, {0x4d, 0x39, 0xfc}},
+    {0x8813b1b0, 2, {0x72, 0x93}},
+};
+
+/* Decode kRgDfa[first, first+n) into one Tier-1 block. */
+static struct FbxTcBlock *DecodeTc(const struct RgInsn *ins, unsigned n) {
+  struct FbxTcBlock *b = (struct FbxTcBlock *)calloc(1, sizeof *b);
+  unsigned i;
+  b->entries = (struct FbxTcEntry *)calloc(n, sizeof(struct FbxTcEntry));
+  for (i = 0; i < n; ++i) {
+    struct FbxTcEntry *e = &b->entries[i];
+    u8 buf[15];
+    memset(buf, 0x90, sizeof buf);
+    memcpy(buf, ins[i].bytes, ins[i].len);
+    if (DecodeInstruction(&e->xedd, buf, sizeof buf, XED_MODE_LONG) ||
+        e->xedd.length != ins[i].len) {
+      free(b->entries);
+      free(b);
+      return NULL;
+    }
+    e->ip = ins[i].ip;
+    e->rde = e->xedd.op.rde;
+    e->uimm0 = e->xedd.op.uimm0;
+    e->disp = e->xedd.op.disp;
+    e->oplen = ins[i].len;
+    e->kind = FBX_TC_KIND_NORMAL;
+  }
+  b->start_pc = ins[0].ip;
+  b->end_pc = ins[n - 1].ip + ins[n - 1].len;
+  b->page = b->start_pc & ~(u64)4095;
+  b->nentries = n;
+  return b;
+}
+
+static int BlockHasOp(const struct FbxIrBlock *ir, u8 op) {
+  u32 i;
+  for (i = 0; i < ir->ninsts; ++i) {
+    if (ir->insts[i].opcode == op) return 1;
+  }
+  return 0;
+}
+
+#define RG_NBLOCKS 6
+static const unsigned kRgBlockFirst[RG_NBLOCKS] = {0, 7, 10, 16, 22, 28};
+static const unsigned kRgBlockLen[RG_NBLOCKS] = {7, 3, 6, 6, 6, 3};
+
+TEST(FbxRegion, RgDfaLoopMembersAreAdmittedAndEmit) {
+  struct FbxTcBlock *tcs[RG_NBLOCKS];
+  struct FbxIrBlock *irs[RG_NBLOCKS];
+  struct FbxWasmBuffer out;
+  u64 succ[2];
+  unsigned i;
+  u32 j;
+  int saw_br_table = 0;
+  for (i = 0; i < RG_NBLOCKS; ++i) {
+    enum FbxIrEmitFailReason why = FBX_IR_EMIT_OK;
+    u8 op = 0;
+    tcs[i] = DecodeTc(&kRgDfa[kRgBlockFirst[i]], kRgBlockLen[i]);
+    ASSERT_NOTNULL(tcs[i]);
+    irs[i] = fbx_ir_lift(tcs[i]);
+    ASSERT_NOTNULL(irs[i]);
+    EXPECT_EQ(0, BlockHasOp(irs[i], FBX_IR_OP_BAILOUT));
+    EXPECT_EQ(1, fbx_ir_region_member_ok(irs[i], tcs[i], &why, &op));
+    EXPECT_EQ(FBX_IR_EMIT_OK, why);
+  }
+  /* Successors, fall-through first: block 0 → (0x8813b15d, 0x8813b1c2). */
+  ASSERT_EQ(2, (i64)fbx_ir_region_successors(irs[0], tcs[0], succ));
+  EXPECT_EQ((i64)0x8813b15d, (i64)succ[0]);
+  EXPECT_EQ((i64)0x8813b1c2, (i64)succ[1]);
+  ASSERT_EQ(2, (i64)fbx_ir_region_successors(irs[5], tcs[5], succ));
+  EXPECT_EQ((i64)0x8813b1b2, (i64)succ[0]);
+  EXPECT_EQ((i64)0x8813b145, (i64)succ[1]);
+  fbx_wasm_buffer_init(&out);
+  ASSERT_EQ(1, fbx_ir_emit_region_wasm(
+                   (const struct FbxIrBlock *const *)irs,
+                   (const struct FbxTcBlock *const *)tcs, RG_NBLOCKS, 0,
+                   4096, &out));
+  ASSERT_NE((i64)0, (i64)out.len);
+  for (j = 0; j < out.len; ++j) {
+    if (out.data[j] == 0x0Eu) saw_br_table = 1;
+  }
+  EXPECT_EQ(1, saw_br_table);
+  {
+    /* Cross-engine validation hook: FBX_REGION_DUMP=<path> writes the
+     * module so wasm-tools / wasmer can validate it out of tree. */
+    const char *dump = getenv("FBX_REGION_DUMP");
+    if (dump && *dump) {
+      FILE *f = fopen(dump, "wb");
+      if (f) {
+        fwrite(out.data, 1, out.len, f);
+        fclose(f);
+      }
+    }
+  }
+  /* The counting variant is a different module (it stores the count). */
+  {
+    struct FbxWasmBuffer counted;
+    fbx_wasm_buffer_init(&counted);
+    ASSERT_EQ(1, fbx_ir_emit_region_wasm(
+                     (const struct FbxIrBlock *const *)irs,
+                     (const struct FbxTcBlock *const *)tcs, RG_NBLOCKS, 1,
+                     4096, &counted));
+    EXPECT_NE(0, counted.len != out.len ||
+                     memcmp(counted.data, out.data, out.len) != 0);
+    fbx_wasm_buffer_free(&counted);
+  }
+  /* Refusals: duplicate member, zero members, zero budget. */
+  {
+    const struct FbxIrBlock *dirs[2] = {irs[0], irs[0]};
+    const struct FbxTcBlock *dtcs[2] = {tcs[0], tcs[0]};
+    struct FbxWasmBuffer o2;
+    fbx_wasm_buffer_init(&o2);
+    EXPECT_EQ(0, fbx_ir_emit_region_wasm(dirs, dtcs, 2, 0, 4096, &o2));
+    EXPECT_EQ(0, fbx_ir_emit_region_wasm(dirs, dtcs, 0, 0, 4096, &o2));
+    EXPECT_EQ(0, fbx_ir_emit_region_wasm(dirs, dtcs, 1, 0, 0, &o2));
+    fbx_wasm_buffer_free(&o2);
+  }
+  fbx_wasm_buffer_free(&out);
+  for (i = 0; i < RG_NBLOCKS; ++i) {
+    fbx_ir_free(irs[i]);
+    FreeTc(tcs[i]);
+  }
+}
+
+/* Lift-and-ask helper: is this one-or-two instruction block a member? */
+static int RegionMemberOkBytes(const struct RgInsn *ins, unsigned n) {
+  struct FbxTcBlock *tc = DecodeTc(ins, n);
+  struct FbxIrBlock *ir;
+  int ok;
+  if (!tc) return -1;
+  ir = fbx_ir_lift(tc);
+  if (!ir) {
+    FreeTc(tc);
+    return -1;
+  }
+  ok = fbx_ir_region_member_ok(ir, tc, NULL, NULL);
+  fbx_ir_free(ir);
+  FreeTc(tc);
+  return ok;
+}
+
+TEST(FbxRegion, MembersThatWriteMemoryOrCannotBeLoweredAreRefused) {
+  /* mov [rax+8], ebx ; jne — a STORE: regions never write guest memory. */
+  static const struct RgInsn store[] = {
+      {0x1000, 3, {0x89, 0x58, 0x08}}, {0x1003, 2, {0x75, 0xfb}}};
+  /* cmp eax, ebx ; jp — PF/NP is not synthesizable. */
+  static const struct RgInsn jp[] = {
+      {0x1000, 2, {0x39, 0xd8}}, {0x1002, 2, {0x7a, 0xfc}}};
+  /* cmp eax, ebx ; jne — the positive control: admitted. */
+  static const struct RgInsn jne[] = {
+      {0x1000, 2, {0x39, 0xd8}}, {0x1002, 2, {0x75, 0xfc}}};
+  /* push rbx ; jmp — a stack op. */
+  static const struct RgInsn push[] = {
+      {0x1000, 1, {0x53}}, {0x1001, 2, {0xeb, 0xfd}}};
+  /* imul eax, ebx ; jmp — IMUL is per-block only. */
+  static const struct RgInsn imul[] = {
+      {0x1000, 3, {0x0f, 0xaf, 0xc3}}, {0x1003, 2, {0xeb, 0xfb}}};
+  /* syscall — a BAILOUT. */
+  static const struct RgInsn sys[] = {{0x1000, 2, {0x0f, 0x05}}};
+  /* ret */
+  static const struct RgInsn ret[] = {{0x1000, 1, {0xc3}}};
+  EXPECT_EQ(1, RegionMemberOkBytes(jne, 2));
+  EXPECT_EQ(0, RegionMemberOkBytes(store, 2));
+  EXPECT_EQ(0, RegionMemberOkBytes(jp, 2));
+  EXPECT_EQ(0, RegionMemberOkBytes(push, 2));
+  EXPECT_EQ(0, RegionMemberOkBytes(imul, 2));
+  EXPECT_EQ(0, RegionMemberOkBytes(sys, 1));
+  EXPECT_EQ(0, RegionMemberOkBytes(ret, 1));
 }

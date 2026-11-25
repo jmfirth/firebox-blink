@@ -242,6 +242,33 @@ int fbx_ir_build_block_ctx_consts(const struct FbxIrBlock *ir,
 size_t fbx_wasm_host_import_count(void);
 const char *fbx_wasm_host_import_name(size_t i);
 
+/* firebox#JJJ — Tier-2 regions: several Tier-1 blocks in one module with
+ * the same block ABI.  See the region section of fbx_ir_emit_wasm.c. */
+#define FBX_REGION_MAX_MEMBERS 16u
+
+/* 1 if (ir, tc) may be a region member: passes the per-block coverage gate
+ * and uses only what a region lowers (no store, stack op, call, ret, imul or
+ * bailout; a BRANCH_COND/BRANCH_TAKEN terminator).  0 + reason otherwise. */
+int fbx_ir_region_member_ok(const struct FbxIrBlock *ir,
+                            const struct FbxTcBlock *tc,
+                            enum FbxIrEmitFailReason *out_reason,
+                            u8 *out_opcode);
+
+/* The member's static successors, fall-through first.  Returns the count. */
+u32 fbx_ir_region_successors(const struct FbxIrBlock *ir,
+                             const struct FbxTcBlock *tc, u64 out[2]);
+
+/* Emit one module for members irs/tcs[0..n), entered at member 0.  Every exit
+ * stores m->ip; it returns 1 when a LOAD in member 0 missed the TLB (Tier 1
+ * resumes at that LOAD in the dispatched block) and 0 otherwise.  `budget` bounds the back-edges one dispatch
+ * takes.  `count_insns` makes the module store the number of guest
+ * instructions it completed in ctx->consts[0] (verification only).  Returns
+ * 1 on success, 0 if any member is refused. */
+int fbx_ir_emit_region_wasm(const struct FbxIrBlock *const *irs,
+                            const struct FbxTcBlock *const *tcs, u32 n,
+                            int count_insns, u32 budget,
+                            struct FbxWasmBuffer *out);
+
 #ifdef __cplusplus
 }
 #endif

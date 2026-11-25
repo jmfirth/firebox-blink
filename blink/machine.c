@@ -2134,6 +2134,24 @@ void JitlessDispatch(P) {
   m->oplen = 0;
 }
 
+/* firebox#JJJ: one instruction through decode-and-execute alone, with no
+ * threaded-code cache, Tier 2 or thunk dispatch.  The Tier-2 region
+ * verifier replays a region's instructions through it as the oracle. */
+void FbxInterpretOne(struct Machine *m) {
+  u64 rde;
+  i64 disp;
+  u64 uimm0;
+  LoadInstruction(m, GetPc(m));
+  rde = m->xedd->op.rde;
+  disp = m->xedd->op.disp;
+  uimm0 = m->xedd->op.uimm0;
+  m->oplen = Oplength(rde);
+  m->ip += Oplength(rde);
+  GetOp(Mopcode(rde))(A);
+  if (m->stashaddr) CommitStash(m);
+  m->oplen = 0;
+}
+
 static void GeneralDispatch(P) {
 #ifdef HAVE_JIT
   int opclass;

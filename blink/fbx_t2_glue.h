@@ -178,6 +178,10 @@ void fbx_t2_get_stats(u64 sys_id, u32 *modules, u64 *bytes);
  * Default 100 (spec §Q2, calibrated from the Tier 1 v0.1 bench corpus). */
 u32 Fbxt2HotnessThreshold(void);
 
+/* firebox#JJJ: one stderr line of Tier-2 region counters (FBX_T2_REGION=1
+ * only).  Called from FbxTcReset. */
+void Fbxt2RegionReport(void);
+
 /* Tier 2 kill-switch (spec §6.6).  Returns false when `FIREBOX_T2=0`
  * (or `=off`, `=false`, `=no`) is set in the environment.  Default
  * true — Tier 2 is on by default once a hot block escalates.  Cached
