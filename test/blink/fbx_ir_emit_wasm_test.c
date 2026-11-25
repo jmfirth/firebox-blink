@@ -23,6 +23,7 @@
 ╚─────────────────────────────────────────────────────────────────────────────*/
 
 #include "blink/fbx_ir.h"
+#include "blink/fbx_t2_block_ctx.h"
 #include "blink/fbx_wasm_emit.h"
 #include "blink/rde.h"
 #include "blink/threadedcode.h"
@@ -686,6 +687,8 @@ TEST(FbxWasmEmit, BranchCondJESynths) {
   ir.ninsts = 1;
   ir.nvregs = 0;
   tc = MakeTc(0x074, 0, 0, 0, 0x8000, 2, FBX_TC_KIND_NORMAL);
+  ir.start_pc = tc->start_pc;
+  ir.end_pc = tc->end_pc; /* firebox#5BW */
   fbx_wasm_buffer_init(&out);
   ASSERT_EQ(1, fbx_ir_emit_wasm(&ir, tc, &out));
   ASSERT_NE((i64)0, (i64)out.len);
@@ -713,6 +716,8 @@ TEST(FbxWasmEmit, RefusesBranchCondJP) {
   ir.ninsts = 1;
   ir.nvregs = 0;
   tc = MakeTc(0x07A, 0, 0, 0, 0x8000, 2, FBX_TC_KIND_NORMAL);
+  ir.start_pc = tc->start_pc;
+  ir.end_pc = tc->end_pc; /* firebox#5BW */
   fbx_wasm_buffer_init(&out);
   ASSERT_EQ(0, fbx_ir_emit_wasm(&ir, tc, &out));
   fbx_wasm_buffer_free(&out);
@@ -1075,6 +1080,8 @@ TEST(FbxWasmEmit, RefusesMalformedSetFlagsRawWithBranchCond) {
   ir.insts = insts;
   ir.ninsts = 2;
   tc = MakeTc(0x001, RDE_MOD3, 0, 0, 0x9000, 3, FBX_TC_KIND_NORMAL);
+  ir.start_pc = tc->start_pc;
+  ir.end_pc = tc->end_pc; /* firebox#5BW */
   fbx_wasm_buffer_init(&out);
   ASSERT_EQ(0, fbx_ir_emit_wasm(&ir, tc, &out));
   fbx_wasm_buffer_free(&out);
@@ -1098,6 +1105,8 @@ TEST(FbxWasmEmit, SynthsCallDirect) {
   ir.insts = insts;
   ir.ninsts = 1;
   tc = MakeTc(0x0E8, 0, 0, 0x100, 0xA000, 5, FBX_TC_KIND_NORMAL);
+  ir.start_pc = tc->start_pc;
+  ir.end_pc = tc->end_pc; /* firebox#5BW */
   fbx_wasm_buffer_init(&out);
   ASSERT_EQ(1, fbx_ir_emit_wasm(&ir, tc, &out));
   ASSERT_NE((i64)0, (i64)out.len);
@@ -2151,6 +2160,7 @@ TEST(FbxWasm602, BranchCondJESynthsWithCallRet) {
     ir2.ninsts = 1;
     ir2.nvregs = 0;
     call_tc = MakeTc(0x0E8, 0, 0, 0x1000, 0xE003, 5, FBX_TC_KIND_NORMAL);
+    ir2.end_pc = call_tc->end_pc; /* firebox#5BW */
     fbx_wasm_buffer_init(&call_out);
     ASSERT_EQ(1, fbx_ir_emit_wasm(&ir2, call_tc, &call_out));
     ASSERT_NE((i64)0, (i64)call_out.len);
@@ -2178,6 +2188,8 @@ TEST(FbxWasm602, DeterministicCallEmit) {
   ir.insts = insts;
   ir.ninsts = 1;
   tc = MakeTc(0x0E8, 0, 0, 0x100, 0xA000, 5, FBX_TC_KIND_NORMAL);
+  ir.start_pc = tc->start_pc;
+  ir.end_pc = tc->end_pc; /* firebox#5BW */
   fbx_wasm_buffer_init(&out1);
   fbx_wasm_buffer_init(&out2);
   ASSERT_EQ(1, fbx_ir_emit_wasm(&ir, tc, &out1));
@@ -2234,6 +2246,7 @@ TEST(FbxWasm602, CallAndRetProduceDifferentBytes) {
   ir_ret.insts = ret_insts;
   ir_ret.ninsts = 1;
   call_tc = MakeTc(0x0E8, 0, 0, 0x100, 0xA000, 5, FBX_TC_KIND_NORMAL);
+  ir_call.end_pc = call_tc->end_pc; /* firebox#5BW */
   ret_tc = MakeTc(0x0C3, 0, 0, 0, 0xB000, 1, FBX_TC_KIND_NORMAL);
   fbx_wasm_buffer_init(&call_out);
   fbx_wasm_buffer_init(&ret_out);
@@ -2354,6 +2367,8 @@ TEST(FbxWasmEmit, SelfLoopWrapperEmitted) {
   ir.ninsts = 1;
   ir.nvregs = 0;
   tc = MakeTc(0x074, 0, 0, 0, 0x8000, 2, FBX_TC_KIND_NORMAL);
+  ir.start_pc = tc->start_pc;
+  ir.end_pc = tc->end_pc; /* firebox#5BW */
   fbx_wasm_buffer_init(&out);
   ASSERT_EQ(1, fbx_ir_emit_wasm(&ir, tc, &out));
   ASSERT_NE((i64)0, (i64)out.len);
@@ -2427,6 +2442,8 @@ TEST(FbxWasmEmit, SelfLoopEmitDeterministic) {
   ir.insts = insts;
   ir.ninsts = 1;
   ir.nvregs = 0;
+  ir.start_pc = 0x8000;
+  ir.end_pc = 0x8002; /* firebox#5BW: the fall-through is the block end */
   tc = MakeTc(0x074, 0, 0, 0, 0x8000, 2, FBX_TC_KIND_NORMAL);
   fbx_wasm_buffer_init(&a);
   fbx_wasm_buffer_init(&b);
@@ -2657,4 +2674,131 @@ TEST(FbxRegion, MembersThatWriteMemoryOrCannotBeLoweredAreRefused) {
   EXPECT_EQ(0, RegionMemberOkBytes(imul, 2));
   EXPECT_EQ(0, RegionMemberOkBytes(sys, 1));
   EXPECT_EQ(0, RegionMemberOkBytes(ret, 1));
+}
+
+/* ────────────────────────────────────────────────────────────────────────── */
+/* firebox#NDG — a flag definition is dead only if nothing between it and the */
+/* next definition can leave the block.                                       */
+/* ────────────────────────────────────────────────────────────────────────── */
+
+/* Occurrences of `i32.store align=2 offset=offsetof(Machine, flags)`. */
+static unsigned CountFlagsStores(const struct FbxWasmBuffer *w) {
+  u8 pat[8];
+  unsigned n = 0, k = 0, v = (unsigned)offsetof(struct Machine, flags);
+  size_t i;
+  pat[k++] = 0x36u;
+  pat[k++] = 0x02u;
+  do {
+    u8 byte = v & 0x7Fu;
+    v >>= 7;
+    pat[k++] = byte | (v ? 0x80u : 0u);
+  } while (v);
+  for (i = 0; i + k <= w->len; ++i) {
+    if (!memcmp(w->data + i, pat, k)) ++n;
+  }
+  return n;
+}
+
+static unsigned PerBlockFlagsStores(const struct RgInsn *ins, unsigned n) {
+  struct FbxTcBlock *tc = DecodeTc(ins, n);
+  struct FbxIrBlock *ir;
+  struct FbxWasmBuffer out;
+  unsigned stores = 0xFFFFu;
+  if (!tc) return 0xFFFEu;
+  ir = fbx_ir_lift(tc);
+  fbx_wasm_buffer_init(&out);
+  if (ir && fbx_ir_emit_wasm(ir, tc, &out)) stores = CountFlagsStores(&out);
+  fbx_wasm_buffer_free(&out);
+  fbx_ir_free(ir);
+  free(tc->entries);
+  free(tc);
+  return stores;
+}
+
+TEST(FbxNdg, FlagDefinitionSurvivesALoadThatCanBailOut) {
+  /* add rax, rbx ; mov rcx, [rdx+8] ; sub rsi, rdi ; jmp .+2
+   * The LOAD can return 1 with m->ip at the mov: Tier 1 resumes there and,
+   * if the access faults, the signal frame carries the ADD's flags. */
+  static const struct RgInsn across_load[] = {
+      {0x1000, 3, {0x48, 0x01, 0xd8}},
+      {0x1003, 4, {0x48, 0x8b, 0x4a, 0x08}},
+      {0x1007, 3, {0x48, 0x29, 0xfe}},
+      {0x100a, 2, {0xeb, 0x00}}};
+  /* The control: a register mov cannot leave the block, so the ADD's
+   * definition is overwritten unobserved and elided. */
+  static const struct RgInsn no_exit[] = {
+      {0x1000, 3, {0x48, 0x01, 0xd8}},
+      {0x1003, 3, {0x48, 0x89, 0xd1}},
+      {0x1006, 3, {0x48, 0x29, 0xfe}},
+      {0x1009, 2, {0xeb, 0x00}}};
+  EXPECT_EQ(2, (i64)PerBlockFlagsStores(across_load, 4));
+  EXPECT_EQ(1, (i64)PerBlockFlagsStores(no_exit, 4));
+}
+
+/* ────────────────────────────────────────────────────────────────────────── */
+/* firebox#5BW — BRANCH_COND's fall-through and CALL_DIRECT's return PC at    */
+/* full width.  The IR's src2 holds only the low 32 bits.                     */
+/* ────────────────────────────────────────────────────────────────────────── */
+
+static int ConstsHold(const struct RgInsn *ins, unsigned n, u64 want,
+                      u64 forbid) {
+  struct FbxTcBlock *tc = DecodeTc(ins, n);
+  struct FbxIrBlock *ir;
+  u64 consts[FBX_T2_BLOCK_CTX_MAX_CONSTS];
+  u32 nconsts = 0, k;
+  int saw = 0, bad = 0;
+  struct FbxWasmBuffer out;
+  if (!tc) return -1;
+  ir = fbx_ir_lift(tc);
+  fbx_wasm_buffer_init(&out);
+  if (!ir || !fbx_ir_emit_wasm(ir, tc, &out) ||
+      !fbx_ir_build_block_ctx_consts(ir, consts, FBX_T2_BLOCK_CTX_MAX_CONSTS,
+                                     &nconsts)) {
+    saw = -2;
+  } else {
+    for (k = 0; k < nconsts; ++k) {
+      saw |= consts[k] == want;
+      bad |= consts[k] == forbid;
+    }
+  }
+  fbx_wasm_buffer_free(&out);
+  fbx_ir_free(ir);
+  free(tc->entries);
+  free(tc);
+  return saw < 0 ? saw : (saw && !bad);
+}
+
+TEST(Fbx5bw, FallThroughAndReturnPcKeepTheHighHalf) {
+  /* cmp rax, rbx ; jne .+0x10, at a PC above 4 GiB */
+  static const struct RgInsn jcc[] = {
+      {0x100001000ull, 3, {0x48, 0x39, 0xd8}},
+      {0x100001003ull, 2, {0x75, 0x10}}};
+  /* call .+0x100, at a PC above 4 GiB */
+  static const struct RgInsn call[] = {
+      {0x200002000ull, 5, {0xe8, 0x00, 0x01, 0x00, 0x00}}};
+  EXPECT_EQ(1, ConstsHold(jcc, 2, 0x100001005ull, 0x00001005ull));
+  EXPECT_EQ(1, ConstsHold(call, 1, 0x200002005ull, 0x00002005ull));
+}
+
+TEST(Fbx5bw, BranchCondWhoseSrc2DisagreesWithTheBlockEndIsRefused) {
+  static const struct RgInsn jcc[] = {
+      {0x100001000ull, 3, {0x48, 0x39, 0xd8}},
+      {0x100001003ull, 2, {0x75, 0x10}}};
+  struct FbxTcBlock *tc = DecodeTc(jcc, 2);
+  struct FbxIrBlock *ir;
+  struct FbxWasmBuffer out;
+  u32 k;
+  ASSERT_NOTNULL(tc);
+  ir = fbx_ir_lift(tc);
+  ASSERT_NOTNULL(ir);
+  fbx_wasm_buffer_init(&out);
+  EXPECT_EQ(1, fbx_ir_emit_wasm(ir, tc, &out));
+  for (k = 0; k < ir->ninsts; ++k) {
+    if (ir->insts[k].opcode == FBX_IR_OP_BRANCH_COND) ir->insts[k].src2 += 1;
+  }
+  EXPECT_EQ(0, fbx_ir_emit_wasm(ir, tc, &out));
+  fbx_wasm_buffer_free(&out);
+  fbx_ir_free(ir);
+  free(tc->entries);
+  free(tc);
 }
