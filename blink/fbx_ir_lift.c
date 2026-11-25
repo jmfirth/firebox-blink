@@ -622,32 +622,61 @@ static int LiftMovStoreMem(struct LiftCtx *ctx, u64 rde, i64 disp,
 /* Lift MOV r, r/m in the memory-load direction (0x8A/0x8B, mod != 3):
  *   LOAD (vreg = mem[base+disp]) ; REG_SET (dst reg = vreg).
  * Returns 1 on success, 0 on alloc failure, -1 to request BAILOUT. */
-static int LiftMovLoadMem(struct LiftCtx *ctx, u64 rde, i64 disp,
-                          u8 width) {
+static int ClassifyLeaMem(u64 rde, u32 *out_base_greg, u32 *out_index_greg,
+                          u32 *out_scale);
+
+/* Emit `vreg = LOAD{load_width} [base (+ index*scale) + disp]` and
+ * `REG_SET{set_width} RexrReg = vreg`.
+ *
+ * firebox#JJJ: the load accepts the SIB-index form `[base + index*scale +
+ * disp]` as well as `[base + disp]`.  The addressing classification is
+ * ClassifyLeaMem's — the one the indexed LEA already uses — so the same forms
+ * are refused (RIP-relative, no-base SIB) and Tier 1 runs them.  The index
+ * rides in src2 (GREG) with the SIB scale; src2_kind stays NONE for the
+ * base-only form, which the emitter reads as "no index term".
+ *
+ * A narrower load widened by REG_SET is MOVZX: the emitter's narrow loads are
+ * i64.load{8,16}_u, which zero-extend, and REG_SET's width then applies the
+ * x86 destination rule (4 zero-extends to 64 bits, 2 merges into the low
+ * word). */
+static int LiftLoadToReg(struct LiftCtx *ctx, u64 rde, i64 disp,
+                         u8 load_width, u8 set_width) {
   u32 base_greg;
+  u32 index_greg;
+  u32 scale;
   u32 val_vreg;
   struct FbxIrInst *ld;
   struct FbxIrInst *set;
-  if (!ClassifyMemBaseDisp(rde, &base_greg)) return -1;
+  if (!ClassifyLeaMem(rde, &base_greg, &index_greg, &scale)) return -1;
   ld = CtxEmit(ctx);
   if (!ld) return 0;
   val_vreg = CtxAllocVreg(ctx);
   ld->opcode = FBX_IR_OP_LOAD;
-  ld->width = width;
+  ld->width = load_width;
   ld->dst_kind = FBX_IR_KIND_VREG;
   ld->dst = val_vreg;
   ld->src1_kind = FBX_IR_KIND_GREG; /* base address register */
   ld->src1 = base_greg;
+  if (scale != 0) {
+    ld->src2_kind = FBX_IR_KIND_GREG; /* index register */
+    ld->src2 = index_greg;
+    ld->scale = scale;
+  }
   ld->imm = (u64)disp; /* sign-extended displacement */
   set = CtxEmit(ctx);
   if (!set) return 0;
   set->opcode = FBX_IR_OP_REG_SET;
-  set->width = width;
+  set->width = set_width;
   set->dst_kind = FBX_IR_KIND_GREG;
   set->dst = (u32)RexrReg(rde);
   set->src1_kind = FBX_IR_KIND_VREG;
   set->src1 = val_vreg;
   return 1;
+}
+
+static int LiftMovLoadMem(struct LiftCtx *ctx, u64 rde, i64 disp,
+                          u8 width) {
+  return LiftLoadToReg(ctx, rde, disp, width, width);
 }
 
 /* ALU sub-op decoder for OpAlui / OpAlu group:
@@ -1162,8 +1191,9 @@ static int LiftAluRR(struct LiftCtx *ctx, u64 rde, u8 op, int byte_op,
 /* Lift MOVZX r, r/m {byte,word} — zero-extending move (mopcode 0x1B6 =
  * MOVZX r, r/m8; mopcode 0x1B7 = MOVZX r, r/m16).
  *
- * mod3-only at v0.1 (see comment on the call site in LiftOne).  The IR
- * shape is REG_GET (narrow width) + REG_SET (wide width).  The synthesis
+ * Register form: REG_GET (narrow width) + REG_SET (wide width).  Memory
+ * form (firebox#JJJ): LOAD (narrow width) + REG_SET (wide width), through
+ * LiftLoadToReg.  The synthesis
  * pass's existing i64.load{8,16}_u path is unsigned — the implicit zero-
  * extension of the wasm load matches MOVZX semantics exactly.  No new IR
  * opcode and no new emit-side machinery needed.
@@ -1171,7 +1201,7 @@ static int LiftAluRR(struct LiftCtx *ctx, u64 rde, u8 op, int byte_op,
  * `src_width` is 1 or 2 (byte vs word source).  Destination width comes
  * from REX.W / operand-size prefix per the wider operand (Word vs Dword vs
  * Qword), determined by WidthFromRde(byte_op=0). */
-static int LiftMovzx(struct LiftCtx *ctx, u64 rde, u8 src_width) {
+static int LiftMovzx(struct LiftCtx *ctx, u64 rde, i64 disp, u8 src_width) {
   u8 dst_width = WidthFromRde(rde, 0);
   u32 src_vreg;
   struct FbxIrInst *get;
@@ -1183,6 +1213,13 @@ static int LiftMovzx(struct LiftCtx *ctx, u64 rde, u8 src_width) {
    * wouldn't be well-defined and a real compiler-emitted x86 wouldn't
    * produce that encoding. */
   if (src_width > dst_width) return -1;
+  /* firebox#JJJ: the memory form, `movzx r, byte/word [mem]`, is a narrow
+   * zero-extending LOAD.  It is the hottest Tier-2 refusal on rg (the DFA
+   * transition loop reads the haystack byte and the byte-class table with
+   * it).  `disp` is the decoded displacement. */
+  if (!IsModrmRegister(rde)) {
+    return LiftLoadToReg(ctx, rde, disp, src_width, dst_width);
+  }
   get = CtxEmit(ctx);
   if (!get) return 0;
   src_vreg = CtxAllocVreg(ctx);
@@ -1313,8 +1350,8 @@ static int LiftOne(struct LiftCtx *ctx, const struct FbxTcEntry *e,
      * rank 34 (0x1B7) per §Q7 measurement.  IR shape matches existing
      * REG_GET (narrow) + REG_SET (wide); the synthesis pass's
      * i64.load{8,16}_u is unsigned, matching MOVZX semantics. */
-    case 0x1B6: return LiftMovzx(ctx, rde, 1);
-    case 0x1B7: return LiftMovzx(ctx, rde, 2);
+    case 0x1B6: return LiftMovzx(ctx, rde, e->disp, 1);
+    case 0x1B7: return LiftMovzx(ctx, rde, e->disp, 2);
     /* ALU group r/m, imm — 0x80 (byte imm), 0x81 (imm32), 0x83 (imm8 sx). */
     case 0x080: return LiftAlui(ctx, rde, e->uimm0, 1);
     case 0x081:

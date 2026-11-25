@@ -962,8 +962,10 @@ TEST(FbxIrLift, MirrorRegisterAssignment) {
 /* ────────────────────────────────────────────────────────────────────────── */
 
 TEST(FbxIrLift, Movzx8) {
-  /* opcode 0x1B6: MOVZX r, r/m8.  No REX.W → dst width = 4. */
-  struct FbxTcBlock *tc = MakeTc(0x1B6, 0, 0, 0, 0x400000, 4,
+  /* opcode 0x1B6: MOVZX r, r/m8, register form.  No REX.W → dst width = 4.
+   * (firebox#JJJ: rde 0 is mod=0, the MEMORY form `[rax]`, which now lifts to
+   * a LOAD — see Movzx8MemBaseDisp.  The register form needs mod=3.) */
+  struct FbxTcBlock *tc = MakeTc(0x1B6, LIFT_RDE_MOD3, 0, 0, 0x400000, 4,
                                  FBX_TC_KIND_NORMAL);
   struct FbxIrBlock *ir = fbx_ir_lift(tc);
   u32 i;
@@ -993,8 +995,8 @@ TEST(FbxIrLift, Movzx8) {
 }
 
 TEST(FbxIrLift, Movzx16) {
-  /* opcode 0x1B7: MOVZX r, r/m16. */
-  struct FbxTcBlock *tc = MakeTc(0x1B7, 0, 0, 0, 0x400000, 4,
+  /* opcode 0x1B7: MOVZX r, r/m16, register form. */
+  struct FbxTcBlock *tc = MakeTc(0x1B7, LIFT_RDE_MOD3, 0, 0, 0x400000, 4,
                                  FBX_TC_KIND_NORMAL);
   struct FbxIrBlock *ir = fbx_ir_lift(tc);
   u32 i;
@@ -1019,7 +1021,8 @@ TEST(FbxIrLift, Movzx8Rexw) {
    * bit 6.  Set rde bit 6 to force REX.W = 1.  Width helper:
    * WidthFromRde(rde, byte_op=0) → 8 when REX.W is set. */
   u64 rexw_bit = (u64)0x40;
-  struct FbxTcBlock *tc = MakeTc(0x1B6, rexw_bit, 0, 0, 0x400000, 4,
+  struct FbxTcBlock *tc = MakeTc(0x1B6, rexw_bit | LIFT_RDE_MOD3, 0, 0,
+                                 0x400000, 4,
                                  FBX_TC_KIND_NORMAL);
   struct FbxIrBlock *ir = fbx_ir_lift(tc);
   u32 i;
@@ -1031,6 +1034,91 @@ TEST(FbxIrLift, Movzx8Rexw) {
     }
   }
   EXPECT_EQ(1, saw_qword_set);
+  fbx_ir_free(ir);
+  FreeTc(tc);
+}
+
+/* firebox#JJJ — the MOVZX memory form is a narrow zero-extending LOAD into a
+ * vreg, then a wide REG_SET.  Before #JJJ the lifter emitted REG_GET of the
+ * r/m REGISTER for this form (reading rAX instead of [rAX]); only the emit
+ * gate's mod==3 refusal kept that wrong lift from running. */
+static const struct FbxIrInst *FirstOp(const struct FbxIrBlock *ir, u8 op) {
+  u32 i;
+  for (i = 0; i < ir->ninsts; ++i) {
+    if (ir->insts[i].opcode == op) return &ir->insts[i];
+  }
+  return 0;
+}
+
+TEST(FbxIrLift, Movzx8MemBaseDisp) {
+  /* `movzx eax, byte [rax + 0x78]`: mod=1, rm=0, no SIB. */
+  struct FbxTcBlock *tc = MakeTc(0x1B6, LIFT_RDE_MEM_BASE_DISP8, 0, 0x78,
+                                 0x400000, 4, FBX_TC_KIND_NORMAL);
+  struct FbxIrBlock *ir = fbx_ir_lift(tc);
+  const struct FbxIrInst *ld, *set;
+  ASSERT_NOTNULL(ir);
+  EXPECT_EQ(0, BlockHas(ir, FBX_IR_OP_BAILOUT));
+  EXPECT_EQ(0, BlockHas(ir, FBX_IR_OP_REG_GET)); /* never reads rm as a reg */
+  ld = FirstOp(ir, FBX_IR_OP_LOAD);
+  set = FirstOp(ir, FBX_IR_OP_REG_SET);
+  ASSERT_NOTNULL(ld);
+  ASSERT_NOTNULL(set);
+  EXPECT_EQ(1, (int)ld->width);
+  EXPECT_EQ(FBX_IR_KIND_GREG, ld->src1_kind);
+  EXPECT_EQ(0, (i64)ld->src1);
+  EXPECT_EQ(FBX_IR_KIND_NONE, ld->src2_kind);
+  EXPECT_EQ(0x78, (i64)ld->imm);
+  EXPECT_EQ(4, (int)set->width);
+  EXPECT_EQ(FBX_IR_KIND_VREG, set->src1_kind);
+  EXPECT_EQ((i64)ld->dst, (i64)set->src1);
+  EXPECT_EQ(0, BlockHas(ir, FBX_IR_OP_SET_FLAGS_RAW));
+  fbx_ir_free(ir);
+  FreeTc(tc);
+}
+
+TEST(FbxIrLift, Movzx16MemSibIndex) {
+  /* `movzx eax, word [rax + rax*1]`: ModrmRm=4 (SIB), SibIndex=0, SibBase=0. */
+  struct FbxTcBlock *tc = MakeTc(0x1B7, 0x200ull, 0, 0, 0x400000, 4,
+                                 FBX_TC_KIND_NORMAL);
+  struct FbxIrBlock *ir = fbx_ir_lift(tc);
+  const struct FbxIrInst *ld;
+  ASSERT_NOTNULL(ir);
+  EXPECT_EQ(0, BlockHas(ir, FBX_IR_OP_BAILOUT));
+  ld = FirstOp(ir, FBX_IR_OP_LOAD);
+  ASSERT_NOTNULL(ld);
+  EXPECT_EQ(2, (int)ld->width);
+  EXPECT_EQ(FBX_IR_KIND_GREG, ld->src2_kind);
+  EXPECT_EQ(0, (i64)ld->src2);
+  EXPECT_EQ(1, (i64)ld->scale);
+  fbx_ir_free(ir);
+  FreeTc(tc);
+}
+
+TEST(FbxIrLift, MovLoadSibIndexScale4) {
+  /* `mov eax, dword [rax + rax*4]`: SibScale=2 (bits 0o46) ⇒ scale 4. */
+  u64 rde = 0x200ull | ((u64)2 << 046);
+  struct FbxTcBlock *tc = MakeTc(0x08B, rde, 0, 0, 0x400000, 3,
+                                 FBX_TC_KIND_NORMAL);
+  struct FbxIrBlock *ir = fbx_ir_lift(tc);
+  const struct FbxIrInst *ld;
+  ASSERT_NOTNULL(ir);
+  EXPECT_EQ(0, BlockHas(ir, FBX_IR_OP_BAILOUT));
+  ld = FirstOp(ir, FBX_IR_OP_LOAD);
+  ASSERT_NOTNULL(ld);
+  EXPECT_EQ(FBX_IR_KIND_GREG, ld->src2_kind);
+  EXPECT_EQ(4, (i64)ld->scale);
+  fbx_ir_free(ir);
+  FreeTc(tc);
+}
+
+TEST(FbxIrLift, MovzxMemRipRelativeRefused) {
+  /* mod=0, rm=5, no SIB: RIP-relative, no base register ⇒ BAILOUT. */
+  struct FbxTcBlock *tc = MakeTc(0x1B6, (u64)5 << 7, 0, 0x10, 0x400000, 7,
+                                 FBX_TC_KIND_NORMAL);
+  struct FbxIrBlock *ir = fbx_ir_lift(tc);
+  ASSERT_NOTNULL(ir);
+  EXPECT_NE(0, BlockHas(ir, FBX_IR_OP_BAILOUT));
+  EXPECT_EQ(0, BlockHas(ir, FBX_IR_OP_LOAD));
   fbx_ir_free(ir);
   FreeTc(tc);
 }

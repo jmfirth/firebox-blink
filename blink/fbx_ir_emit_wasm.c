@@ -806,10 +806,9 @@ static int CoverageGate(const struct FbxIrBlock *ir,
        * EmitRegLoad doesn't model memory-modrm yet — same gate as the
        * MOV variants above). */
       case 0x1B6: case 0x1B7:
-        if (!Mod3(rde)) {
-          SetFail(fail, FBX_IR_EMIT_MOD3_REQUIRED, (u8)(mop & 0xFF));
-          return 0;
-        }
+        /* firebox#JJJ: both forms.  The memory form lifts to a narrow
+         * zero-extending LOAD + REG_SET (LiftLoadToReg); an addressing form
+         * the LOAD cannot express was already a lift-time BAILOUT. */
         break;
       /* #794 — IMUL r,r/m,imm32 (0x69) / imm8 (0x6B) and IMUL r,r/m (0x1AF =
        * 0x0FAF).  Reg-form (modrm.mod==3) only at this increment — the lifter
@@ -919,6 +918,20 @@ static int CoverageGate(const struct FbxIrBlock *ir,
       } else if (p->src2_kind != FBX_IR_KIND_NONE &&
                  p->src2_kind != FBX_IR_KIND_IMM) {
         SetFail(fail, FBX_IR_EMIT_LEA_SIB_FORM, p->opcode);
+        return 0;
+      }
+    }
+    /* firebox#JJJ: a LOAD's src2 is its optional SIB index (GREG + scale);
+     * nothing else may ride there. */
+    if (p->opcode == FBX_IR_OP_LOAD) {
+      if (p->src2_kind == FBX_IR_KIND_GREG) {
+        if (p->src2 >= 16u || (p->scale != 1 && p->scale != 2 &&
+                               p->scale != 4 && p->scale != 8)) {
+          SetFail(fail, FBX_IR_EMIT_KIND_MISMATCH, p->opcode);
+          return 0;
+        }
+      } else if (p->src2_kind != FBX_IR_KIND_NONE) {
+        SetFail(fail, FBX_IR_EMIT_KIND_MISMATCH, p->opcode);
         return 0;
       }
     }
@@ -1330,6 +1343,9 @@ static int AllocPopSlots(struct BlockCtxBuilder *b,
  * the scarce 4-entry IMM range isn't consumed by `[base+0]` forms. */
 struct MemAddrSlots {
   u32 base_slot;
+  u32 index_slot;      /* firebox#JJJ: LOAD SIB index; valid iff has_index */
+  int has_index;
+  u32 scale;           /* 1/2/4/8 when has_index, else 0 */
   u32 disp_slot;       /* 0xFFFFFFFFu when disp == 0 (no slot needed) */
   int has_disp;
   u32 bailout_pc_slot; /* firebox#735 — PC to bail to on a TLB miss/fault */
@@ -1340,6 +1356,18 @@ static int AllocLoadStoreSlots(struct BlockCtxBuilder *b,
                                struct MemAddrSlots *out) {
   /* src1 is always the base greg id for both LOAD and STORE. */
   out->base_slot = BcAllocGreg(b, p->src1);
+  /* firebox#JJJ: a LOAD may carry a SIB index in src2.  (A STORE's src2 is
+   * its value vreg, never an index.)  Allocated between base and disp in
+   * both walkers, so the slot indices agree. */
+  if (p->opcode == FBX_IR_OP_LOAD && p->src2_kind == FBX_IR_KIND_GREG) {
+    out->index_slot = BcAllocGreg(b, p->src2);
+    out->has_index = 1;
+    out->scale = p->scale;
+  } else {
+    out->index_slot = 0xFFFFFFFFu;
+    out->has_index = 0;
+    out->scale = 0;
+  }
   if (p->imm != 0) {
     out->disp_slot = BcAllocImm(b, p->imm);
     out->has_disp = 1;
@@ -2766,13 +2794,34 @@ static void EmitGregAddImm(struct FbxWasmBuffer *body, u32 base_slot,
  * the caller routes it through EmitGuestVaToHostOffsetOrBailout to translate.
  * (Pre-#735 this appended an `i32.wrap_i64`, treating the VA as a linear
  * offset — the #709/#719 OOB-trap root cause.) */
-static void EmitMemEffectiveVa(struct FbxWasmBuffer *body, u32 base_slot,
-                               int has_disp, u32 disp_slot) {
+static void EmitScaleShift(struct FbxWasmBuffer *body, u32 scale) {
+  if (scale != 1) {
+    u32 shift = (scale == 2) ? 1u : (scale == 4) ? 2u : 3u;
+    fbx_wasm_buffer_u8(body, WASM_OP_I64_CONST);
+    fbx_wasm_buffer_sleb(body, (i64)shift);
+    fbx_wasm_buffer_u8(body, WASM_OP_I64_SHL);
+  }
+}
+
+static void EmitMemEffectiveVa(struct FbxWasmBuffer *body,
+                               const struct MemAddrSlots *s) {
+  u32 base_slot = s->base_slot;
+  int has_disp = s->has_disp;
+  u32 disp_slot = s->disp_slot;
   /* Load the guest base register's value as i64 (the guest VA base). */
   EmitPushGregBaseAddr(body, base_slot);
   fbx_wasm_buffer_u8(body, WASM_OP_I64_LOAD);
   fbx_wasm_buffer_uleb(body, 3);
   fbx_wasm_buffer_uleb(body, 0);
+  if (s->has_index) {
+    /* firebox#JJJ: + weg[index] << log2(scale), modulo 2^64 like the CPU. */
+    EmitPushGregBaseAddr(body, s->index_slot);
+    fbx_wasm_buffer_u8(body, WASM_OP_I64_LOAD);
+    fbx_wasm_buffer_uleb(body, 3);
+    fbx_wasm_buffer_uleb(body, 0);
+    EmitScaleShift(body, s->scale);
+    fbx_wasm_buffer_u8(body, WASM_OP_I64_ADD);
+  }
   if (has_disp) {
     /* + (i64)disp, from the hoisted ctx slot. */
     EmitLoadCtxI64(body, disp_slot);
@@ -2791,9 +2840,9 @@ static void EmitMemEffectiveVa(struct FbxWasmBuffer *body, u32 base_slot,
  * nothing before the translation (read-only into dst_local), so a bailout is
  * safe to re-run on Tier 1. */
 static void EmitLoadMem(struct FbxWasmBuffer *body, u32 dst_local,
-                        u32 base_slot, int has_disp, u32 disp_slot, u8 width,
+                        const struct MemAddrSlots *s, u8 width,
                         u32 mmu_va, u32 mmu_entry, u32 bailout_pc_slot) {
-  EmitMemEffectiveVa(body, base_slot, has_disp, disp_slot);
+  EmitMemEffectiveVa(body, s);
   EmitGuestVaToHostOffsetOrBailout(body, /*need_rw=*/0, width, mmu_va,
                                    mmu_entry, bailout_pc_slot);
   switch (width) {
@@ -2831,9 +2880,9 @@ static void EmitLoadMem(struct FbxWasmBuffer *body, u32 dst_local,
  * the value is pushed, so a translation-miss bailout has committed nothing for
  * this op and Tier 1 can re-run the whole instruction soundly. */
 static void EmitStoreMem(struct FbxWasmBuffer *body, u32 val_local,
-                         u32 base_slot, int has_disp, u32 disp_slot, u8 width,
+                         const struct MemAddrSlots *s, u8 width,
                          u32 mmu_va, u32 mmu_entry, u32 bailout_pc_slot) {
-  EmitMemEffectiveVa(body, base_slot, has_disp, disp_slot);
+  EmitMemEffectiveVa(body, s);
   EmitGuestVaToHostOffsetOrBailout(body, /*need_rw=*/1, width, mmu_va,
                                    mmu_entry, bailout_pc_slot);
   fbx_wasm_buffer_u8(body, WASM_OP_LOCAL_GET);
@@ -3379,8 +3428,7 @@ static int EmitFunctionBody(struct FbxWasmBuffer *body,
           SetFail(fail, FBX_IR_EMIT_KIND_MISMATCH, p->opcode);
           return 0;
         }
-        EmitLoadMem(body, VregLocal(p->dst), s.base_slot, s.has_disp,
-                    s.disp_slot, p->width ? p->width : 8u,
+        EmitLoadMem(body, VregLocal(p->dst), &s, p->width ? p->width : 8u,
                     MmuVaLocal(ir, needs_scratch, self_loop),
                     MmuEntryLocal(ir, needs_scratch, self_loop),
                     s.bailout_pc_slot);
@@ -3399,8 +3447,7 @@ static int EmitFunctionBody(struct FbxWasmBuffer *body,
           SetFail(fail, FBX_IR_EMIT_KIND_MISMATCH, p->opcode);
           return 0;
         }
-        EmitStoreMem(body, VregLocal(p->src2), s.base_slot, s.has_disp,
-                     s.disp_slot, p->width ? p->width : 8u,
+        EmitStoreMem(body, VregLocal(p->src2), &s, p->width ? p->width : 8u,
                      MmuVaLocal(ir, needs_scratch, self_loop),
                      MmuEntryLocal(ir, needs_scratch, self_loop),
                      s.bailout_pc_slot);

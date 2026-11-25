@@ -1212,6 +1212,114 @@ TEST(FbxWasmEmit, EmitsMemoryFormMovLoad) {
   FreeTc(tc);
 }
 
+/* firebox#JJJ — a LOAD with a SIB index: `mov ebx, [rax + rcx*4 + 0x20]`.
+ * Builds the IR the lifter produces (LiftLoadToReg) with the given index
+ * kind / scale, and emits it against a mem-form 0x8B TC entry. */
+static int EmitIndexedLoad(u8 src2_kind, u32 scale, struct FbxWasmBuffer *out) {
+  struct FbxIrBlock ir;
+  struct FbxIrInst insts[3];
+  struct FbxTcBlock *tc;
+  int rc;
+  memset(&ir, 0, sizeof ir);
+  memset(insts, 0, sizeof insts);
+  insts[0].opcode = FBX_IR_OP_PC_MARK;
+  insts[0].imm = 0xB100;
+  insts[1].opcode = FBX_IR_OP_LOAD;
+  insts[1].width = 4;
+  insts[1].dst_kind = FBX_IR_KIND_VREG;
+  insts[1].dst = 0;
+  insts[1].src1_kind = FBX_IR_KIND_GREG;
+  insts[1].src1 = 0;
+  insts[1].src2_kind = src2_kind;
+  insts[1].src2 = 1;
+  insts[1].scale = scale;
+  insts[1].imm = 0x20;
+  insts[2].opcode = FBX_IR_OP_REG_SET;
+  insts[2].width = 4;
+  insts[2].dst_kind = FBX_IR_KIND_GREG;
+  insts[2].dst = 3;
+  insts[2].src1_kind = FBX_IR_KIND_VREG;
+  insts[2].src1 = 0;
+  ir.insts = insts;
+  ir.ninsts = 3;
+  ir.nvregs = 1;
+  ir.start_pc = 0xB100;
+  ir.end_pc = 0xB104;
+  tc = MakeTc(0x08B, RDE_MEM_BASE_DISP8, 0, 0x20, 0xB100, 4,
+              FBX_TC_KIND_NORMAL);
+  fbx_wasm_buffer_init(out);
+  rc = fbx_ir_emit_wasm(&ir, tc, out);
+  FreeTc(tc);
+  return rc;
+}
+
+TEST(FbxWasmEmit, IndexedLoadEmitsTheIndexTerm) {
+  struct FbxWasmBuffer plain, idx1, idx4;
+  u32 j;
+  int saw_shl = 0;
+  ASSERT_EQ(1, EmitIndexedLoad(FBX_IR_KIND_NONE, 0, &plain));
+  ASSERT_EQ(1, EmitIndexedLoad(FBX_IR_KIND_GREG, 1, &idx1));
+  ASSERT_EQ(1, EmitIndexedLoad(FBX_IR_KIND_GREG, 4, &idx4));
+  /* The index is not dropped: each form is a different module, and the
+   * scaled one carries an i64.shl (0x86) the scale-1 one does not need. */
+  EXPECT_NE(0, plain.len != idx1.len ||
+                   memcmp(plain.data, idx1.data, plain.len) != 0);
+  EXPECT_NE(0, idx1.len != idx4.len ||
+                   memcmp(idx1.data, idx4.data, idx1.len) != 0);
+  for (j = 0; j < idx4.len; ++j) {
+    if (idx4.data[j] == 0x86u) saw_shl = 1;
+  }
+  EXPECT_EQ(1, saw_shl);
+  fbx_wasm_buffer_free(&plain);
+  fbx_wasm_buffer_free(&idx1);
+  fbx_wasm_buffer_free(&idx4);
+}
+
+TEST(FbxWasmEmit, IndexedLoadBadShapesAreRefused) {
+  struct FbxWasmBuffer out;
+  /* scale 3 is not a SIB scale; an IMM or VREG src2 is not an index. */
+  EXPECT_EQ(0, EmitIndexedLoad(FBX_IR_KIND_GREG, 3, &out));
+  fbx_wasm_buffer_free(&out);
+  EXPECT_EQ(0, EmitIndexedLoad(FBX_IR_KIND_IMM, 0, &out));
+  fbx_wasm_buffer_free(&out);
+  EXPECT_EQ(0, EmitIndexedLoad(FBX_IR_KIND_VREG, 1, &out));
+  fbx_wasm_buffer_free(&out);
+}
+
+TEST(FbxWasmEmit, MovzxMemoryFormPassesTheGate) {
+  /* firebox#JJJ: `movzx edx, byte [rax + 0x20]` — LOAD width 1 + REG_SET
+   * width 4 against a mem-form 0x1B6 TC entry.  Was MOD3_REQUIRED. */
+  struct FbxIrBlock ir;
+  struct FbxIrInst insts[3];
+  struct FbxTcBlock *tc;
+  struct FbxWasmBuffer out;
+  memset(&ir, 0, sizeof ir);
+  memset(insts, 0, sizeof insts);
+  insts[0].opcode = FBX_IR_OP_PC_MARK;
+  insts[0].imm = 0xB100;
+  insts[1].opcode = FBX_IR_OP_LOAD;
+  insts[1].width = 1;
+  insts[1].dst_kind = FBX_IR_KIND_VREG;
+  insts[1].src1_kind = FBX_IR_KIND_GREG;
+  insts[1].imm = 0x20;
+  insts[2].opcode = FBX_IR_OP_REG_SET;
+  insts[2].width = 4;
+  insts[2].dst_kind = FBX_IR_KIND_GREG;
+  insts[2].dst = 2;
+  insts[2].src1_kind = FBX_IR_KIND_VREG;
+  ir.insts = insts;
+  ir.ninsts = 3;
+  ir.nvregs = 1;
+  ir.start_pc = 0xB100;
+  ir.end_pc = 0xB104;
+  tc = MakeTc(0x1B6, RDE_MEM_BASE_DISP8, 0, 0x20, 0xB100, 4,
+              FBX_TC_KIND_NORMAL);
+  fbx_wasm_buffer_init(&out);
+  EXPECT_EQ(1, fbx_ir_emit_wasm(&ir, tc, &out));
+  fbx_wasm_buffer_free(&out);
+  FreeTc(tc);
+}
+
 TEST(FbxWasmEmit, MemoryFormMovZeroDispEmits) {
   /* #677 — disp==0 form: no IMM slot is consumed (disp elided), but emit
    * still succeeds.  STORE mem[greg0] = vreg0. */
@@ -1838,7 +1946,7 @@ TEST(FbxWasm599, IrVersionBumped) {
    * Emit flipped from synthesize to refuse for a whole block class (any block
    * whose last flag-definer is an IMUL), so stale v8 sidecars must invalidate
    * rather than serve the fail-open wasm they already hold. */
-  ASSERT_EQ(9u, (u32)FBX_IR_VERSION);
+  ASSERT_EQ(10u, (u32)FBX_IR_VERSION);
 }
 
 TEST(FbxWasm599, FlagSynthDifferentOpKindProducesDifferentBytes) {

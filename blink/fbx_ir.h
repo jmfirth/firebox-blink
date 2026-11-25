@@ -194,8 +194,12 @@ extern "C" {
  *     class, so stale v8 sidecars must invalidate rather than serve the
  *     fail-open wasm they already hold.  Costs Tier-2 coverage on straight-line
  *     imul blocks (unmeasured, and deliberately paid); the permanent close is
- *     IMUL flag synthesis, a larger increment.  See work/tasks/3XY-* . */
-#define FBX_IR_VERSION 9u
+ *     IMUL flag synthesis, a larger increment.  See work/tasks/3XY-* .
+ *   10 — firebox#JJJ: LOAD gains an optional SIB index (src2 GREG + scale,
+ *     `[base + index*scale + disp]`), and MOVZX r, m8/m16 lifts to a narrow
+ *     LOAD + REG_SET instead of a BAILOUT.  The same IR bytes mean something
+ *     new for a LOAD whose src2 was never inspected before. */
+#define FBX_IR_VERSION 10u
 
 /* ────────────────────────────────────────────────────────────────────────── */
 /* IR opcodes.                                                                */
