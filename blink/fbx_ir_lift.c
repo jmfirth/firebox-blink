@@ -31,6 +31,8 @@
 #include "blink/rde.h"
 #include "blink/threadedcode.h"
 #include "blink/types.h"
+#include "blink/modrm.h"
+#include "blink/x86.h"
 
 /* The blink git SHA the build was produced from.  Optional — if the build
  * system does not provide it, the cache key falls back to all-zero.  Phase
@@ -238,6 +240,7 @@ static const char *const kOpcodeNames[FBX_IR_OP_LAST_] = {
     [FBX_IR_OP_CALL_HOST] = "CALL_HOST",
     [FBX_IR_OP_PUSH] = "PUSH",
     [FBX_IR_OP_POP] = "POP",
+    [FBX_IR_OP_JMP_INDIRECT] = "JMP_INDIRECT",
 };
 
 const char *fbx_ir_opcode_name(u8 opcode) {
@@ -271,6 +274,11 @@ struct LiftCtx {
   u32 cap;
   u32 next_vreg;
   u16 flags;
+  /* firebox#T3R2: 1 when lifting for a Tier-2 region (fbx_ir_lift_region).
+   * The forms only regions lower are lifted in this mode alone; the per-block
+   * lift BAILOUTs them exactly as before. */
+  int region;
+  u64 next_pc; /* PC after the instruction being lifted (RIP-relative) */
 };
 
 static int CtxReserve(struct LiftCtx *ctx, u32 want) {
@@ -355,6 +363,7 @@ static int LiftOpIsTerminator(u8 op) {
     case FBX_IR_OP_RET:
     case FBX_IR_OP_BAILOUT:
     case FBX_IR_OP_CALL_HOST:
+    case FBX_IR_OP_JMP_INDIRECT:
       return 1;
     default:
       return 0;
@@ -481,6 +490,7 @@ static int LiftOperandRoles(u64 mop) {
     /* ModRM.reg is an opcode extension (0x80, 0xC6) or a wide register
      * (MOVZX r, r/m8); only r/m is a byte. */
     case 0x080: case 0x0C6: case 0x1B6:
+    case 0x0F6: case 0x0FE: /* firebox#T3R2: TEST/NOT/NEG, INC/DEC r/m8 */
       return FBX_LIFT_HAS_MODRM | FBX_LIFT_RM_BYTE;
     /* Word/dword/qword ModRM ops — no byte register in either field. */
     case 0x089: case 0x08B: case 0x0C7:
@@ -488,6 +498,7 @@ static int LiftOperandRoles(u64 mop) {
     case 0x003: case 0x00B: case 0x023: case 0x02B: case 0x033: case 0x03B:
     case 0x085: case 0x1B7: case 0x081: case 0x083:
     case 0x069: case 0x06B: case 0x1AF:
+    case 0x0F7: case 0x0FF: /* firebox#T3R2: groups 3 and 5 */
       return FBX_LIFT_HAS_MODRM;
     case 0x08D:
       return FBX_LIFT_HAS_MODRM | FBX_LIFT_NO_SEG;
@@ -507,6 +518,7 @@ static int LiftOperandRoles(u64 mop) {
     case 0x188: case 0x189: case 0x18A: case 0x18B:
     case 0x18C: case 0x18D: case 0x18E: case 0x18F:
     case 0x0E8: case 0x0E9: case 0x0EB: case 0x0C3:
+    case 0x0A8: case 0x0A9: /* firebox#T3R2: TEST AL/rAX, imm */
     case 0x050: case 0x051: case 0x052: case 0x053:
     case 0x054: case 0x055: case 0x056: case 0x057:
     case 0x058: case 0x059: case 0x05A: case 0x05B:
@@ -572,6 +584,23 @@ static int LiftOperandShapeUnmodelled(u64 rde, u64 mop) {
    * (ADC /2 and SBB /3 are refused there).  No other group opcode (0x82,
    * C0/C1, D0-D3, F6/F7, FE/FF, 0F BA, 8F) has a role entry at all. */
   if ((mop == 0x0C6 || mop == 0x0C7) && ModrmReg(rde) != 0) return 1;
+  /* firebox#T3R2: group 3 (F6/F7) as TEST /0, NOT /2, NEG /3 — not the /1
+   * TEST alias, not MUL/IMUL/DIV/IDIV; group 4/5 (FE/FF) as INC /0, DEC /1
+   * and, for FF, CALL /2 and JMP /4 — not the far forms or PUSH r/m. */
+  if ((mop == 0x0F6 || mop == 0x0F7) &&
+      !(ModrmReg(rde) == 0 || ModrmReg(rde) == 2 || ModrmReg(rde) == 3)) {
+    return 1;
+  }
+  if (mop == 0x0FE && ModrmReg(rde) > 1) return 1;
+  if (mop == 0x0FF && !(ModrmReg(rde) <= 2 || ModrmReg(rde) == 4)) return 1;
+  /* firebox#T3R2: an operand-size prefix makes PUSH/POP/RET move 2 bytes
+   * (blink/stack.c kStackOsz) and changes CALL/JMP; the IR models only the
+   * 8-byte forms.  (These used to lift at 8 bytes regardless.) */
+  if (Osz(rde) &&
+      ((mop >= 0x050 && mop <= 0x05F) || mop == 0x0E8 || mop == 0x0C3 ||
+       (mop == 0x0FF && (ModrmReg(rde) == 2 || ModrmReg(rde) == 4)))) {
+    return 1;
+  }
   if (!(roles & FBX_LIFT_HAS_MODRM)) return 0;
   if ((roles & FBX_LIFT_REG_BYTE) &&
       LiftIsHighByteReg(rde, (u32)ModrmReg(rde))) {
@@ -590,12 +619,16 @@ static int LiftOperandShapeUnmodelled(u64 rde, u64 mop) {
 /* Lift MOV r/m, r in the memory-store direction (0x88/0x89, mod != 3):
  *   REG_GET (src reg → vreg) ; STORE (mem[base+disp] = vreg).
  * Returns 1 on success, 0 on alloc failure, -1 to request BAILOUT. */
+static int LiftStoreRegion(struct LiftCtx *ctx, u64 rde, i64 disp, u8 width,
+                           int imm_src, u64 uimm0);
+
 static int LiftMovStoreMem(struct LiftCtx *ctx, u64 rde, i64 disp,
                            u8 width) {
   u32 base_greg;
   u32 val_vreg;
   struct FbxIrInst *get;
   struct FbxIrInst *st;
+  if (ctx->region) return LiftStoreRegion(ctx, rde, disp, width, 0, 0);
   if (!ClassifyMemBaseDisp(rde, &base_greg)) return -1;
   get = CtxEmit(ctx);
   if (!get) return 0;
@@ -625,6 +658,117 @@ static int LiftMovStoreMem(struct LiftCtx *ctx, u64 rde, i64 disp,
 static int ClassifyLeaMem(u64 rde, u32 *out_base_greg, u32 *out_index_greg,
                           u32 *out_scale);
 
+/* firebox#T3R2 — one memory operand's address.  The per-block lift accepts
+ * ClassifyLeaMem's forms (base, optional index*scale, disp); the region lift
+ * also accepts RIP-relative, as an absolute VA (the PC after the instruction
+ * plus disp, blink/modrm.c ComputeAddress).  Everything else is refused, and
+ * Tier 1 runs it. */
+struct LiftAddr {
+  int abs;
+  u32 base, index, scale;
+  u64 va;
+  i64 disp;
+};
+
+static int LiftClassifyAddr(const struct LiftCtx *ctx, u64 rde, i64 disp,
+                            struct LiftAddr *a) {
+  memset(a, 0, sizeof *a);
+  if (IsModrmRegister(rde)) return 0;
+  if (!SibExists(rde) && ModrmMod(rde) == 0 && ModrmRm(rde) == 5) {
+    if (!ctx->region || !IsRipRelative(rde)) return 0;
+    a->abs = 1;
+    a->va = ctx->next_pc + (u64)disp;
+    return 1;
+  }
+  if (!ClassifyLeaMem(rde, &a->base, &a->index, &a->scale)) return 0;
+  a->disp = disp;
+  return 1;
+}
+
+/* LOAD address encoding: src1 GREG base (+ src2 GREG index, scale) + imm
+ * disp; or src1_kind IMM with the absolute VA in imm. */
+static void LiftSetLoadAddr(struct FbxIrInst *ld, const struct LiftAddr *a) {
+  if (a->abs) {
+    ld->src1_kind = FBX_IR_KIND_IMM;
+    ld->src1 = 0;
+    ld->imm = a->va;
+    return;
+  }
+  ld->src1_kind = FBX_IR_KIND_GREG;
+  ld->src1 = a->base;
+  if (a->scale != 0) {
+    ld->src2_kind = FBX_IR_KIND_GREG;
+    ld->src2 = a->index;
+    ld->scale = a->scale;
+  }
+  ld->imm = (u64)a->disp;
+}
+
+/* Emit `vreg = LOAD{width} [mem]` for the instruction's ModRM memory
+ * operand.  Returns 1 (and *out_vreg), 0 on alloc failure, -1 to BAILOUT. */
+static int LiftLoadOperand(struct LiftCtx *ctx, u64 rde, i64 disp, u8 width,
+                           u32 *out_vreg) {
+  struct LiftAddr a;
+  struct FbxIrInst *ld;
+  if (!LiftClassifyAddr(ctx, rde, disp, &a)) return -1;
+  ld = CtxEmit(ctx);
+  if (!ld) return 0;
+  *out_vreg = CtxAllocVreg(ctx);
+  ld->opcode = FBX_IR_OP_LOAD;
+  ld->width = width;
+  ld->dst_kind = FBX_IR_KIND_VREG;
+  ld->dst = *out_vreg;
+  LiftSetLoadAddr(ld, &a);
+  return 1;
+}
+
+/* firebox#T3R2 — a region STORE: `mem = RexrReg` (MOV r/m, r) or `mem = imm`
+ * (MOV r/m, imm).  STORE encoding: src1 GREG base or src1_kind IMM with the
+ * absolute VA in imm; src2 VREG value; the optional SIB index rides in dst
+ * (GREG) with `scale`; imm is the disp for the register forms. */
+static int LiftStoreRegion(struct LiftCtx *ctx, u64 rde, i64 disp, u8 width,
+                           int imm_src, u64 uimm0) {
+  struct LiftAddr a;
+  u32 val_vreg;
+  struct FbxIrInst *get;
+  struct FbxIrInst *st;
+  if (!LiftClassifyAddr(ctx, rde, disp, &a)) return -1;
+  get = CtxEmit(ctx);
+  if (!get) return 0;
+  val_vreg = CtxAllocVreg(ctx);
+  get->opcode = FBX_IR_OP_REG_GET;
+  get->width = width;
+  get->dst_kind = FBX_IR_KIND_VREG;
+  get->dst = val_vreg;
+  if (imm_src) {
+    get->src1_kind = FBX_IR_KIND_IMM;
+    get->imm = uimm0;
+  } else {
+    get->src1_kind = FBX_IR_KIND_GREG;
+    get->src1 = (u32)RexrReg(rde);
+  }
+  st = CtxEmit(ctx);
+  if (!st) return 0;
+  st->opcode = FBX_IR_OP_STORE;
+  st->width = width;
+  st->src2_kind = FBX_IR_KIND_VREG;
+  st->src2 = val_vreg;
+  if (a.abs) {
+    st->src1_kind = FBX_IR_KIND_IMM;
+    st->imm = a.va;
+  } else {
+    st->src1_kind = FBX_IR_KIND_GREG;
+    st->src1 = a.base;
+    st->imm = (u64)a.disp;
+    if (a.scale != 0) {
+      st->dst_kind = FBX_IR_KIND_GREG;
+      st->dst = a.index;
+      st->scale = a.scale;
+    }
+  }
+  return 1;
+}
+
 /* Emit `vreg = LOAD{load_width} [base (+ index*scale) + disp]` and
  * `REG_SET{set_width} RexrReg = vreg`.
  *
@@ -641,28 +785,11 @@ static int ClassifyLeaMem(u64 rde, u32 *out_base_greg, u32 *out_index_greg,
  * word). */
 static int LiftLoadToReg(struct LiftCtx *ctx, u64 rde, i64 disp,
                          u8 load_width, u8 set_width) {
-  u32 base_greg;
-  u32 index_greg;
-  u32 scale;
   u32 val_vreg;
-  struct FbxIrInst *ld;
+  int rc;
   struct FbxIrInst *set;
-  if (!ClassifyLeaMem(rde, &base_greg, &index_greg, &scale)) return -1;
-  ld = CtxEmit(ctx);
-  if (!ld) return 0;
-  val_vreg = CtxAllocVreg(ctx);
-  ld->opcode = FBX_IR_OP_LOAD;
-  ld->width = load_width;
-  ld->dst_kind = FBX_IR_KIND_VREG;
-  ld->dst = val_vreg;
-  ld->src1_kind = FBX_IR_KIND_GREG; /* base address register */
-  ld->src1 = base_greg;
-  if (scale != 0) {
-    ld->src2_kind = FBX_IR_KIND_GREG; /* index register */
-    ld->src2 = index_greg;
-    ld->scale = scale;
-  }
-  ld->imm = (u64)disp; /* sign-extended displacement */
+  rc = LiftLoadOperand(ctx, rde, disp, load_width, &val_vreg);
+  if (rc <= 0) return rc;
   set = CtxEmit(ctx);
   if (!set) return 0;
   set->opcode = FBX_IR_OP_REG_SET;
@@ -792,9 +919,17 @@ static int LiftMovZvqpIvqp(struct LiftCtx *ctx, u64 rde, u64 uimm0) {
  * `c6 c0 5a` (mov $0x5a,%al) became a 32-bit register write: it replaced all
  * of eAX and, by the 32-bit zero-extension rule, cleared the upper half of
  * rAX as well. */
-static int LiftMovImm(struct LiftCtx *ctx, u64 rde, u64 uimm0, int byte_op) {
+static int LiftMovImm(struct LiftCtx *ctx, u64 rde, i64 disp, u64 uimm0,
+                      int byte_op) {
   u8 width = WidthFromRde(rde, byte_op);
-  struct FbxIrInst *set = CtxEmit(ctx);
+  struct FbxIrInst *set;
+  /* firebox#T3R2: the memory form is a store, not a register write.  (It was
+   * lifted as `RexbRm = imm`; the per-block gate's mod3 check refused it.) */
+  if (!IsModrmRegister(rde)) {
+    if (!ctx->region) return -1;
+    return LiftStoreRegion(ctx, rde, disp, width, 1, uimm0);
+  }
+  set = CtxEmit(ctx);
   if (!set) return 0;
   set->opcode = FBX_IR_OP_REG_SET;
   set->width = width;
@@ -896,6 +1031,18 @@ static int LiftLea(struct LiftCtx *ctx, u64 rde, i64 disp) {
    * `lea r14,[r9+rax]`) and refuses only the no-base / RIP-relative forms.
    * EmitLea adds `weg[index]*scale` to the effective address — no MMU
    * translation (LEA never touches guest memory). */
+  if (ctx->region && IsRipRelative(rde)) {
+    /* firebox#T3R2: `lea r, [rip + disp]` is a constant. */
+    struct FbxIrInst *set = CtxEmit(ctx);
+    if (!set) return 0;
+    set->opcode = FBX_IR_OP_REG_SET;
+    set->width = width;
+    set->dst_kind = FBX_IR_KIND_GREG;
+    set->dst = (u32)RexrReg(rde);
+    set->src1_kind = FBX_IR_KIND_IMM;
+    set->imm = ctx->next_pc + (u64)disp;
+    return 1;
+  }
   if (!ClassifyLeaMem(rde, &base_greg, &index_greg, &scale)) {
     return -1;
   }
@@ -918,6 +1065,159 @@ static int LiftLea(struct LiftCtx *ctx, u64 rde, i64 disp) {
   }
   lea->imm = (u64)disp;
   return 1;
+}
+
+/* firebox#T3R2 — shared tails for the region-only lifts. */
+static int LiftGetReg(struct LiftCtx *ctx, u8 width, u32 greg, u32 *out) {
+  struct FbxIrInst *g = CtxEmit(ctx);
+  if (!g) return 0;
+  *out = CtxAllocVreg(ctx);
+  g->opcode = FBX_IR_OP_REG_GET;
+  g->width = width;
+  g->dst_kind = FBX_IR_KIND_VREG;
+  g->dst = *out;
+  g->src1_kind = FBX_IR_KIND_GREG;
+  g->src1 = greg;
+  return 1;
+}
+
+static int LiftGetImm(struct LiftCtx *ctx, u8 width, u64 imm, u32 *out) {
+  struct FbxIrInst *g = CtxEmit(ctx);
+  if (!g) return 0;
+  *out = CtxAllocVreg(ctx);
+  g->opcode = FBX_IR_OP_REG_GET;
+  g->width = width;
+  g->dst_kind = FBX_IR_KIND_VREG;
+  g->dst = *out;
+  g->src1_kind = FBX_IR_KIND_IMM;
+  g->imm = imm;
+  return 1;
+}
+
+/* `op` on two vregs; the result goes to `dst_greg` unless op is CMP/TEST;
+ * then SET_FLAGS_RAW of kind `flags_kind` (0: no flags) over `flags_src1`
+ * and `flags_src2`. */
+static int LiftAluTail(struct LiftCtx *ctx, u8 width, u8 op, u32 lhs, u32 rhs,
+                       u32 dst_greg, u8 flags_kind, u32 flags_src1,
+                       u32 flags_src2) {
+  int writes = op != FBX_IR_OP_CMP && op != FBX_IR_OP_TEST;
+  u32 res = 0;
+  struct FbxIrInst *alu = CtxEmit(ctx);
+  if (!alu) return 0;
+  if (writes) res = CtxAllocVreg(ctx);
+  alu->opcode = op;
+  alu->width = width;
+  alu->dst_kind = writes ? FBX_IR_KIND_VREG : FBX_IR_KIND_NONE;
+  alu->dst = res;
+  alu->src1_kind = FBX_IR_KIND_VREG;
+  alu->src1 = lhs;
+  alu->src2_kind = FBX_IR_KIND_VREG;
+  alu->src2 = rhs;
+  if (writes) {
+    struct FbxIrInst *set = CtxEmit(ctx);
+    if (!set) return 0;
+    set->opcode = FBX_IR_OP_REG_SET;
+    set->width = width;
+    set->dst_kind = FBX_IR_KIND_GREG;
+    set->dst = dst_greg;
+    set->src1_kind = FBX_IR_KIND_VREG;
+    set->src1 = res;
+  }
+  if (flags_kind) {
+    struct FbxIrInst *fl = CtxEmit(ctx);
+    if (!fl) return 0;
+    fl->opcode = FBX_IR_OP_SET_FLAGS_RAW;
+    fl->width = width;
+    fl->imm = flags_kind;
+    fl->src1_kind = FBX_IR_KIND_VREG;
+    fl->src1 = flags_src1;
+    fl->src2_kind = FBX_IR_KIND_VREG;
+    fl->src2 = flags_src2;
+  }
+  return 1;
+}
+
+/* firebox#T3R2 — the memory-operand ALU forms a region lowers, all of which
+ * READ memory only: `op r, [m]` (r is the destination), `cmp/test [m], r`,
+ * and `cmp [m], imm`.  The read-modify-write forms (`op [m], r`, `op [m],
+ * imm` for every op but CMP/TEST) are refused: Tier 1 runs them. */
+static int LiftAluMemRegion(struct LiftCtx *ctx, u64 rde, i64 disp, u8 width,
+                            u8 op, int mem_is_lhs, int imm_rhs, u64 uimm0) {
+  u32 m, o;
+  int rc;
+  if (!ctx->region) return -1;
+  if (mem_is_lhs && op != FBX_IR_OP_CMP && op != FBX_IR_OP_TEST) return -1;
+  rc = LiftLoadOperand(ctx, rde, disp, width, &m);
+  if (rc <= 0) return rc;
+  if (imm_rhs) {
+    if (!LiftGetImm(ctx, width, uimm0, &o)) return 0;
+  } else {
+    if (!LiftGetReg(ctx, width, (u32)RexrReg(rde), &o)) return 0;
+  }
+  if (mem_is_lhs) return LiftAluTail(ctx, width, op, m, o, 0, op, m, o);
+  return LiftAluTail(ctx, width, op, o, m, (u32)RexrReg(rde), op, o, m);
+}
+
+/* firebox#T3R2 — group 3 (F6/F7) /0 TEST r, imm; /2 NOT; /3 NEG; group 4/5
+ * (FE/FF) /0 INC, /1 DEC — register forms; FF /2 CALL and /4 JMP, register
+ * or memory.  Region lifts only.  Flags are blink/alu.c's: NOT writes none;
+ * INC/DEC keep CF; NEG's AF is (x != 0). */
+static int LiftUnaryRegion(struct LiftCtx *ctx, u64 rde, i64 disp, u64 uimm0,
+                           u64 mop) {
+  int byte_op = mop == 0x0F6 || mop == 0x0FE;
+  u8 width = WidthFromRde(rde, byte_op);
+  u32 greg = (u32)RexbRm(rde);
+  u32 x, k;
+  int sub = (int)ModrmReg(rde);
+  if (!ctx->region) return -1;
+  if ((mop == 0x0FF) && (sub == 2 || sub == 4)) {
+    struct FbxIrInst *c;
+    u32 t;
+    if (IsModrmRegister(rde)) {
+      if (!LiftGetReg(ctx, 8, greg, &t)) return 0;
+    } else {
+      int rc = LiftLoadOperand(ctx, rde, disp, 8, &t);
+      if (rc <= 0) return rc;
+    }
+    c = CtxEmit(ctx);
+    if (!c) return 0;
+    c->opcode = sub == 2 ? FBX_IR_OP_CALL_INDIRECT : FBX_IR_OP_JMP_INDIRECT;
+    c->src1_kind = FBX_IR_KIND_VREG;
+    c->src1 = t;
+    if (sub == 2) {
+      c->imm = ctx->next_pc; /* return PC, full width */
+      ctx->flags |= FBX_IR_BLOCK_FLAG_HAS_CALL;
+    }
+    ctx->flags |= FBX_IR_BLOCK_FLAG_HAS_INDIRECT_BR;
+    return 1;
+  }
+  if (!IsModrmRegister(rde)) return -1; /* read-modify-write: Tier 1 */
+  if (mop == 0x0F6 || mop == 0x0F7) {
+    switch (sub) {
+      case 0: /* TEST r, imm */
+        if (!LiftGetReg(ctx, width, greg, &x)) return 0;
+        if (!LiftGetImm(ctx, width, uimm0, &k)) return 0;
+        return LiftAluTail(ctx, width, FBX_IR_OP_TEST, x, k, 0,
+                           FBX_IR_OP_TEST, x, k);
+      case 2: /* NOT: x ^ all-ones, no flags */
+        if (!LiftGetReg(ctx, width, greg, &x)) return 0;
+        if (!LiftGetImm(ctx, width, ~(u64)0, &k)) return 0;
+        return LiftAluTail(ctx, width, FBX_IR_OP_XOR, x, k, greg, 0, 0, 0);
+      case 3: /* NEG: 0 - x */
+        if (!LiftGetReg(ctx, width, greg, &x)) return 0;
+        if (!LiftGetImm(ctx, width, 0, &k)) return 0;
+        return LiftAluTail(ctx, width, FBX_IR_OP_SUB, k, x, greg,
+                           FBX_IR_FLAGS_NEG, x, x);
+      default:
+        return -1;
+    }
+  }
+  if (sub != 0 && sub != 1) return -1;
+  if (!LiftGetReg(ctx, width, greg, &x)) return 0;
+  if (!LiftGetImm(ctx, width, 1, &k)) return 0;
+  return LiftAluTail(ctx, width, sub == 0 ? FBX_IR_OP_ADD : FBX_IR_OP_SUB, x,
+                     k, greg, sub == 0 ? FBX_IR_FLAGS_INC : FBX_IR_FLAGS_DEC,
+                     x, k);
 }
 
 /* Common body for the immediate-form ALU lift: `greg` = OP(greg, imm) with
@@ -994,9 +1294,17 @@ static int LiftAluImmCommon(struct LiftCtx *ctx, u8 width, u32 greg,
 
 /* Lift ALU group 1 r/m, imm (opcode 0x83 = OpAlui w/ sign-extended imm8;
  * also 0x81 = OpAlui w/ imm32; mopcode 0x080 / 0x081 / 0x082 / 0x083). */
-static int LiftAlui(struct LiftCtx *ctx, u64 rde, u64 uimm0, int byte_op) {
+static int LiftAlui(struct LiftCtx *ctx, u64 rde, i64 disp, u64 uimm0,
+                    int byte_op) {
   u8 op = AluSubOp(rde);
   if (op == 0) return -1; /* ADC/SBB — bailout */
+  /* firebox#T3R2: the memory form is not a register operation.  (It was
+   * lifted as one on RexbRm; the per-block gate's mod3 check refused it.)
+   * A region lowers `cmp [m], imm`; the rest is read-modify-write. */
+  if (!IsModrmRegister(rde)) {
+    return LiftAluMemRegion(ctx, rde, disp, WidthFromRde(rde, byte_op), op,
+                            /*mem_is_lhs=*/1, /*imm_rhs=*/1, uimm0);
+  }
   return LiftAluImmCommon(ctx, WidthFromRde(rde, byte_op), (u32)RexbRm(rde),
                           uimm0, op);
 }
@@ -1106,8 +1414,8 @@ static int LiftImul(struct LiftCtx *ctx, u64 rde, int has_imm, u64 uimm0) {
 #define FBX_ALU_DIR_RM_R 0
 #define FBX_ALU_DIR_R_RM 1
 
-static int LiftAluRR(struct LiftCtx *ctx, u64 rde, u8 op, int byte_op,
-                     int op_dir) {
+static int LiftAluRR(struct LiftCtx *ctx, u64 rde, i64 disp, u8 op,
+                     int byte_op, int op_dir) {
   u8 width = WidthFromRde(rde, byte_op);
   u32 lhs_greg;
   u32 rhs_greg;
@@ -1120,6 +1428,12 @@ static int LiftAluRR(struct LiftCtx *ctx, u64 rde, u8 op, int byte_op,
   struct FbxIrInst *alu;
   struct FbxIrInst *set_res;
   struct FbxIrInst *flags;
+  /* firebox#T3R2: the memory form is not a register operation.  (It was
+   * lifted as one on RexbRm; the per-block gate's mod3 check refused it.) */
+  if (!IsModrmRegister(rde)) {
+    return LiftAluMemRegion(ctx, rde, disp, width, op,
+                            op_dir == FBX_ALU_DIR_RM_R, 0, 0);
+  }
   if (op_dir == FBX_ALU_DIR_RM_R) {
     lhs_greg = (u32)RexbRm(rde);
     rhs_greg = (u32)RexrReg(rde);
@@ -1304,22 +1618,22 @@ static int LiftOne(struct LiftCtx *ctx, const struct FbxTcEntry *e,
     case 0x0BC: case 0x0BD: case 0x0BE: case 0x0BF:
       return LiftMovZvqpIvqp(ctx, rde, e->uimm0);
     /* MOV r/m, imm — opcode 0xC6 (byte) / 0xC7 (word). */
-    case 0x0C6: return LiftMovImm(ctx, rde, e->uimm0, 1);
-    case 0x0C7: return LiftMovImm(ctx, rde, e->uimm0, 0);
+    case 0x0C6: return LiftMovImm(ctx, rde, e->disp, e->uimm0, 1);
+    case 0x0C7: return LiftMovImm(ctx, rde, e->disp, e->uimm0, 0);
     /* ALU group r/m, r — ADD/OR/AND/SUB/XOR/CMP at 0x00/01, 0x08/09, etc.
      * Operand-direction = r/m is destination (op_dir=RM_R). */
-    case 0x000: return LiftAluRR(ctx, rde, FBX_IR_OP_ADD, 1, FBX_ALU_DIR_RM_R);
-    case 0x001: return LiftAluRR(ctx, rde, FBX_IR_OP_ADD, 0, FBX_ALU_DIR_RM_R);
-    case 0x008: return LiftAluRR(ctx, rde, FBX_IR_OP_OR,  1, FBX_ALU_DIR_RM_R);
-    case 0x009: return LiftAluRR(ctx, rde, FBX_IR_OP_OR,  0, FBX_ALU_DIR_RM_R);
-    case 0x020: return LiftAluRR(ctx, rde, FBX_IR_OP_AND, 1, FBX_ALU_DIR_RM_R);
-    case 0x021: return LiftAluRR(ctx, rde, FBX_IR_OP_AND, 0, FBX_ALU_DIR_RM_R);
-    case 0x028: return LiftAluRR(ctx, rde, FBX_IR_OP_SUB, 1, FBX_ALU_DIR_RM_R);
-    case 0x029: return LiftAluRR(ctx, rde, FBX_IR_OP_SUB, 0, FBX_ALU_DIR_RM_R);
-    case 0x030: return LiftAluRR(ctx, rde, FBX_IR_OP_XOR, 1, FBX_ALU_DIR_RM_R);
-    case 0x031: return LiftAluRR(ctx, rde, FBX_IR_OP_XOR, 0, FBX_ALU_DIR_RM_R);
-    case 0x038: return LiftAluRR(ctx, rde, FBX_IR_OP_CMP, 1, FBX_ALU_DIR_RM_R);
-    case 0x039: return LiftAluRR(ctx, rde, FBX_IR_OP_CMP, 0, FBX_ALU_DIR_RM_R);
+    case 0x000: return LiftAluRR(ctx, rde, e->disp, FBX_IR_OP_ADD, 1, FBX_ALU_DIR_RM_R);
+    case 0x001: return LiftAluRR(ctx, rde, e->disp, FBX_IR_OP_ADD, 0, FBX_ALU_DIR_RM_R);
+    case 0x008: return LiftAluRR(ctx, rde, e->disp, FBX_IR_OP_OR,  1, FBX_ALU_DIR_RM_R);
+    case 0x009: return LiftAluRR(ctx, rde, e->disp, FBX_IR_OP_OR,  0, FBX_ALU_DIR_RM_R);
+    case 0x020: return LiftAluRR(ctx, rde, e->disp, FBX_IR_OP_AND, 1, FBX_ALU_DIR_RM_R);
+    case 0x021: return LiftAluRR(ctx, rde, e->disp, FBX_IR_OP_AND, 0, FBX_ALU_DIR_RM_R);
+    case 0x028: return LiftAluRR(ctx, rde, e->disp, FBX_IR_OP_SUB, 1, FBX_ALU_DIR_RM_R);
+    case 0x029: return LiftAluRR(ctx, rde, e->disp, FBX_IR_OP_SUB, 0, FBX_ALU_DIR_RM_R);
+    case 0x030: return LiftAluRR(ctx, rde, e->disp, FBX_IR_OP_XOR, 1, FBX_ALU_DIR_RM_R);
+    case 0x031: return LiftAluRR(ctx, rde, e->disp, FBX_IR_OP_XOR, 0, FBX_ALU_DIR_RM_R);
+    case 0x038: return LiftAluRR(ctx, rde, e->disp, FBX_IR_OP_CMP, 1, FBX_ALU_DIR_RM_R);
+    case 0x039: return LiftAluRR(ctx, rde, e->disp, FBX_IR_OP_CMP, 0, FBX_ALU_DIR_RM_R);
     /* §13.5 mirror-direction ALU group r, r/m — same ops, swapped operand
      * direction (r is destination, r/m is the second source).  Mopcodes
      * 0x02/0x03 (ADD), 0x0A/0x0B (OR), 0x22/0x23 (AND), 0x2A/0x2B (SUB),
@@ -1330,22 +1644,22 @@ static int LiftOne(struct LiftCtx *ctx, const struct FbxTcEntry *e,
      * was preventing escalation entirely; refusing-after-lift lets
      * Phase 4 reachability still log the IR shape, and lets #597's
      * lazy-flag work pick them up automatically when it lands). */
-    case 0x002: return LiftAluRR(ctx, rde, FBX_IR_OP_ADD, 1, FBX_ALU_DIR_R_RM);
-    case 0x003: return LiftAluRR(ctx, rde, FBX_IR_OP_ADD, 0, FBX_ALU_DIR_R_RM);
-    case 0x00A: return LiftAluRR(ctx, rde, FBX_IR_OP_OR,  1, FBX_ALU_DIR_R_RM);
-    case 0x00B: return LiftAluRR(ctx, rde, FBX_IR_OP_OR,  0, FBX_ALU_DIR_R_RM);
-    case 0x022: return LiftAluRR(ctx, rde, FBX_IR_OP_AND, 1, FBX_ALU_DIR_R_RM);
-    case 0x023: return LiftAluRR(ctx, rde, FBX_IR_OP_AND, 0, FBX_ALU_DIR_R_RM);
-    case 0x02A: return LiftAluRR(ctx, rde, FBX_IR_OP_SUB, 1, FBX_ALU_DIR_R_RM);
-    case 0x02B: return LiftAluRR(ctx, rde, FBX_IR_OP_SUB, 0, FBX_ALU_DIR_R_RM);
-    case 0x032: return LiftAluRR(ctx, rde, FBX_IR_OP_XOR, 1, FBX_ALU_DIR_R_RM);
-    case 0x033: return LiftAluRR(ctx, rde, FBX_IR_OP_XOR, 0, FBX_ALU_DIR_R_RM);
-    case 0x03A: return LiftAluRR(ctx, rde, FBX_IR_OP_CMP, 1, FBX_ALU_DIR_R_RM);
-    case 0x03B: return LiftAluRR(ctx, rde, FBX_IR_OP_CMP, 0, FBX_ALU_DIR_R_RM);
+    case 0x002: return LiftAluRR(ctx, rde, e->disp, FBX_IR_OP_ADD, 1, FBX_ALU_DIR_R_RM);
+    case 0x003: return LiftAluRR(ctx, rde, e->disp, FBX_IR_OP_ADD, 0, FBX_ALU_DIR_R_RM);
+    case 0x00A: return LiftAluRR(ctx, rde, e->disp, FBX_IR_OP_OR,  1, FBX_ALU_DIR_R_RM);
+    case 0x00B: return LiftAluRR(ctx, rde, e->disp, FBX_IR_OP_OR,  0, FBX_ALU_DIR_R_RM);
+    case 0x022: return LiftAluRR(ctx, rde, e->disp, FBX_IR_OP_AND, 1, FBX_ALU_DIR_R_RM);
+    case 0x023: return LiftAluRR(ctx, rde, e->disp, FBX_IR_OP_AND, 0, FBX_ALU_DIR_R_RM);
+    case 0x02A: return LiftAluRR(ctx, rde, e->disp, FBX_IR_OP_SUB, 1, FBX_ALU_DIR_R_RM);
+    case 0x02B: return LiftAluRR(ctx, rde, e->disp, FBX_IR_OP_SUB, 0, FBX_ALU_DIR_R_RM);
+    case 0x032: return LiftAluRR(ctx, rde, e->disp, FBX_IR_OP_XOR, 1, FBX_ALU_DIR_R_RM);
+    case 0x033: return LiftAluRR(ctx, rde, e->disp, FBX_IR_OP_XOR, 0, FBX_ALU_DIR_R_RM);
+    case 0x03A: return LiftAluRR(ctx, rde, e->disp, FBX_IR_OP_CMP, 1, FBX_ALU_DIR_R_RM);
+    case 0x03B: return LiftAluRR(ctx, rde, e->disp, FBX_IR_OP_CMP, 0, FBX_ALU_DIR_R_RM);
     /* TEST r/m, r — 0x84 / 0x85.  No mirror variant in x86 (TEST is
      * symmetric in its operand encoding). */
-    case 0x084: return LiftAluRR(ctx, rde, FBX_IR_OP_TEST, 1, FBX_ALU_DIR_RM_R);
-    case 0x085: return LiftAluRR(ctx, rde, FBX_IR_OP_TEST, 0, FBX_ALU_DIR_RM_R);
+    case 0x084: return LiftAluRR(ctx, rde, e->disp, FBX_IR_OP_TEST, 1, FBX_ALU_DIR_RM_R);
+    case 0x085: return LiftAluRR(ctx, rde, e->disp, FBX_IR_OP_TEST, 0, FBX_ALU_DIR_RM_R);
     /* §13.5 MOVZX — zero-extending move.  Top-30 rank 15 (0x1B6) +
      * rank 34 (0x1B7) per §Q7 measurement.  IR shape matches existing
      * REG_GET (narrow) + REG_SET (wide); the synthesis pass's
@@ -1353,9 +1667,9 @@ static int LiftOne(struct LiftCtx *ctx, const struct FbxTcEntry *e,
     case 0x1B6: return LiftMovzx(ctx, rde, e->disp, 1);
     case 0x1B7: return LiftMovzx(ctx, rde, e->disp, 2);
     /* ALU group r/m, imm — 0x80 (byte imm), 0x81 (imm32), 0x83 (imm8 sx). */
-    case 0x080: return LiftAlui(ctx, rde, e->uimm0, 1);
+    case 0x080: return LiftAlui(ctx, rde, e->disp, e->uimm0, 1);
     case 0x081:
-    case 0x083: return LiftAlui(ctx, rde, e->uimm0, 0);
+    case 0x083: return LiftAlui(ctx, rde, e->disp, e->uimm0, 0);
     /* #794 — IMUL truncating forms.  3-operand imm (0x69 imm32-sx / 0x6B
      * imm8-sx) → r = r/m * imm; 2-operand (0x0FAF → mopcode 0x1AF) → r =
      * r * r/m.  No flag synthesis (correct-or-refuse at the emit gate). */
@@ -1451,6 +1765,18 @@ static int LiftOne(struct LiftCtx *ctx, const struct FbxTcEntry *e,
       br->imm = (u64)((i64)next_pc + e->disp);
       return 1;
     }
+    /* firebox#T3R2 — region lifts only (each returns -1 outside a region). */
+    case 0x0F6: case 0x0F7: case 0x0FE: case 0x0FF:
+      return LiftUnaryRegion(ctx, rde, e->disp, e->uimm0, mop);
+    case 0x0A8: case 0x0A9: {
+      u32 x, k;
+      u8 w = WidthFromRde(rde, mop == 0x0A8);
+      if (!ctx->region) return -1;
+      if (!LiftGetReg(ctx, w, 0u, &x)) return 0;
+      if (!LiftGetImm(ctx, w, e->uimm0, &k)) return 0;
+      return LiftAluTail(ctx, w, FBX_IR_OP_TEST, x, k, 0, FBX_IR_OP_TEST, x,
+                         k);
+    }
     default:
       return -1;
   }
@@ -1460,7 +1786,17 @@ static int LiftOne(struct LiftCtx *ctx, const struct FbxTcEntry *e,
 /* Public API.                                                                */
 /* ────────────────────────────────────────────────────────────────────────── */
 
+static struct FbxIrBlock *LiftBlock(const struct FbxTcBlock *tc, int region);
+
 struct FbxIrBlock *fbx_ir_lift(const struct FbxTcBlock *tc) {
+  return LiftBlock(tc, 0);
+}
+
+struct FbxIrBlock *fbx_ir_lift_region(const struct FbxTcBlock *tc) {
+  return LiftBlock(tc, 1);
+}
+
+static struct FbxIrBlock *LiftBlock(const struct FbxTcBlock *tc, int region) {
   struct LiftCtx ctx;
   struct FbxIrBlock *blk;
   u32 i;
@@ -1471,6 +1807,7 @@ struct FbxIrBlock *fbx_ir_lift(const struct FbxTcBlock *tc) {
   /* Thunk blocks stay on Tier 1 — refuse to lift.  Spec §6.5. */
   if (tc->entries[0].kind == FBX_TC_KIND_THUNK) return NULL;
   memset(&ctx, 0, sizeof ctx);
+  ctx.region = region;
   for (i = 0; i < tc->nentries; ++i) {
     const struct FbxTcEntry *e = &tc->entries[i];
     u64 next_pc = e->ip + e->oplen;
@@ -1506,7 +1843,14 @@ struct FbxIrBlock *fbx_ir_lift(const struct FbxTcBlock *tc) {
       }
     }
     if (!EmitPcMark(&ctx, e->ip)) goto fail;
-    rc = LiftOne(&ctx, e, next_pc);
+    ctx.next_pc = next_pc;
+    /* firebox#T3R2: the region lowerings assume 64-bit mode (stack width,
+     * RIP-relative addressing); anything else stays on Tier 1. */
+    if (region && Mode(e->rde) != XED_MODE_LONG) {
+      rc = -1;
+    } else {
+      rc = LiftOne(&ctx, e, next_pc);
+    }
     if (rc == 0) goto fail; /* alloc */
     if (rc < 0) {
       /* Unsupported opcode — emit BAILOUT and stop. */
