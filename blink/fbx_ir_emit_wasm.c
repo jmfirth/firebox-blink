@@ -1018,6 +1018,24 @@ static int CoverageGate(const struct FbxIrBlock *ir,
 #define M_PAGE_U    0x0000000000000004ull
 #define M_PAGE_HOST 0x0000000000000400ull
 #define M_PAGE_TA   0x0000fffffffff000ull
+/* firebox#T3R2: the mirrors above are checked against the reference header,
+ * not trusted from memory. */
+_Static_assert(M_PAGE_V == PAGE_V && M_PAGE_RW == PAGE_RW &&
+                   M_PAGE_U == PAGE_U && M_PAGE_HOST == PAGE_HOST &&
+                   M_PAGE_TA == PAGE_TA,
+               "M_PAGE_* must equal blink/machine.h PAGE_*");
+_Static_assert(sizeof(struct MachineTlb) == M_TLB_STRIDE &&
+                   offsetof(struct MachineTlb, page) == M_TLB_OFF_PAGE &&
+                   offsetof(struct MachineTlb, entry) == M_TLB_OFF_ENTRY &&
+                   sizeof(((struct Machine *)0)->tlb) ==
+                       (M_TLB_KEY_MASK + 1u) * M_TLB_STRIDE,
+               "MachineTlb layout drifted from the inline translation");
+/* firebox#T3R2: FindPageTableEntry flushes the TLB first when another thread
+ * (or this thread's own system call) set m->invalidated; an inline TLB hit
+ * that ignored it would translate through a stale entry after munmap. */
+#define M_OFF_INVALIDATED ((u32)offsetof(struct Machine, invalidated))
+_Static_assert(sizeof(((struct Machine *)0)->invalidated) == 1,
+               "the inline translation loads m->invalidated as one byte");
 
 /* x86 EFLAGS bit positions — duplicated from blink/flags.h to keep this
  * file standalone (no further include dependency).  Phase 4's offline
@@ -2424,6 +2442,7 @@ static int EmitBranchCondSelfLoop(struct FbxWasmBuffer *body,
  *     host-offset there is `s->real + (entry & PAGE_TA)`, deferred)
  *   - m->metal != 0 (CPL may be != 3; the baked `need` assumes CPL-3 user)
  *   - page-crossing access ((va & 4095) + width > 4096)
+ *   - m->invalidated (FindPageTableEntry must flush the TLB first)
  * The Tier-1 walk on bailout FILLS the TLB (FindPageTableEntry), so the very
  * next dispatch of this funcref hits the inline fast path.
  *
@@ -2530,6 +2549,16 @@ static void EmitGuestVaTranslateFailCond(struct FbxWasmBuffer *body,
   fbx_wasm_buffer_u8(body, WASM_OP_I64_CONST);
   fbx_wasm_buffer_sleb(body, 0);
   fbx_wasm_buffer_u8(body, WASM_OP_I64_NE);              /* → i32 */
+  fbx_wasm_buffer_u8(body, WASM_OP_I32_OR);
+
+  /* (g) firebox#T3R2: m->invalidated — the TLB must be flushed before any
+   * entry in it is trusted (FindPageTableEntry's first step).  Tier 1 does
+   * the flush on the bailout. */
+  fbx_wasm_buffer_u8(body, WASM_OP_LOCAL_GET);
+  fbx_wasm_buffer_uleb(body, EMIT_LOCAL_M_PTR);
+  fbx_wasm_buffer_u8(body, 0x2Du); /* i32.load8_u */
+  fbx_wasm_buffer_uleb(body, 0);
+  fbx_wasm_buffer_uleb(body, M_OFF_INVALIDATED);
   fbx_wasm_buffer_u8(body, WASM_OP_I32_OR);
 
   /* (e) page-crossing: (va & 4095) + width > 4096. */
@@ -3769,6 +3798,225 @@ static int EmitCodeSection(struct FbxWasmBuffer *out,
 #endif
 #define M_OFF_ATTENTION ((u32)offsetof(struct Machine, attention))
 
+/* ── firebox#T3R2: the region's TLB refill ──────────────────────────────────
+ *
+ * A region LOAD whose inline translation fails no longer leaves at once: it
+ * first calls the module's second function, `tlb_fill(m_ptr, va) -> i32`,
+ * which is FindPageTableEntry's success path for a CPL-3 user access
+ * (blink/memory.c), and then re-evaluates the SAME inline predicate against
+ * the refilled slot.  Only the walk is new; what a filled entry permits is
+ * still decided by EmitGuestVaTranslateFailCond.
+ *
+ * tlb_fill writes `m->tlb[(page >> 12) & 31] = {page, entry}` exactly as
+ * FindPageTableEntry does, and REFUSES (returns 0, writes nothing) wherever
+ * the C walk would do anything but that:
+ *   - m->invalidated (the walk flushes the TLB first), m->metal (entry
+ *     masking), m->insyscall (the walk takes page locks);
+ *   - a non-canonical page (the walk faults);
+ *   - a table entry that is not PAGE_HOST (GetPageAddress's s->real branch)
+ *     or whose table lies at or above 4 GiB (the module's 32-bit view);
+ *   - any level without PAGE_V (MapError), a PAGE_PS huge mapping (the walk
+ *     rewrites the entry), a leaf with PAGE_RSRV (HandlePageFault).
+ * A refusal exits the region with the LOAD uncommitted, so Tier 1 runs that
+ * instruction through the authoritative walk: every fault, lazy allocation
+ * and lock is still Tier 1's, raised from the same ip with the same
+ * registers.  Page-table entries are read with a plain aligned i64.load
+ * where LoadPte uses an acquire load; the leaf's page is only touched
+ * through an address derived from that load. */
+#define M_OFF_SYSTEM    ((u32)offsetof(struct Machine, system))
+#define M_OFF_INSYSCALL ((u32)offsetof(struct Machine, insyscall))
+#define S_OFF_CR3       ((u32)offsetof(struct System, cr3))
+_Static_assert(sizeof(((struct Machine *)0)->metal) == 1 &&
+                   sizeof(((struct Machine *)0)->insyscall) == 1,
+               "tlb_fill loads metal and insyscall as one byte each");
+_Static_assert(sizeof(((struct System *)0)->cr3) == 8,
+               "tlb_fill loads cr3 as an i64");
+#define REGION_FN_TLB_FILL (FBX_HOST_IMPORT_COUNT + 1u)
+
+static void RegionFillRefuseIf(struct FbxWasmBuffer *b) {
+  fbx_wasm_buffer_u8(b, WASM_OP_IF);
+  fbx_wasm_buffer_u8(b, WASM_BLOCKTYPE_EMPTY);
+  fbx_wasm_buffer_u8(b, WASM_OP_I32_CONST);
+  fbx_wasm_buffer_sleb(b, 0);
+  fbx_wasm_buffer_u8(b, WASM_OP_RETURN);
+  fbx_wasm_buffer_u8(b, WASM_OP_END);
+}
+
+static void RegionFillBits(struct FbxWasmBuffer *b, u32 local, u64 bits) {
+  /* pushes i32 ((local & bits) != 0) */
+  fbx_wasm_buffer_u8(b, WASM_OP_LOCAL_GET);
+  fbx_wasm_buffer_uleb(b, local);
+  fbx_wasm_buffer_u8(b, WASM_OP_I64_CONST);
+  fbx_wasm_buffer_sleb(b, (i64)bits);
+  fbx_wasm_buffer_u8(b, WASM_OP_I64_AND);
+  fbx_wasm_buffer_u8(b, WASM_OP_I64_CONST);
+  fbx_wasm_buffer_sleb(b, 0);
+  fbx_wasm_buffer_u8(b, WASM_OP_I64_NE);
+}
+
+/* Body of tlb_fill: params m_ptr (local 0, i32), va (local 1, i64); locals
+ * entry (2, i64), page (3, i64), s (4, i32). */
+static void EmitRegionTlbFillBody(struct FbxWasmBuffer *b) {
+  enum { L_M = 0, L_VA = 1, L_E = 2, L_PAGE = 3, L_S = 4 };
+  static const u32 kLevels[4] = {39, 30, 21, 12};
+  u32 k;
+  fbx_wasm_buffer_uleb(b, 2);
+  fbx_wasm_buffer_uleb(b, 2);
+  fbx_wasm_buffer_u8(b, WASM_VALTYPE_I64);
+  fbx_wasm_buffer_uleb(b, 1);
+  fbx_wasm_buffer_u8(b, WASM_VALTYPE_I32);
+  /* if (m->invalidated | m->metal | m->insyscall) return 0 */
+  fbx_wasm_buffer_u8(b, WASM_OP_LOCAL_GET);
+  fbx_wasm_buffer_uleb(b, L_M);
+  fbx_wasm_buffer_u8(b, WASM_OP_I32_LOAD8U);
+  fbx_wasm_buffer_uleb(b, 0);
+  fbx_wasm_buffer_uleb(b, M_OFF_INVALIDATED);
+  fbx_wasm_buffer_u8(b, WASM_OP_LOCAL_GET);
+  fbx_wasm_buffer_uleb(b, L_M);
+  fbx_wasm_buffer_u8(b, WASM_OP_I32_LOAD8U);
+  fbx_wasm_buffer_uleb(b, 0);
+  fbx_wasm_buffer_uleb(b, M_OFF_METAL);
+  fbx_wasm_buffer_u8(b, WASM_OP_I32_OR);
+  fbx_wasm_buffer_u8(b, WASM_OP_LOCAL_GET);
+  fbx_wasm_buffer_uleb(b, L_M);
+  fbx_wasm_buffer_u8(b, WASM_OP_I32_LOAD8U);
+  fbx_wasm_buffer_uleb(b, 0);
+  fbx_wasm_buffer_uleb(b, M_OFF_INSYSCALL);
+  fbx_wasm_buffer_u8(b, WASM_OP_I32_OR);
+  RegionFillRefuseIf(b);
+  /* page = va & -4096; refuse unless -2^47 <= page < 2^47 */
+  fbx_wasm_buffer_u8(b, WASM_OP_LOCAL_GET);
+  fbx_wasm_buffer_uleb(b, L_VA);
+  fbx_wasm_buffer_u8(b, WASM_OP_I64_CONST);
+  fbx_wasm_buffer_sleb(b, -4096);
+  fbx_wasm_buffer_u8(b, WASM_OP_I64_AND);
+  fbx_wasm_buffer_u8(b, WASM_OP_LOCAL_TEE);
+  fbx_wasm_buffer_uleb(b, L_PAGE);
+  fbx_wasm_buffer_u8(b, WASM_OP_I64_CONST);
+  fbx_wasm_buffer_sleb(b, (i64)0x800000000000ll);
+  fbx_wasm_buffer_u8(b, WASM_OP_I64_ADD);
+  fbx_wasm_buffer_u8(b, WASM_OP_I64_CONST);
+  fbx_wasm_buffer_sleb(b, (i64)0x1000000000000ll);
+  fbx_wasm_buffer_u8(b, 0x5Au); /* i64.ge_u */
+  RegionFillRefuseIf(b);
+  /* s = m->system, refused unless the whole System is below 4 GiB */
+  fbx_wasm_buffer_u8(b, WASM_OP_LOCAL_GET);
+  fbx_wasm_buffer_uleb(b, L_M);
+  if (sizeof(void *) == 8) {
+    fbx_wasm_buffer_u8(b, WASM_OP_I64_LOAD);
+    fbx_wasm_buffer_uleb(b, 3);
+    fbx_wasm_buffer_uleb(b, M_OFF_SYSTEM);
+  } else {
+    fbx_wasm_buffer_u8(b, WASM_OP_I32_LOAD);
+    fbx_wasm_buffer_uleb(b, 2);
+    fbx_wasm_buffer_uleb(b, M_OFF_SYSTEM);
+    fbx_wasm_buffer_u8(b, WASM_OP_I64_EXTEND_I32_U);
+  }
+  fbx_wasm_buffer_u8(b, WASM_OP_LOCAL_TEE);
+  fbx_wasm_buffer_uleb(b, L_E);
+  fbx_wasm_buffer_u8(b, WASM_OP_I64_CONST);
+  fbx_wasm_buffer_sleb(b, (i64)(0x100000000ll - (i64)sizeof(struct System)));
+  fbx_wasm_buffer_u8(b, 0x56u); /* i64.gt_u */
+  RegionFillRefuseIf(b);
+  fbx_wasm_buffer_u8(b, WASM_OP_LOCAL_GET);
+  fbx_wasm_buffer_uleb(b, L_E);
+  fbx_wasm_buffer_u8(b, WASM_OP_I32_WRAP_I64);
+  fbx_wasm_buffer_u8(b, WASM_OP_LOCAL_SET);
+  fbx_wasm_buffer_uleb(b, L_S);
+  /* entry = s->cr3 */
+  fbx_wasm_buffer_u8(b, WASM_OP_LOCAL_GET);
+  fbx_wasm_buffer_uleb(b, L_S);
+  fbx_wasm_buffer_u8(b, WASM_OP_I64_LOAD);
+  fbx_wasm_buffer_uleb(b, 3);
+  fbx_wasm_buffer_uleb(b, S_OFF_CR3);
+  fbx_wasm_buffer_u8(b, WASM_OP_LOCAL_SET);
+  fbx_wasm_buffer_uleb(b, L_E);
+  for (k = 0; k < 4; ++k) {
+    /* the table this entry names: PAGE_HOST, below 4 GiB */
+    fbx_wasm_buffer_u8(b, WASM_OP_LOCAL_GET);
+    fbx_wasm_buffer_uleb(b, L_E);
+    fbx_wasm_buffer_u8(b, WASM_OP_I64_CONST);
+    fbx_wasm_buffer_sleb(b, (i64)PAGE_HOST);
+    fbx_wasm_buffer_u8(b, WASM_OP_I64_AND);
+    fbx_wasm_buffer_u8(b, WASM_OP_I64_EQZ);
+    fbx_wasm_buffer_u8(b, WASM_OP_LOCAL_GET);
+    fbx_wasm_buffer_uleb(b, L_E);
+    fbx_wasm_buffer_u8(b, WASM_OP_I64_CONST);
+    fbx_wasm_buffer_sleb(b, (i64)PAGE_TA);
+    fbx_wasm_buffer_u8(b, WASM_OP_I64_AND);
+    fbx_wasm_buffer_u8(b, WASM_OP_I64_CONST);
+    fbx_wasm_buffer_sleb(b, (i64)0xFFFFF000ll);
+    fbx_wasm_buffer_u8(b, 0x56u); /* i64.gt_u */
+    fbx_wasm_buffer_u8(b, WASM_OP_I32_OR);
+    RegionFillRefuseIf(b);
+    /* entry = *(u64 *)((entry & PAGE_TA) + ((page >> level) & 511) * 8) */
+    fbx_wasm_buffer_u8(b, WASM_OP_LOCAL_GET);
+    fbx_wasm_buffer_uleb(b, L_E);
+    fbx_wasm_buffer_u8(b, WASM_OP_I64_CONST);
+    fbx_wasm_buffer_sleb(b, (i64)PAGE_TA);
+    fbx_wasm_buffer_u8(b, WASM_OP_I64_AND);
+    fbx_wasm_buffer_u8(b, WASM_OP_LOCAL_GET);
+    fbx_wasm_buffer_uleb(b, L_PAGE);
+    fbx_wasm_buffer_u8(b, WASM_OP_I64_CONST);
+    fbx_wasm_buffer_sleb(b, (i64)kLevels[k]);
+    fbx_wasm_buffer_u8(b, WASM_OP_I64_SHR_U);
+    fbx_wasm_buffer_u8(b, WASM_OP_I64_CONST);
+    fbx_wasm_buffer_sleb(b, 511);
+    fbx_wasm_buffer_u8(b, WASM_OP_I64_AND);
+    fbx_wasm_buffer_u8(b, WASM_OP_I64_CONST);
+    fbx_wasm_buffer_sleb(b, 3);
+    fbx_wasm_buffer_u8(b, WASM_OP_I64_SHL);
+    fbx_wasm_buffer_u8(b, WASM_OP_I64_ADD);
+    fbx_wasm_buffer_u8(b, WASM_OP_I32_WRAP_I64);
+    fbx_wasm_buffer_u8(b, WASM_OP_I64_LOAD);
+    fbx_wasm_buffer_uleb(b, 3);
+    fbx_wasm_buffer_uleb(b, 0);
+    fbx_wasm_buffer_u8(b, WASM_OP_LOCAL_SET);
+    fbx_wasm_buffer_uleb(b, L_E);
+    /* !(entry & PAGE_V): MapError */
+    fbx_wasm_buffer_u8(b, WASM_OP_LOCAL_GET);
+    fbx_wasm_buffer_uleb(b, L_E);
+    fbx_wasm_buffer_u8(b, WASM_OP_I64_CONST);
+    fbx_wasm_buffer_sleb(b, (i64)PAGE_V);
+    fbx_wasm_buffer_u8(b, WASM_OP_I64_AND);
+    fbx_wasm_buffer_u8(b, WASM_OP_I64_EQZ);
+    RegionFillRefuseIf(b);
+    if (kLevels[k] > 12) {
+      RegionFillBits(b, L_E, PAGE_PS); /* huge page */
+      RegionFillRefuseIf(b);
+    }
+  }
+  RegionFillBits(b, L_E, PAGE_RSRV); /* HandlePageFault's case */
+  RegionFillRefuseIf(b);
+  /* m->tlb[(page >> 12) & 31] = {page, entry} */
+  for (k = 0; k < 2; ++k) {
+    fbx_wasm_buffer_u8(b, WASM_OP_LOCAL_GET);
+    fbx_wasm_buffer_uleb(b, L_M);
+    fbx_wasm_buffer_u8(b, WASM_OP_LOCAL_GET);
+    fbx_wasm_buffer_uleb(b, L_PAGE);
+    fbx_wasm_buffer_u8(b, WASM_OP_I64_CONST);
+    fbx_wasm_buffer_sleb(b, 12);
+    fbx_wasm_buffer_u8(b, WASM_OP_I64_SHR_U);
+    fbx_wasm_buffer_u8(b, WASM_OP_I64_CONST);
+    fbx_wasm_buffer_sleb(b, (i64)M_TLB_KEY_MASK);
+    fbx_wasm_buffer_u8(b, WASM_OP_I64_AND);
+    fbx_wasm_buffer_u8(b, WASM_OP_I32_WRAP_I64);
+    fbx_wasm_buffer_u8(b, WASM_OP_I32_CONST);
+    fbx_wasm_buffer_sleb(b, (i64)M_TLB_STRIDE);
+    fbx_wasm_buffer_u8(b, 0x6Cu); /* i32.mul */
+    fbx_wasm_buffer_u8(b, WASM_OP_I32_ADD);
+    fbx_wasm_buffer_u8(b, WASM_OP_LOCAL_GET);
+    fbx_wasm_buffer_uleb(b, k == 0 ? L_PAGE : L_E);
+    fbx_wasm_buffer_u8(b, WASM_OP_I64_STORE);
+    fbx_wasm_buffer_uleb(b, 3);
+    fbx_wasm_buffer_uleb(b, M_OFF_TLB + (k == 0 ? M_TLB_OFF_PAGE
+                                                 : M_TLB_OFF_ENTRY));
+  }
+  fbx_wasm_buffer_u8(b, WASM_OP_I32_CONST);
+  fbx_wasm_buffer_sleb(b, 1);
+  fbx_wasm_buffer_u8(b, WASM_OP_END);
+}
+
 #define FBX_REGION_NGREGS 16u
 
 struct RegionEmit {
@@ -4111,6 +4359,45 @@ static void RegionLoadOp(struct FbxWasmBuffer *b, u8 width) {
   fbx_wasm_buffer_uleb(b, 0);
 }
 
+/* Consume the guest VA on the stack; leave the i32 host offset of a
+ * `width`-byte access, or exit the region with the access uncommitted.  On a
+ * failed inline translation the region refills the slot (tlb_fill) and
+ * re-runs the same predicate; only if that still fails does it exit.  A
+ * failure in the ENTRY member returns 1: ExecuteBlock resumes Tier 1 at this
+ * instruction inside the dispatched block, so Tier 1 runs it (faulting,
+ * allocating or refilling exactly as it would have).  Returning 0 there would
+ * re-dispatch the same region at the same PC.  A failure in any other member
+ * returns 0; the block at that PC then takes it as its own entry. */
+static void RegionTranslate(struct RegionEmit *r, u32 i, u64 cur_pc,
+                            int need_rw, u8 width) {
+  struct FbxWasmBuffer *b = r->body;
+  EmitGuestVaTranslateFailCond(b, need_rw, width, r->l_mmu_va,
+                               r->l_mmu_entry);
+  fbx_wasm_buffer_u8(b, WASM_OP_IF);
+  fbx_wasm_buffer_u8(b, WASM_BLOCKTYPE_EMPTY);
+  fbx_wasm_buffer_u8(b, WASM_OP_LOCAL_GET);
+  fbx_wasm_buffer_uleb(b, EMIT_LOCAL_M_PTR);
+  fbx_wasm_buffer_u8(b, WASM_OP_LOCAL_GET);
+  fbx_wasm_buffer_uleb(b, r->l_mmu_va);
+  fbx_wasm_buffer_u8(b, WASM_OP_CALL);
+  fbx_wasm_buffer_uleb(b, REGION_FN_TLB_FILL);
+  fbx_wasm_buffer_u8(b, WASM_OP_I32_EQZ);
+  fbx_wasm_buffer_u8(b, WASM_OP_IF);
+  fbx_wasm_buffer_u8(b, WASM_BLOCKTYPE_EMPTY);
+  RegionExit(r, cur_pc, r->n - i + 2u, /*uncount=*/1, i == 0 ? 1 : 0);
+  fbx_wasm_buffer_u8(b, WASM_OP_END);
+  fbx_wasm_buffer_u8(b, WASM_OP_LOCAL_GET);
+  fbx_wasm_buffer_uleb(b, r->l_mmu_va);
+  EmitGuestVaTranslateFailCond(b, need_rw, width, r->l_mmu_va,
+                               r->l_mmu_entry);
+  fbx_wasm_buffer_u8(b, WASM_OP_IF);
+  fbx_wasm_buffer_u8(b, WASM_BLOCKTYPE_EMPTY);
+  RegionExit(r, cur_pc, r->n - i + 2u, /*uncount=*/1, i == 0 ? 1 : 0);
+  fbx_wasm_buffer_u8(b, WASM_OP_END);
+  fbx_wasm_buffer_u8(b, WASM_OP_END);
+  EmitGuestVaHostOffset(b, r->l_mmu_va, r->l_mmu_entry);
+}
+
 static int RegionEmitMember(struct RegionEmit *r, u32 i) {
   struct FbxWasmBuffer *b = r->body;
   const struct FbxIrBlock *ir = r->irs[i];
@@ -4162,20 +4449,7 @@ static int RegionEmitMember(struct RegionEmit *r, u32 i) {
         u8 w = RegionWidth(p->width);
         RegionEa(r, p->src1, p->src2_kind == FBX_IR_KIND_GREG, p->src2,
                  p->scale, p->imm);
-        EmitGuestVaTranslateFailCond(b, /*need_rw=*/0, w, r->l_mmu_va,
-                                     r->l_mmu_entry);
-        fbx_wasm_buffer_u8(b, WASM_OP_IF);
-        fbx_wasm_buffer_u8(b, WASM_BLOCKTYPE_EMPTY);
-        /* A miss in the ENTRY member returns 1: ExecuteBlock resumes Tier 1
-         * at this LOAD inside the dispatched block, so Tier 1 runs it and
-         * refills the TLB.  Returning 0 there would re-dispatch the same
-         * region at the same PC, which misses again: a livelock that only an
-         * unrelated TLB refill can break.  A miss in any other member returns
-         * 0; the region headed by that member (or a fresh Tier-1 block)
-         * then takes the miss as its own entry miss. */
-        RegionExit(r, cur_pc, r->n - i + 1u, /*uncount=*/1, i == 0 ? 1 : 0);
-        fbx_wasm_buffer_u8(b, WASM_OP_END);
-        EmitGuestVaHostOffset(b, r->l_mmu_va, r->l_mmu_entry);
+        RegionTranslate(r, i, cur_pc, /*need_rw=*/0, w);
         RegionLoadOp(b, w);
         fbx_wasm_buffer_u8(b, WASM_OP_LOCAL_SET);
         fbx_wasm_buffer_uleb(b, VregLocal(p->dst));
@@ -4223,6 +4497,7 @@ int fbx_ir_emit_region_wasm(const struct FbxIrBlock *const *irs,
   struct RegionEmit r;
   struct FbxWasmBuffer fn;
   struct FbxWasmBuffer code;
+  struct FbxWasmBuffer fill;
   u32 used = 0, written = 0;
   u32 i, j, k;
   u32 maxv = 0;
@@ -4362,15 +4637,30 @@ int fbx_ir_emit_region_wasm(const struct FbxIrBlock *const *irs,
   fbx_wasm_buffer_u32_le(out, 0x00000001u);
   EmitTypeSection(out);
   EmitImportSection(out);
-  EmitFunctionSection(out);
+  {
+    /* Two local functions: the region (type 0, exported as before) and its
+     * tlb_fill helper (type 2, (i32, i64) -> i32). */
+    struct FbxWasmBuffer fsec;
+    fbx_wasm_buffer_init(&fsec);
+    fbx_wasm_buffer_uleb(&fsec, 2);
+    fbx_wasm_buffer_uleb(&fsec, WASM_TYPE_IDX_BLOCK);
+    fbx_wasm_buffer_uleb(&fsec, WASM_TYPE_IDX_HOST_RESOLVE);
+    EmitSection(out, WASM_SECTION_FUNCTION, &fsec);
+    fbx_wasm_buffer_free(&fsec);
+  }
   EmitExportSection(out);
+  fbx_wasm_buffer_init(&fill);
+  EmitRegionTlbFillBody(&fill);
   fbx_wasm_buffer_init(&code);
-  fbx_wasm_buffer_uleb(&code, 1);
+  fbx_wasm_buffer_uleb(&code, 2);
   fbx_wasm_buffer_uleb(&code, (u64)fn.len);
   fbx_wasm_buffer_bytes(&code, fn.data, fn.len);
+  fbx_wasm_buffer_uleb(&code, (u64)fill.len);
+  fbx_wasm_buffer_bytes(&code, fill.data, fill.len);
   EmitSection(out, WASM_SECTION_CODE, &code);
   {
-    int oom = fn.oom || code.oom || out->oom;
+    int oom = fn.oom || code.oom || out->oom || fill.oom;
+    fbx_wasm_buffer_free(&fill);
     fbx_wasm_buffer_free(&code);
     fbx_wasm_buffer_free(&fn);
     if (oom) {
