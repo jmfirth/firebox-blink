@@ -47,6 +47,118 @@
 #include "blink/log.h"
 #include "blink/machine.h"
 #include "blink/util.h"
+#include "blink/biosrom.h"
+
+/* ────────────────────────────────────────────────────────────────────────── */
+/* firebox#T3R4 (#KPA residue) — a thunk faults where the function it stands  */
+/* in for would.                                                              */
+/*                                                                            */
+/* A thunk replaces a libc function's body, so every guest access it makes is */
+/* one that function's own loads and stores would make, and Linux answers a   */
+/* bad one with SIGSEGV: si_addr the first byte that cannot be accessed,      */
+/* si_code SEGV_MAPERR or SEGV_ACCERR as the page says.  The helpers here     */
+/* used to return a NULL or -1 that every thunk swallowed: a memcpy, memset,  */
+/* strcpy or strtok_r into a read-only page WROTE it (CopyToUser asks the     */
+/* page for PAGE_U only), into an unmapped one returned as though it had      */
+/* copied, and a read fault made strlen return 0 and memchr return NULL.      */
+/*                                                                            */
+/* Each access now goes through ResolveAddress / ResolveAddressWrite, which   */
+/* throw.  A thunk runs as a whole block entry with oplen 0, so m->ip is      */
+/* still the function's entry, and no thunk changes a register until its     */
+/* work is done (only %rax, before the `ret` it emulates reads the stack):    */
+/* the frame shows the call as made, and a handler that fixes the mapping    */
+/* and returns re-runs the call.  Re-running must compute what               */
+/* the uninterrupted call would have, so a thunk whose partial writes would  */
+/* change its own re-run (memmove/memcpy over an overlap, strtok_r) checks    */
+/* every page it will touch, in the order it will touch them, before its     */
+/* first store.  Where a partial write is harmless to the re-run (disjoint   */
+/* copies, memset, strcpy), the store that faults is simply the first one on */
+/* the bad page, as in the function itself.                                  */
+/* ────────────────────────────────────────────────────────────────────────── */
+
+static u8 *ThunkRead(struct Machine *m, i64 v) {
+  return ResolveAddress(m, v);
+}
+
+/* Copy n bytes of guest memory at `src` into the host buffer `dst`. */
+static void ThunkCopyIn(struct Machine *m, void *dst, i64 src, u64 n) {
+  u8 *d = (u8 *)dst;
+  while (n) {
+    u64 k = 4096 - ((u64)src & 4095);
+    if (k > n) k = n;
+    memcpy(d, ThunkRead(m, src), (size_t)k);
+    d += k;
+    src += (i64)k;
+    n -= k;
+  }
+}
+
+/* Copy n host bytes to guest memory at `dst`, which must be writable.  ROM
+ * keeps VirtualCopy's rule: the store is dropped, as the hardware drops it. */
+static void ThunkCopyOut(struct Machine *m, i64 dst, const void *src, u64 n) {
+  const u8 *s = (const u8 *)src;
+  while (n) {
+    u64 k = 4096 - ((u64)dst & 4095);
+    u8 *p;
+    if (k > n) k = n;
+    p = ResolveAddressWrite(m, dst);
+    if (!IsRomAddress(m, p)) memcpy(p, s, (size_t)k);
+    s += k;
+    dst += (i64)k;
+    n -= k;
+  }
+}
+
+/* memmove over guest memory, staged through one page-sized buffer in the
+ * direction that never overwrites a source byte before reading it.  With
+ * `copy` false it only resolves, in the same order, each page the copy will
+ * read and write: the pre-check an overlapping move needs (see above). */
+static void ThunkMovePass(struct Machine *m, i64 dst, i64 src, u64 n,
+                          bool copy) {
+  u8 stage[4096];
+  if (dst <= src || (u64)(dst - src) >= n) {
+    while (n) {
+      u64 ks = 4096 - ((u64)src & 4095);
+      u64 kd = 4096 - ((u64)dst & 4095);
+      u64 k = ks < kd ? ks : kd;
+      if (k > n) k = n;
+      if (copy) {
+        ThunkCopyIn(m, stage, src, k);
+        ThunkCopyOut(m, dst, stage, k);
+      } else {
+        (void)ThunkRead(m, src);
+        (void)ResolveAddressWrite(m, dst);
+      }
+      src += (i64)k;
+      dst += (i64)k;
+      n -= k;
+    }
+  } else {
+    while (n) {
+      i64 se = src + (i64)n, de = dst + (i64)n;
+      u64 ks = ((u64)(se - 1) & 4095) + 1;
+      u64 kd = ((u64)(de - 1) & 4095) + 1;
+      u64 k = ks < kd ? ks : kd;
+      if (k > n) k = n;
+      if (copy) {
+        ThunkCopyIn(m, stage, se - (i64)k, k);
+        ThunkCopyOut(m, de - (i64)k, stage, k);
+      } else {
+        /* Backward, a chunk's first access is its last byte. */
+        (void)ThunkRead(m, se - 1);
+        (void)ResolveAddressWrite(m, de - 1);
+      }
+      n -= k;
+    }
+  }
+}
+
+static void ThunkMove(struct Machine *m, i64 dst, i64 src, u64 n) {
+  bool overlap = (src < dst && src + (i64)n > dst) ||
+                 (dst < src && dst + (i64)n > src);
+  if (overlap) ThunkMovePass(m, dst, src, n, false);
+  ThunkMovePass(m, dst, src, n, true);
+}
 
 /* ────────────────────────────────────────────────────────────────────────── */
 /* Per-thread trace flag, lit when FIREBOX_THUNK_TRACE=1 in the environment.  */
@@ -87,12 +199,9 @@ static void ThunkRet(struct Machine *m) {
   u8 tmp[8] = {0};
   i64 ret_pc;
   sp = Get64(m->sp);
-  if (CopyFromUser(m, tmp, (i64)sp, 8) == -1) {
-    /* Guest stack underflow — let Blink fault as it would have without us.
-     * Reset ip to the call site so the standard fault path reports it. */
-    LOGF("thunk: failed to read guest return PC at sp=%#llx", (long long)sp);
-    return;
-  }
+  /* An unreadable stack faults here, as the function's `ret` would (this
+   * used to return with ip unchanged, so the block re-ran the thunk forever). */
+  ThunkCopyIn(m, tmp, (i64)sp, 8);
   ret_pc = (i64)Get64(tmp);
   Put64(m->sp, sp + 8);
   m->ip = ret_pc;
@@ -105,7 +214,8 @@ static void ThunkRet(struct Machine *m) {
 /* ────────────────────────────────────────────────────────────────────────── */
 
 /* strnlen on a guest pointer, scanning up to n bytes.  Returns the number of
- * bytes before the first NUL, or `n` if none was seen.  -1 on guest fault. */
+ * bytes before the first NUL, or `n` if none was seen.  A fault throws (see
+ * the fault note at the top), as it does in every Guest* walker below. */
 static i64 GuestStrnlen(struct Machine *m, i64 s, u64 n) {
   u64 walked = 0;
   while (walked < n) {
@@ -113,8 +223,7 @@ static i64 GuestStrnlen(struct Machine *m, i64 s, u64 n) {
     u64 chunk = 4096 - off;
     u64 want = n - walked;
     u64 limit = chunk < want ? chunk : want;
-    u8 *host = LookupAddress(m, s);
-    if (!host) return -1;
+    u8 *host = ThunkRead(m, s);
     /* host is exactly the page-translated pointer; we may read [host, host+limit). */
     const u8 *p = host;
     const u8 *end = host + limit;
@@ -127,9 +236,7 @@ static i64 GuestStrnlen(struct Machine *m, i64 s, u64 n) {
 }
 
 /* Compare two guest memory ranges of length n, byte-by-byte.  Returns the
- * traditional memcmp 3-way result (negative/zero/positive).  On fault we
- * fall through with whatever was read so the guest sees a deterministic
- * answer; the next instruction will re-fault naturally if needed. */
+ * traditional memcmp 3-way result (negative/zero/positive). */
 static int GuestMemcmp(struct Machine *m, i64 a, i64 b, u64 n) {
   while (n) {
     u64 oa = (u64)a & 4095;
@@ -138,9 +245,8 @@ static int GuestMemcmp(struct Machine *m, i64 a, i64 b, u64 n) {
     u64 chunk_b = 4096 - ob;
     u64 chunk = chunk_a < chunk_b ? chunk_a : chunk_b;
     if (chunk > n) chunk = n;
-    u8 *ha = LookupAddress(m, a);
-    u8 *hb = LookupAddress(m, b);
-    if (!ha || !hb) return 0; /* let the interpreter fault on next step */
+    u8 *ha = ThunkRead(m, a);
+    u8 *hb = ThunkRead(m, b);
     int r = memcmp(ha, hb, (size_t)chunk);
     if (r) return r;
     n -= chunk;
@@ -152,7 +258,7 @@ static int GuestMemcmp(struct Machine *m, i64 a, i64 b, u64 n) {
 
 /* Scan up to n bytes of guest memory at address `s` for the first byte
  * equal to `c` (low 8 bits).  Returns the absolute guest address of the
- * match, or 0 if no match in the first n bytes.  -1 on guest fault.
+ * match, or 0 if no match in the first n bytes.
  *
  * Matches Linux memchr(3) semantics: comparison is unsigned-char-wise. */
 static i64 GuestMemchr(struct Machine *m, i64 s, u8 c, u64 n) {
@@ -163,8 +269,7 @@ static i64 GuestMemchr(struct Machine *m, i64 s, u8 c, u64 n) {
     u64 chunk = 4096 - off;
     u64 want = n - walked;
     u64 limit = chunk < want ? chunk : want;
-    u8 *host = LookupAddress(m, cur);
-    if (!host) return -1;
+    u8 *host = ThunkRead(m, cur);
     /* memchr returns pointer-into-buffer; use the libc primitive for the
      * inner page-bounded scan — vectorised on the host. */
     void *hit = memchr(host, (int)c, (size_t)limit);
@@ -181,7 +286,6 @@ static i64 GuestMemchr(struct Machine *m, i64 s, u8 c, u64 n) {
  *   - a byte equal to `c` is seen → return its guest address
  *   - a NUL is seen → if c == 0, return its address (POSIX: strchr matches
  *     NUL); otherwise return 0
- *   - a guest fault → return -1
  *
  * Page-bounded, like the rest of the helpers. */
 static i64 GuestStrchr(struct Machine *m, i64 s, u8 c) {
@@ -189,8 +293,7 @@ static i64 GuestStrchr(struct Machine *m, i64 s, u8 c) {
   for (;;) {
     u64 off = (u64)cur & 4095;
     u64 limit = 4096 - off;
-    u8 *host = LookupAddress(m, cur);
-    if (!host) return -1;
+    u8 *host = ThunkRead(m, cur);
     u64 i;
     for (i = 0; i < limit; ++i) {
       u8 b = host[i];
@@ -217,9 +320,8 @@ static int GuestStrncmp(struct Machine *m, i64 a, i64 b, u64 n) {
     u64 chunk_b = 4096 - ob;
     u64 chunk = chunk_a < chunk_b ? chunk_a : chunk_b;
     if (chunk > n) chunk = n;
-    u8 *ha = LookupAddress(m, a);
-    u8 *hb = LookupAddress(m, b);
-    if (!ha || !hb) return 0;
+    u8 *ha = ThunkRead(m, a);
+    u8 *hb = ThunkRead(m, b);
     u64 i;
     for (i = 0; i < chunk; ++i) {
       u8 ca = ha[i];
@@ -245,8 +347,7 @@ static i64 GuestStrcpy(struct Machine *m, i64 dst, i64 src) {
     u8 stage[4096];
     u64 off_s = (u64)s & 4095;
     u64 chunk_s = 4096 - off_s;
-    u8 *hs = LookupAddress(m, s);
-    if (!hs) return -1;
+    u8 *hs = ThunkRead(m, s);
     /* Find NUL inside this source page (or chunk-end if none). */
     void *nul = memchr(hs, 0, (size_t)chunk_s);
     u64 want;
@@ -270,9 +371,7 @@ static i64 GuestStrcpy(struct Machine *m, i64 dst, i64 src) {
         u64 off_d = (u64)dcur & 4095;
         u64 chunk_d = 4096 - off_d;
         u64 to_write = chunk_d < remaining ? chunk_d : remaining;
-        if (CopyToUser(m, dcur, stage + staged_off, to_write) == -1) {
-          return -1;
-        }
+        ThunkCopyOut(m, dcur, stage + staged_off, to_write);
         dcur += (i64)to_write;
         staged_off += to_write;
         remaining -= to_write;
@@ -286,8 +385,7 @@ static i64 GuestStrcpy(struct Machine *m, i64 dst, i64 src) {
 }
 
 /* Copy up to n bytes of a guest C-string from `src` to `dst`, NUL-padding
- * any remainder if `src` is shorter than n.  Returns 0 on success, -1 on
- * fault.  Page-bounded.
+ * any remainder if `src` is shorter than n.  Returns 0.  Page-bounded.
  *
  * Matches POSIX strncpy:
  *   - If strlen(src) >= n: copy exactly n bytes, NO NUL terminator added.
@@ -311,8 +409,7 @@ static int GuestStrncpy(struct Machine *m, i64 dst, i64 src, u64 n) {
       u64 chunk_d = 4096 - off_d;
       chunk = chunk_s < chunk_d ? chunk_s : chunk_d;
       if (chunk > n) chunk = n;
-      u8 *hs = LookupAddress(m, s);
-      if (!hs) return -1;
+      u8 *hs = ThunkRead(m, s);
       /* Look for NUL inside this source chunk. */
       void *nul = memchr(hs, 0, (size_t)chunk);
       if (nul) {
@@ -328,7 +425,7 @@ static int GuestStrncpy(struct Machine *m, i64 dst, i64 src, u64 n) {
         memcpy(stage, hs, (size_t)chunk);
       }
     }
-    if (CopyToUser(m, d, stage, chunk) == -1) return -1;
+    ThunkCopyOut(m, d, stage, chunk);
     d += (i64)chunk;
     s += (i64)chunk;
     n -= chunk;
@@ -345,9 +442,8 @@ static int GuestStrcmp(struct Machine *m, i64 a, i64 b) {
     u64 chunk_a = 4096 - oa;
     u64 chunk_b = 4096 - ob;
     u64 chunk = chunk_a < chunk_b ? chunk_a : chunk_b;
-    u8 *ha = LookupAddress(m, a);
-    u8 *hb = LookupAddress(m, b);
-    if (!ha || !hb) return 0;
+    u8 *ha = ThunkRead(m, a);
+    u8 *hb = ThunkRead(m, b);
     const u8 *pa = ha;
     const u8 *pb = hb;
     u64 i;
@@ -375,45 +471,11 @@ static void ThunkMemcpy(struct Machine *m) {
     LOGF("thunk memcpy(dst=%#llx, src=%#llx, n=%llu)",
          (long long)dst, (long long)src, (unsigned long long)n);
   }
-  if (n) {
-    /* memcpy semantics — non-overlapping.  But many guests call memcpy on
-     * overlapping ranges anyway (UB but common); we use CopyFromUser into
-     * a temporary buffer when overlap is suspected and CopyToUser back.
-     * For the common case we copy page-by-page via VirtualCopy-style loop. */
-    /* Detect overlap: if [dst, dst+n) intersects [src, src+n) we must
-     * stage through a heap buffer to preserve source bytes.  This matches
-     * memmove semantics; memcpy on overlapping regions is UB but real-world
-     * libc memcpy implementations typically still produce a sane result. */
-    bool overlap = (src < dst && src + (i64)n > dst) ||
-                   (dst < src && dst + (i64)n > src);
-    if (overlap) {
-      u8 *buf = (u8 *)malloc((size_t)n);
-      if (buf) {
-        if (CopyFromUser(m, buf, src, n) == 0) {
-          (void)CopyToUser(m, dst, buf, n);
-        }
-        free(buf);
-      }
-    } else {
-      /* Non-overlapping: page-by-page copy avoids the malloc round-trip. */
-      u64 remaining = n;
-      i64 s = src, d = dst;
-      u8 stage[4096];
-      while (remaining) {
-        u64 off_s = (u64)s & 4095;
-        u64 off_d = (u64)d & 4095;
-        u64 chunk_s = 4096 - off_s;
-        u64 chunk_d = 4096 - off_d;
-        u64 chunk = chunk_s < chunk_d ? chunk_s : chunk_d;
-        if (chunk > remaining) chunk = remaining;
-        if (CopyFromUser(m, stage, s, chunk) == -1) break;
-        if (CopyToUser(m, d, stage, chunk) == -1) break;
-        s += (i64)chunk;
-        d += (i64)chunk;
-        remaining -= chunk;
-      }
-    }
-  }
+  /* memcpy's contract is disjoint ranges, but guests call it on overlapping
+   * ones anyway and real libcs still produce memmove's result; so does this.
+   * (It used to stage an overlap through a malloc of n bytes and copy nothing
+   * at all when that failed.) */
+  if (n) ThunkMove(m, dst, src, n);
   Put64(m->ax, (u64)dst);  /* memcpy returns dst */
   ThunkRet(m);
 }
@@ -435,7 +497,7 @@ static void ThunkMemset(struct Machine *m) {
       u64 off = (u64)d & 4095;
       u64 chunk = 4096 - off;
       if (chunk > remaining) chunk = remaining;
-      if (CopyToUser(m, d, stage, chunk) == -1) break;
+      ThunkCopyOut(m, d, stage, chunk);
       d += (i64)chunk;
       remaining -= chunk;
     }
@@ -451,7 +513,6 @@ static void ThunkStrlen(struct Machine *m) {
    * cap prevents an infinite loop on a guest where the entire address space
    * is non-NUL (e.g. a buggy caller passing a non-string). */
   i64 len = GuestStrnlen(m, s, (u64)1 << 30);
-  if (len < 0) len = 0;
   if (g_thunk_trace) {
     LOGF("thunk strlen(s=%#llx) = %lld", (long long)s, (long long)len);
   }
@@ -496,7 +557,6 @@ static void ThunkMemchr(struct Machine *m) {
   u64 n = Get64(m->dx);
   /* memchr returns NULL when n == 0, regardless of buffer contents. */
   i64 hit = n ? GuestMemchr(m, s, c, n) : 0;
-  if (hit < 0) hit = 0;  /* fault → NULL; next access will refault */
   if (g_thunk_trace) {
     LOGF("thunk memchr(s=%#llx, c=%#x, n=%llu) = %#llx",
          (long long)s, (unsigned)c, (unsigned long long)n,
@@ -510,7 +570,6 @@ static void ThunkStrchr(struct Machine *m) {
   i64 s = (i64)Get64(m->di);
   u8 c = (u8)(Get64(m->si) & 0xff);
   i64 hit = GuestStrchr(m, s, c);
-  if (hit < 0) hit = 0;
   if (g_thunk_trace) {
     LOGF("thunk strchr(s=%#llx, c=%#x) = %#llx",
          (long long)s, (unsigned)c, (long long)hit);
@@ -575,10 +634,8 @@ static void ThunkStrnlen(struct Machine *m) {
   u64 n = Get64(m->si);
   /* POSIX strnlen: return min(strlen(s), n).  GuestStrnlen already caps the
    * walk at the provided n, returning the number of bytes before the first
-   * NUL, or n if none found in the window.  Fault → return 0 (next access
-   * will refault). */
+   * NUL, or n if none found in the window. */
   i64 len = n ? GuestStrnlen(m, s, n) : 0;
-  if (len < 0) len = 0;
   if (g_thunk_trace) {
     LOGF("thunk strnlen(s=%#llx, n=%llu) = %lld",
          (long long)s, (unsigned long long)n, (long long)len);
@@ -600,7 +657,7 @@ static inline u8 AsciiTolower(u8 c) {
 /* Walk two guest C-strings comparing ASCII-tolower(*l) vs ASCII-tolower(*r).
  * Returns musl's 3-way result: tolower(*l) - tolower(*r) after the loop, where
  * the loop stops at the first NUL on either side OR the first differing pair.
- * Page-bounded.  -1-style faults return 0 (next access refaults). */
+ * Page-bounded. */
 static int GuestStrcasecmp(struct Machine *m, i64 l, i64 r) {
   for (;;) {
     u64 ol = (u64)l & 4095;
@@ -608,9 +665,8 @@ static int GuestStrcasecmp(struct Machine *m, i64 l, i64 r) {
     u64 chunk_l = 4096 - ol;
     u64 chunk_r = 4096 - or_;
     u64 chunk = chunk_l < chunk_r ? chunk_l : chunk_r;
-    u8 *hl = LookupAddress(m, l);
-    u8 *hr = LookupAddress(m, r);
-    if (!hl || !hr) return 0;
+    u8 *hl = ThunkRead(m, l);
+    u8 *hr = ThunkRead(m, r);
     u64 i;
     for (i = 0; i < chunk; ++i) {
       u8 cl = hl[i];
@@ -642,9 +698,8 @@ static int GuestStrncasecmp(struct Machine *m, i64 l, i64 r, u64 n) {
     u64 chunk_r = 4096 - or_;
     u64 chunk = chunk_l < chunk_r ? chunk_l : chunk_r;
     if (chunk > n) chunk = n;
-    u8 *hl = LookupAddress(m, l);
-    u8 *hr = LookupAddress(m, r);
-    if (!hl || !hr) return 0;
+    u8 *hl = ThunkRead(m, l);
+    u8 *hr = ThunkRead(m, r);
     u64 i;
     for (i = 0; i < chunk; ++i) {
       u8 cl = hl[i];
@@ -697,8 +752,7 @@ static void ThunkStrncasecmp(struct Machine *m) {
  * guest C-string `haystack`.  Returns:
  *   - the guest address of the match (haystack-relative pointer), or
  *   - the haystack address itself if needle is empty (POSIX), or
- *   - 0 if no match, or
- *   - -1 on guest fault.
+ *   - 0 if no match.
  *
  * Implementation strategy: stage both strings into bounded host buffers via
  * GuestStrnlen-bounded reads, then use the host libc strstr().  We cap the
@@ -719,8 +773,7 @@ static i64 GuestStrstr(struct Machine *m, i64 haystack, i64 needle) {
    * needle returns the haystack pointer per POSIX. */
   u64 npage_off = (u64)needle & 4095;
   u64 nchunk = 4096 - npage_off;
-  u8 *hneedle = LookupAddress(m, needle);
-  if (!hneedle) return -1;
+  u8 *hneedle = ThunkRead(m, needle);
   /* Find NUL in needle's current page.  If the needle spans pages we still
    * cap at the first 4 KiB — covers every grep/awk pattern we'd realistically
    * see; oversized needles fall back to the slow path below. */
@@ -735,8 +788,7 @@ static i64 GuestStrstr(struct Machine *m, i64 haystack, i64 needle) {
     while (walked < kMaxScan) {
       u64 hoff = (u64)hcur & 4095;
       u64 hchunk = 4096 - hoff;
-      u8 *hh = LookupAddress(m, hcur);
-      if (!hh) return -1;
+      u8 *hh = ThunkRead(m, hcur);
       void *hnul = memchr(hh, 0, (size_t)hchunk);
       u64 hwindow = hnul ? (u64)((const u8 *)hnul - hh) : hchunk;
       u64 j;
@@ -747,9 +799,8 @@ static i64 GuestStrstr(struct Machine *m, i64 haystack, i64 needle) {
         i64 hc = hcur + (i64)j;
         bool matched = true;
         for (;;) {
-          u8 *pn = LookupAddress(m, nc);
-          u8 *ph = LookupAddress(m, hc);
-          if (!pn || !ph) { matched = false; break; }
+          u8 *pn = ThunkRead(m, nc);
+          u8 *ph = ThunkRead(m, hc);
           if (!*pn) break;                 /* needle exhausted → match */
           if (!*ph) { matched = false; break; }  /* haystack exhausted */
           if (*pn != *ph) { matched = false; break; }
@@ -792,8 +843,7 @@ static i64 GuestStrstr(struct Machine *m, i64 haystack, i64 needle) {
     if (hchunk > kHaystackStageCap - hbuf_len) {
       hchunk = kHaystackStageCap - hbuf_len;
     }
-    u8 *hh = LookupAddress(m, hcur);
-    if (!hh) { free(hbuf); return -1; }
+    u8 *hh = ThunkRead(m, hcur);
     void *hnul = memchr(hh, 0, (size_t)hchunk);
     u64 take = hnul ? (u64)((const u8 *)hnul - hh) : hchunk;
     memcpy(hbuf + hbuf_len, hh, (size_t)take);
@@ -824,7 +874,6 @@ static void ThunkStrstr(struct Machine *m) {
   i64 haystack = (i64)Get64(m->di);
   i64 needle = (i64)Get64(m->si);
   i64 hit = GuestStrstr(m, haystack, needle);
-  if (hit < 0) hit = 0;
   if (g_thunk_trace) {
     LOGF("thunk strstr(h=%#llx, n=%#llx) = %#llx",
          (long long)haystack, (long long)needle, (long long)hit);
@@ -838,11 +887,9 @@ static void ThunkStrstr(struct Machine *m) {
  *   1. dst > src AND ranges overlap → copy backwards
  *   2. otherwise → forward copy is safe (memcpy semantics)
  *
- * We piggyback on ThunkMemcpy's overlap detection which already stages the
- * full source through a heap buffer before writing.  That's strictly correct
- * for any overlap shape (it preserves source bytes before any destination
- * write happens), so memmove and memcpy can share the same implementation.
- * The win is the host call replacing the interpreted x86 unwind / `rep movsb`
+ * ThunkMove copies a page at a time in whichever of those two directions
+ * keeps every source byte intact until it is read, so memmove and memcpy
+ * share it.  The win is the host call replacing the interpreted x86 unwind / `rep movsb`
  * machinery in musl's hand-asm memmove. */
 static void ThunkMemmove(struct Machine *m) {
   i64 dst = (i64)Get64(m->di);
@@ -852,20 +899,7 @@ static void ThunkMemmove(struct Machine *m) {
     LOGF("thunk memmove(dst=%#llx, src=%#llx, n=%llu)",
          (long long)dst, (long long)src, (unsigned long long)n);
   }
-  if (n) {
-    /* Always stage through a heap buffer — memmove must preserve source
-     * across the write, which the malloc round-trip guarantees regardless of
-     * overlap direction.  The page-by-page non-overlap fast path used by
-     * ThunkMemcpy is unsafe here because memmove guarantees correct behaviour
-     * under arbitrary overlap (memcpy's contract is non-overlapping only). */
-    u8 *buf = (u8 *)malloc((size_t)n);
-    if (buf) {
-      if (CopyFromUser(m, buf, src, n) == 0) {
-        (void)CopyToUser(m, dst, buf, n);
-      }
-      free(buf);
-    }
-  }
+  if (n) ThunkMove(m, dst, src, n);
   Put64(m->ax, (u64)dst);  /* memmove returns dst */
   ThunkRet(m);
 }
@@ -918,8 +952,7 @@ static i64 GuestMemrchr(struct Machine *m, i64 s, u8 c, u64 n) {
     u64 chunk = last_off + 1;            /* bytes from page_start..last+1 */
     if (chunk > remaining) chunk = remaining;
     i64 page_start = last - (i64)(chunk - 1);
-    u8 *host = LookupAddress(m, page_start);
-    if (!host) return -1;
+    u8 *host = ThunkRead(m, page_start);
     /* Scan host[0..chunk) for the LAST occurrence of c. */
     size_t i;
     for (i = chunk; i > 0; --i) {
@@ -938,7 +971,6 @@ static void ThunkMemrchr(struct Machine *m) {
   u8 c = (u8)(Get64(m->si) & 0xff);
   u64 n = Get64(m->dx);
   i64 hit = GuestMemrchr(m, s, c, n);
-  if (hit < 0) hit = 0;
   if (g_thunk_trace) {
     LOGF("thunk memrchr(s=%#llx, c=%#x, n=%llu) = %#llx",
          (long long)s, (unsigned)c, (unsigned long long)n, (long long)hit);
@@ -955,9 +987,7 @@ static void ThunkStrrchr(struct Machine *m) {
   u8 c = (u8)(Get64(m->si) & 0xff);
   /* Bounded strlen — same 1 GiB safety cap as ThunkStrlen. */
   i64 len = GuestStrnlen(m, s, (u64)1 << 30);
-  if (len < 0) len = 0;
   i64 hit = GuestMemrchr(m, s, c, (u64)len + 1);
-  if (hit < 0) hit = 0;
   if (g_thunk_trace) {
     LOGF("thunk strrchr(s=%#llx, c=%#x) = %#llx",
          (long long)s, (unsigned)c, (long long)hit);
@@ -968,20 +998,19 @@ static void ThunkStrrchr(struct Machine *m) {
 
 /* Build a 256-bit "byte-set" bitmap from a guest C-string of accept/reject
  * chars.  Used by strspn/strcspn/strpbrk/strtok_r.  Sets bit `b` for every
- * byte `b` that appears in `set` (NUL-terminated, page-bounded).  Returns 0
- * on success, -1 on guest fault.  `bits` must be 32 bytes. */
-static int GuestBuildByteSet(struct Machine *m, i64 set, u8 bits[32]) {
+ * byte `b` that appears in `set` (NUL-terminated, page-bounded).  `bits` must
+ * be 32 bytes. */
+static void GuestBuildByteSet(struct Machine *m, i64 set, u8 bits[32]) {
   memset(bits, 0, 32);
   i64 cur = set;
   for (;;) {
     u64 off = (u64)cur & 4095;
     u64 chunk = 4096 - off;
-    u8 *host = LookupAddress(m, cur);
-    if (!host) return -1;
+    u8 *host = ThunkRead(m, cur);
     u64 i;
     for (i = 0; i < chunk; ++i) {
       u8 b = host[i];
-      if (!b) return 0;  /* NUL terminator → set complete */
+      if (!b) return;  /* NUL terminator → set complete */
       bits[b >> 3] |= (u8)(1u << (b & 7));
     }
     cur += (i64)chunk;
@@ -991,15 +1020,14 @@ static int GuestBuildByteSet(struct Machine *m, i64 set, u8 bits[32]) {
 /* Walk a guest C-string returning the length of the initial run of chars
  * that ARE in `bits` (strspn semantics).  Page-bounded.  Returns the count of
  * bytes before the first byte NOT in `bits` (or before the terminating NUL).
- * -1 on guest fault. */
+ */
 static i64 GuestSpanIn(struct Machine *m, i64 s, const u8 bits[32]) {
   u64 count = 0;
   i64 cur = s;
   for (;;) {
     u64 off = (u64)cur & 4095;
     u64 chunk = 4096 - off;
-    u8 *host = LookupAddress(m, cur);
-    if (!host) return -1;
+    u8 *host = ThunkRead(m, cur);
     u64 i;
     for (i = 0; i < chunk; ++i) {
       u8 b = host[i];
@@ -1012,15 +1040,14 @@ static i64 GuestSpanIn(struct Machine *m, i64 s, const u8 bits[32]) {
 }
 
 /* Walk a guest C-string returning the length of the initial run of chars
- * that are NOT in `bits` (strcspn semantics).  Page-bounded.  -1 on fault. */
+ * that are NOT in `bits` (strcspn semantics).  Page-bounded. */
 static i64 GuestSpanOut(struct Machine *m, i64 s, const u8 bits[32]) {
   u64 count = 0;
   i64 cur = s;
   for (;;) {
     u64 off = (u64)cur & 4095;
     u64 chunk = 4096 - off;
-    u8 *host = LookupAddress(m, cur);
-    if (!host) return -1;
+    u8 *host = ThunkRead(m, cur);
     u64 i;
     for (i = 0; i < chunk; ++i) {
       u8 b = host[i];
@@ -1036,13 +1063,8 @@ static void ThunkStrspn(struct Machine *m) {
   i64 s = (i64)Get64(m->di);
   i64 set = (i64)Get64(m->si);
   u8 bits[32];
-  if (GuestBuildByteSet(m, set, bits) == -1) {
-    Put64(m->ax, 0);
-    ThunkRet(m);
-    return;
-  }
+  GuestBuildByteSet(m, set, bits);
   i64 len = GuestSpanIn(m, s, bits);
-  if (len < 0) len = 0;
   if (g_thunk_trace) {
     LOGF("thunk strspn(s=%#llx, set=%#llx) = %lld",
          (long long)s, (long long)set, (long long)len);
@@ -1055,13 +1077,8 @@ static void ThunkStrcspn(struct Machine *m) {
   i64 s = (i64)Get64(m->di);
   i64 set = (i64)Get64(m->si);
   u8 bits[32];
-  if (GuestBuildByteSet(m, set, bits) == -1) {
-    Put64(m->ax, 0);
-    ThunkRet(m);
-    return;
-  }
+  GuestBuildByteSet(m, set, bits);
   i64 len = GuestSpanOut(m, s, bits);
-  if (len < 0) len = 0;
   if (g_thunk_trace) {
     LOGF("thunk strcspn(s=%#llx, set=%#llx) = %lld",
          (long long)s, (long long)set, (long long)len);
@@ -1077,17 +1094,12 @@ static void ThunkStrpbrk(struct Machine *m) {
   i64 set = (i64)Get64(m->si);
   u8 bits[32];
   i64 hit = 0;
-  if (GuestBuildByteSet(m, set, bits) == 0) {
-    i64 len = GuestSpanOut(m, s, bits);
-    if (len >= 0) {
-      /* Check whether the stop char was a hit (in set) vs NUL.  Re-read the
-       * one byte at s+len. */
-      i64 p = s + len;
-      u8 *host = LookupAddress(m, p);
-      if (host && *host) {
-        hit = p;
-      }
-    }
+  GuestBuildByteSet(m, set, bits);
+  {
+    /* Check whether the stop char was a hit (in set) vs NUL.  Re-read the
+     * one byte at s+len. */
+    i64 p = s + GuestSpanOut(m, s, bits);
+    if (*ThunkRead(m, p)) hit = p;
   }
   if (g_thunk_trace) {
     LOGF("thunk strpbrk(s=%#llx, set=%#llx) = %#llx",
@@ -1115,48 +1127,45 @@ static void ThunkStrtokR(struct Machine *m) {
   i64 statep = (i64)Get64(m->dx);
   i64 result = 0;
   u8 bits[32];
-  i64 spn, cspn, end;
+  i64 cspn, end;
   /* Resume from state if s is NULL. */
   if (s == 0) {
     u8 sbuf[8];
-    if (CopyFromUser(m, sbuf, statep, 8) == -1) {
-      goto done;
-    }
+    ThunkCopyIn(m, sbuf, statep, 8);
     s = (i64)Get64(sbuf);
     if (s == 0) goto done;
   }
-  if (GuestBuildByteSet(m, sep, bits) == -1) goto done;
+  GuestBuildByteSet(m, sep, bits);
   /* Skip leading separators. */
-  spn = GuestSpanIn(m, s, bits);
-  if (spn < 0) goto done;
-  s += spn;
+  s += GuestSpanIn(m, s, bits);
   /* If exhausted, store NULL and return NULL. */
-  {
-    u8 *host = LookupAddress(m, s);
-    if (!host) goto done;
-    if (*host == 0) {
-      u8 zero[8] = {0};
-      (void)CopyToUser(m, statep, zero, 8);
-      goto done;
-    }
+  if (*ThunkRead(m, s) == 0) {
+    u8 zero[8] = {0};
+    ThunkCopyOut(m, statep, zero, 8);
+    goto done;
   }
   /* Find end of token. */
   cspn = GuestSpanOut(m, s, bits);
-  if (cspn < 0) goto done;
   end = s + cspn;
-  /* Terminate in place if not already at NUL, then advance state. */
+  /* Terminate in place if not already at NUL, then advance state.  Both
+   * stores are checked before either is made, in musl's order (the
+   * terminator, then *state): a re-run after a fault on the second would
+   * otherwise find the terminator already written and return a different
+   * state (see the fault note at the top). */
   {
-    u8 *eh = LookupAddress(m, end);
-    if (!eh) goto done;
     u8 next_state_buf[8] = {0};
-    if (*eh) {
+    bool cut = *ThunkRead(m, end) != 0;
+    if (cut) (void)ResolveAddressWrite(m, end);
+    (void)ResolveAddressWrite(m, statep);
+    (void)ResolveAddressWrite(m, statep + 7);
+    if (cut) {
       u8 zero = 0;
-      (void)CopyToUser(m, end, &zero, 1);
+      ThunkCopyOut(m, end, &zero, 1);
       Put64(next_state_buf, (u64)(end + 1));
     } else {
       Put64(next_state_buf, (u64)end);
     }
-    (void)CopyToUser(m, statep, next_state_buf, 8);
+    ThunkCopyOut(m, statep, next_state_buf, 8);
   }
   result = s;
 done:
