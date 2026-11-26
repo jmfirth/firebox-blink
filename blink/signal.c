@@ -168,6 +168,10 @@ void DeliverSignal(struct Machine *m, int sig, int code) {
   Put64(m->dx, sp + offsetof(struct SignalFrame, uc));
   SIG_LOGF("handler is %" PRIx64, Read64(m->system->hands[sig - 1].handler));
   m->ip = Read64(m->system->hands[sig - 1].handler);
+  /* firebox#KPA (review): Linux enters the handler with DF, TF and RF
+   * clear (setup_rt_frame), so its string operations run forwards even when
+   * the signal arrived between STD and CLD.  The frame keeps the old value. */
+  m->flags &= ~(1u << FLAGS_DF | 1u << FLAGS_TF | 1u << FLAGS_RF);
 }
 
 void SigRestore(struct Machine *m) {
@@ -184,7 +188,17 @@ void SigRestore(struct Machine *m) {
   SYS_LOGF("rt_sigreturn(%#" PRIx64 ")", Read64(m->sp) - 8);
   unassert(!CopyFromUserRead(m, &sf, Read64(m->sp) - 8, sizeof(sf)));
   m->ip = Read64(sf.uc.rip);
-  ImportFlags(m, Read64(sf.uc.eflags)); /* firebox#KPA: the inverse */
+  /* firebox#KPA: the inverse of the export, restricted (review) to what
+   * Linux's restore_sigcontext lets a handler change, FIX_EFLAGS: AC OF DF
+   * TF SF ZF AF PF CF RF.  IF, IOPL, NT and ID keep their current values. */
+  {
+    u64 fix = 1u << FLAGS_AC | 1u << FLAGS_OF | 1u << FLAGS_DF |
+              1u << FLAGS_TF | 1u << FLAGS_SF | 1u << FLAGS_ZF |
+              1u << FLAGS_AF | 1u << FLAGS_PF | 1u << FLAGS_CF |
+              1u << FLAGS_RF;
+    ImportFlags(m, (ExportFlags(m->flags) & ~fix) |
+                       (Read64(sf.uc.eflags) & fix));
+  }
   m->sigmask = Read64(sf.uc.sigmask);
   SIG_LOGF("sigmask restore %" PRIx64, m->sigmask);
   memcpy(m->r8, sf.uc.r8, 8);

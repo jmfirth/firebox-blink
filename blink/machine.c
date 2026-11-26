@@ -345,13 +345,13 @@ static void OpBswapZvqp(P) {
 
 static void OpMovAlOb(P) {
   i64 addr = AddressOb(A);
-  SetWriteAddr(m, addr, 1);
+  SetReadAddr(m, addr, 1); /* firebox#KPA: a load (the two were swapped) */
   Put8(m->ax, Load8(ResolveAddress(m, addr)));
 }
 
 static void OpMovObAl(P) {
   i64 addr = AddressOb(A);
-  SetReadAddr(m, addr, 1);
+  SetWriteAddr(m, addr, 1);
   Store8(ResolveAddressWrite(m, addr), Get8(m->ax)); /* firebox#KPA */
 }
 
@@ -362,9 +362,16 @@ static void OpMovRaxOvqp(P) {
 }
 
 static void OpMovOvqpRax(P) {
+  /* firebox#KPA: through BeginStore, so a store that straddles into a page
+   * that is not writable faults there too (one ResolveAddressWrite checked
+   * only the first page, then wrote past it). */
   i64 v = DataSegment(A, disp);
-  SetWriteAddr(m, v, 1 << RegLog2(rde));
-  WriteMemory(rde, ResolveAddressWrite(m, v), Get64(m->ax)); /* firebox#KPA */
+  size_t n = (size_t)1 << RegLog2(rde);
+  void *p[2];
+  u8 b[8], *q;
+  q = BeginStore(m, v, n, p, b);
+  WriteMemory(rde, q, Get64(m->ax));
+  EndStore(m, v, n, p, b);
 }
 
 static void OpMovEbGb(P) {

@@ -308,6 +308,21 @@ static u8 *GetVectorAddress(P, size_t n) {
   return p;
 }
 
+/* firebox#KPA (review): the aligned 16-byte STORE destination (MOVAPS,
+ * MOVDQA [m], xmm; MOVNTDQ/MOVNTPS/MOVNTPD).  GetVectorAddress asks the page
+ * for PAGE_U only, so these wrote a PROT_READ page (glibc's aligned and
+ * non-temporal memset/memcpy paths use them).  ResolveAddressWrite asks for
+ * PAGE_RW at CPL 3 and raises SEGV_ACCERR.  An aligned 16-byte access never
+ * straddles a page. */
+u8 *GetXmmAddressWrite(P) {
+  i64 v;
+  if (IsModrmRegister(rde)) return XmmRexbRm(m, rde);
+  v = ComputeAddress(A);
+  SetWriteAddr(m, v, 16);
+  if (v & 15) ThrowSegmentationFault(m, v);
+  return ResolveAddressWrite(m, v);
+}
+
 u8 *GetMmxAddress(P) {
   return GetVectorAddress(A, 8);
 }
