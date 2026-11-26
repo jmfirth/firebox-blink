@@ -279,6 +279,12 @@ struct LiftCtx {
    * lift BAILOUTs them exactly as before. */
   int region;
   u64 next_pc; /* PC after the instruction being lifted (RIP-relative) */
+  /* firebox#T3R3: the instruction's segment override (Sego), when a region
+   * lift may apply it to the memory operand, and whether a lifter did
+   * (LiftClassifyAddr).  An override no lifter consumed refuses the
+   * instruction (LiftOne). */
+  u8 seg;
+  int seg_used;
 };
 
 static int CtxReserve(struct LiftCtx *ctx, u32 want) {
@@ -571,7 +577,7 @@ static int LiftIsVexEncoded(const struct FbxTcEntry *e) {
 
 /* Returns 1 if `rde` uses an operand shape the IR cannot express (see above);
  * the caller must BAILOUT rather than lift. */
-static int LiftOperandShapeUnmodelled(u64 rde, u64 mop) {
+static int LiftOperandShapeUnmodelled(u64 rde, u64 mop, int region) {
   int roles = LiftOperandRoles(mop);
   if (roles == FBX_LIFT_UNCLASSIFIED) return 1;
   /* LOCK.  No lifter here models an atomic read-modify-write, and on every
@@ -612,7 +618,9 @@ static int LiftOperandShapeUnmodelled(u64 rde, u64 mop) {
   }
   /* Memory operand. */
   if (Asz(rde)) return 1;
-  if (Sego(rde) && !(roles & FBX_LIFT_NO_SEG)) return 1;
+  /* firebox#T3R3: a region lift applies the segment base (LiftClassifyAddr
+   * records it in the IR; LiftOne refuses an override nothing consumed). */
+  if (Sego(rde) && !(roles & FBX_LIFT_NO_SEG) && !region) return 1;
   return 0;
 }
 
@@ -665,12 +673,17 @@ static int ClassifyLeaMem(u64 rde, u32 *out_base_greg, u32 *out_index_greg,
  * Tier 1 runs it. */
 struct LiftAddr {
   int abs;
-  u32 base, index, scale;
+  u32 base, index, scale; /* scale 0: no index (an absolute VA may have one) */
   u64 va;
   i64 disp;
+  u8 seg;
 };
 
-static int LiftClassifyAddr(const struct LiftCtx *ctx, u64 rde, i64 disp,
+/* firebox#T3R3: a region lift also takes the no-base SIB forms, `[disp32]`
+ * and `[index*scale + disp32]` (an absolute VA, plus the index), and any
+ * segment override (blink/modrm.c LoadEffectiveAddress then AddSegment:
+ * the override's base is added to whichever form it is). */
+static int LiftClassifyAddr(struct LiftCtx *ctx, u64 rde, i64 disp,
                             struct LiftAddr *a) {
   memset(a, 0, sizeof *a);
   if (IsModrmRegister(rde)) return 0;
@@ -678,20 +691,35 @@ static int LiftClassifyAddr(const struct LiftCtx *ctx, u64 rde, i64 disp,
     if (!ctx->region || !IsRipRelative(rde)) return 0;
     a->abs = 1;
     a->va = ctx->next_pc + (u64)disp;
-    return 1;
+  } else if (ctx->region && SibExists(rde) && !SibHasBase(rde)) {
+    a->abs = 1;
+    a->va = (u64)disp;
+    if (SibHasIndex(rde)) {
+      a->index = ((u32)Rexx(rde) << 3) | (u32)SibIndex(rde);
+      a->scale = 1u << (u32)SibScale(rde);
+    }
+  } else {
+    if (!ClassifyLeaMem(rde, &a->base, &a->index, &a->scale)) return 0;
+    a->disp = disp;
   }
-  if (!ClassifyLeaMem(rde, &a->base, &a->index, &a->scale)) return 0;
-  a->disp = disp;
+  a->seg = ctx->seg;
+  ctx->seg_used = 1;
   return 1;
 }
 
 /* LOAD address encoding: src1 GREG base (+ src2 GREG index, scale) + imm
  * disp; or src1_kind IMM with the absolute VA in imm. */
 static void LiftSetLoadAddr(struct FbxIrInst *ld, const struct LiftAddr *a) {
+  ld->seg = a->seg;
   if (a->abs) {
     ld->src1_kind = FBX_IR_KIND_IMM;
     ld->src1 = 0;
     ld->imm = a->va;
+    if (a->scale != 0) {
+      ld->src2_kind = FBX_IR_KIND_GREG;
+      ld->src2 = a->index;
+      ld->scale = a->scale;
+    }
     return;
   }
   ld->src1_kind = FBX_IR_KIND_GREG;
@@ -753,6 +781,7 @@ static int LiftStoreRegion(struct LiftCtx *ctx, u64 rde, i64 disp, u8 width,
   st->width = width;
   st->src2_kind = FBX_IR_KIND_VREG;
   st->src2 = val_vreg;
+  st->seg = a.seg;
   if (a.abs) {
     st->src1_kind = FBX_IR_KIND_IMM;
     st->imm = a.va;
@@ -760,11 +789,11 @@ static int LiftStoreRegion(struct LiftCtx *ctx, u64 rde, i64 disp, u8 width,
     st->src1_kind = FBX_IR_KIND_GREG;
     st->src1 = a.base;
     st->imm = (u64)a.disp;
-    if (a.scale != 0) {
-      st->dst_kind = FBX_IR_KIND_GREG;
-      st->dst = a.index;
-      st->scale = a.scale;
-    }
+  }
+  if (a.scale != 0) {
+    st->dst_kind = FBX_IR_KIND_GREG;
+    st->dst = a.index;
+    st->scale = a.scale;
   }
   return 1;
 }
@@ -1041,6 +1070,31 @@ static int LiftLea(struct LiftCtx *ctx, u64 rde, i64 disp) {
     set->dst = (u32)RexrReg(rde);
     set->src1_kind = FBX_IR_KIND_IMM;
     set->imm = ctx->next_pc + (u64)disp;
+    return 1;
+  }
+  if (ctx->region && SibExists(rde) && !SibHasBase(rde)) {
+    /* firebox#T3R3: no base, `lea r, [index*scale + disp32]` (or the
+     * constant `[disp32]`).  LEA src1_kind NONE: regions only. */
+    lea = CtxEmit(ctx);
+    if (!lea) return 0;
+    if (!SibHasIndex(rde)) {
+      lea->opcode = FBX_IR_OP_REG_SET;
+      lea->width = width;
+      lea->dst_kind = FBX_IR_KIND_GREG;
+      lea->dst = (u32)RexrReg(rde);
+      lea->src1_kind = FBX_IR_KIND_IMM;
+      lea->imm = (u64)disp;
+      return 1;
+    }
+    lea->opcode = FBX_IR_OP_LEA;
+    lea->width = width;
+    lea->dst_kind = FBX_IR_KIND_GREG;
+    lea->dst = (u32)RexrReg(rde);
+    lea->src1_kind = FBX_IR_KIND_NONE;
+    lea->src2_kind = FBX_IR_KIND_GREG;
+    lea->src2 = ((u32)Rexx(rde) << 3) | (u32)SibIndex(rde);
+    lea->scale = 1u << (u32)SibScale(rde);
+    lea->imm = (u64)disp;
     return 1;
   }
   if (!ClassifyLeaMem(rde, &base_greg, &index_greg, &scale)) {
@@ -1593,14 +1647,37 @@ static int LiftCallJvds(struct LiftCtx *ctx, u64 target_pc, u64 return_pc) {
  *    0   : alloc failure
  *   -1   : unsupported opcode; caller emits BAILOUT
  */
+static int LiftOneOp(struct LiftCtx *ctx, const struct FbxTcEntry *e,
+                     u64 next_pc);
+
 static int LiftOne(struct LiftCtx *ctx, const struct FbxTcEntry *e,
                    u64 next_pc) {
   u64 rde = e->rde;
   u64 mop = Mopcode(rde);
+  int roles, rc;
   /* firebox#RAT — refuse the operand shapes the IR cannot express BEFORE any
    * lifter reads a register number or an addressing form out of `rde`. */
   if (LiftIsVexEncoded(e)) return -1;
-  if (LiftOperandShapeUnmodelled(rde, mop)) return -1;
+  if (LiftOperandShapeUnmodelled(rde, mop, ctx->region)) return -1;
+  /* firebox#T3R3: a region lift carries a memory operand's segment override
+   * into the IR.  Only LiftClassifyAddr applies it, so an instruction whose
+   * lifter computed its address any other way is refused here. */
+  roles = LiftOperandRoles(mop);
+  ctx->seg = 0;
+  ctx->seg_used = 0;
+  if (ctx->region && (roles & FBX_LIFT_HAS_MODRM) &&
+      !(roles & FBX_LIFT_NO_SEG) && !IsModrmRegister(rde)) {
+    ctx->seg = (u8)Sego(rde);
+  }
+  rc = LiftOneOp(ctx, e, next_pc);
+  if (rc > 0 && ctx->seg && !ctx->seg_used) return -1;
+  return rc;
+}
+
+static int LiftOneOp(struct LiftCtx *ctx, const struct FbxTcEntry *e,
+                     u64 next_pc) {
+  u64 rde = e->rde;
+  u64 mop = Mopcode(rde);
   switch (mop) {
     /* MOV r/m, r — opcode 0x88 (byte) and 0x89 (word).  #677 routes the
      * memory-store form (mod != 3) through LiftMovStoreMem; the call may
@@ -1988,7 +2065,7 @@ void fbx_ir_block_sha256(const struct FbxIrBlock *ir, u8 out_sha256[32]) {
       b[k++] = p->dst_kind;
       b[k++] = p->src1_kind;
       b[k++] = p->src2_kind;
-      b[k++] = p->_pad0;
+      b[k++] = p->seg;
       b[k++] = (u8)(p->_pad1 >> 0);
       b[k++] = (u8)(p->_pad1 >> 8);
       b[k++] = (u8)(p->dst >> 0);

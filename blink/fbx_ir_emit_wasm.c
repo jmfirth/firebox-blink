@@ -1016,7 +1016,9 @@ static int CoverageGateMode(const struct FbxIrBlock *ir,
        * weg[index]*scale to the effective address (no MMU translation; LEA
        * never dereferences memory).  Anything else (a missing base, or a GREG
        * index with an invalid scale) is a form the emitter doesn't model. */
-      if (p->src1_kind != FBX_IR_KIND_GREG) {
+      if (p->src1_kind != FBX_IR_KIND_GREG &&
+          !(region && p->src1_kind == FBX_IR_KIND_NONE &&
+            p->src2_kind == FBX_IR_KIND_GREG)) { /* firebox#T3R3: no base */
         SetFail(fail, FBX_IR_EMIT_LEA_SIB_FORM, p->opcode);
         return 0;
       }
@@ -1037,9 +1039,11 @@ static int CoverageGateMode(const struct FbxIrBlock *ir,
      * relative) address, a STORE's SIB index in dst — are not the per-block
      * emitter's; it would read the address from src1 as a register. */
     if (!region &&
-        (p->opcode == FBX_IR_OP_LOAD || p->opcode == FBX_IR_OP_STORE) &&
-        (p->src1_kind != FBX_IR_KIND_GREG ||
-         (p->opcode == FBX_IR_OP_STORE && p->dst_kind != FBX_IR_KIND_NONE))) {
+        (((p->opcode == FBX_IR_OP_LOAD || p->opcode == FBX_IR_OP_STORE) &&
+          (p->src1_kind != FBX_IR_KIND_GREG ||
+           (p->opcode == FBX_IR_OP_STORE &&
+            p->dst_kind != FBX_IR_KIND_NONE))) ||
+         p->seg != 0)) { /* firebox#T3R3: a segment base is regions' only */
       SetFail(fail, FBX_IR_EMIT_KIND_MISMATCH, p->opcode);
       return 0;
     }
@@ -4253,6 +4257,11 @@ int fbx_ir_region_member_ok(const struct FbxIrBlock *ir,
   for (i = 0; i < ir->ninsts; ++i) {
     const struct FbxIrInst *p = &ir->insts[i];
     int ok = 1;
+    /* firebox#T3R3: only a memory access carries a segment */
+    if (p->seg && p->opcode != FBX_IR_OP_LOAD &&
+        p->opcode != FBX_IR_OP_STORE) {
+      ok = 0;
+    }
     if (p != term && RegionIsTerminator(p->opcode)) {
       ok = 0; /* control flow that is not the terminator */
     }
@@ -4282,7 +4291,10 @@ int fbx_ir_region_member_ok(const struct FbxIrBlock *ir,
                  (p->src2_kind == FBX_IR_KIND_GREG && p->src2 < 16u &&
                   RegionScaleOk(p->scale)))) ||
                (p->src1_kind == FBX_IR_KIND_IMM &&
-                p->src2_kind == FBX_IR_KIND_NONE));
+                (p->src2_kind == FBX_IR_KIND_NONE ||
+                 (p->src2_kind == FBX_IR_KIND_GREG && p->src2 < 16u &&
+                  RegionScaleOk(p->scale))))) &&
+              p->seg <= 6u;
         break;
       case FBX_IR_OP_STORE:
         /* firebox#T3R2: value in src2; base in src1 with the index in dst,
@@ -4294,7 +4306,10 @@ int fbx_ir_region_member_ok(const struct FbxIrBlock *ir,
                  (p->dst_kind == FBX_IR_KIND_GREG && p->dst < 16u &&
                   RegionScaleOk(p->scale)))) ||
                (p->src1_kind == FBX_IR_KIND_IMM &&
-                p->dst_kind == FBX_IR_KIND_NONE));
+                (p->dst_kind == FBX_IR_KIND_NONE ||
+                 (p->dst_kind == FBX_IR_KIND_GREG && p->dst < 16u &&
+                  RegionScaleOk(p->scale))))) &&
+              p->seg <= 6u;
         break;
       case FBX_IR_OP_PUSH:
         ok &= p->width == 8 && p->src1_kind == FBX_IR_KIND_GREG &&
@@ -4344,12 +4359,15 @@ int fbx_ir_region_member_ok(const struct FbxIrBlock *ir,
       case FBX_IR_OP_LEA:
         ok &= p->dst_kind == FBX_IR_KIND_GREG && p->dst < 16u &&
               (p->width == 2 || p->width == 4 || p->width == 8) &&
-              p->src1_kind == FBX_IR_KIND_GREG && p->src1 < 16u &&
-              (p->src2_kind == FBX_IR_KIND_NONE ||
-               p->src2_kind == FBX_IR_KIND_IMM ||
-               (p->src2_kind == FBX_IR_KIND_GREG && p->src2 < 16u &&
-                (p->scale == 1 || p->scale == 2 || p->scale == 4 ||
-                 p->scale == 8)));
+              ((p->src1_kind == FBX_IR_KIND_GREG && p->src1 < 16u &&
+                (p->src2_kind == FBX_IR_KIND_NONE ||
+                 p->src2_kind == FBX_IR_KIND_IMM ||
+                 (p->src2_kind == FBX_IR_KIND_GREG && p->src2 < 16u &&
+                  RegionScaleOk(p->scale)))) ||
+               /* firebox#T3R3: no base, an index */
+               (p->src1_kind == FBX_IR_KIND_NONE &&
+                p->src2_kind == FBX_IR_KIND_GREG && p->src2 < 16u &&
+                RegionScaleOk(p->scale)));
         break;
       case FBX_IR_OP_BRANCH_COND:
         /* PF/NP is a lazy-parity read EmitJccPredicate refuses.  The IR
@@ -4935,19 +4953,41 @@ static void RegionUnaryFlags(struct RegionEmit *r, u8 kind, u32 x_local,
   fbx_wasm_buffer_uleb(b, M_OFF_FLAGS);
 }
 
-/* Push a memory operand's VA: base (+ index*scale) + disp, or absolute. */
+/* firebox#T3R3: m->seg[k].base, the segment bases AddSegment adds. */
+#define M_OFF_SEGBASE(k)                                     \
+  ((u32)(offsetof(struct Machine, seg) +                     \
+         (k) * sizeof(struct DescriptorCache) +               \
+         offsetof(struct DescriptorCache, base)))
+_Static_assert(sizeof(((struct DescriptorCache *)0)->base) == 8,
+               "a region loads a segment base as an i64");
+
+/* Push a memory operand's VA: base (+ index*scale) + disp, or an absolute
+ * VA (+ index*scale), then (firebox#T3R3) + the segment override's base
+ * (blink/modrm.c ComputeAddress: LoadEffectiveAddress, then AddSegment). */
 static void RegionMemEa(struct RegionEmit *r, const struct FbxIrInst *p,
                         int index_in_dst) {
+  struct FbxWasmBuffer *b = r->body;
+  int has_index = index_in_dst ? p->dst_kind == FBX_IR_KIND_GREG
+                               : p->src2_kind == FBX_IR_KIND_GREG;
+  u32 index = index_in_dst ? p->dst : p->src2;
   if (p->src1_kind == FBX_IR_KIND_IMM) {
-    RegionI64Const(r->body, p->imm);
-    return;
-  }
-  if (index_in_dst) {
-    RegionEa(r, p->src1, p->dst_kind == FBX_IR_KIND_GREG, p->dst, p->scale,
-             p->imm);
+    RegionI64Const(b, p->imm);
+    if (has_index) {
+      fbx_wasm_buffer_u8(b, WASM_OP_LOCAL_GET);
+      fbx_wasm_buffer_uleb(b, RegionG(r, index));
+      EmitScaleShift(b, p->scale);
+      fbx_wasm_buffer_u8(b, WASM_OP_I64_ADD);
+    }
   } else {
-    RegionEa(r, p->src1, p->src2_kind == FBX_IR_KIND_GREG, p->src2, p->scale,
-             p->imm);
+    RegionEa(r, p->src1, has_index, index, p->scale, p->imm);
+  }
+  if (p->seg) {
+    fbx_wasm_buffer_u8(b, WASM_OP_LOCAL_GET);
+    fbx_wasm_buffer_uleb(b, EMIT_LOCAL_M_PTR);
+    fbx_wasm_buffer_u8(b, WASM_OP_I64_LOAD);
+    fbx_wasm_buffer_uleb(b, 3);
+    fbx_wasm_buffer_uleb(b, M_OFF_SEGBASE(p->seg - 1u));
+    fbx_wasm_buffer_u8(b, WASM_OP_I64_ADD);
   }
 }
 
@@ -5074,8 +5114,19 @@ static int RegionEmitMember(struct RegionEmit *r, u32 i) {
                           VregLocal(p->src2), RegionWidth(p->width));
         break;
       case FBX_IR_OP_LEA:
-        RegionEa(r, p->src1, p->src2_kind == FBX_IR_KIND_GREG, p->src2,
-                 p->scale, p->imm);
+        if (p->src1_kind == FBX_IR_KIND_NONE) {
+          /* firebox#T3R3: no base: index*scale + disp */
+          fbx_wasm_buffer_u8(b, WASM_OP_LOCAL_GET);
+          fbx_wasm_buffer_uleb(b, RegionG(r, p->src2));
+          EmitScaleShift(b, p->scale);
+          if (p->imm) {
+            RegionI64Const(b, p->imm);
+            fbx_wasm_buffer_u8(b, WASM_OP_I64_ADD);
+          }
+        } else {
+          RegionEa(r, p->src1, p->src2_kind == FBX_IR_KIND_GREG, p->src2,
+                   p->scale, p->imm);
+        }
         RegionStoreG(r, p->dst, p->width);
         break;
       case FBX_IR_OP_BRANCH_COND:

@@ -1956,7 +1956,7 @@ TEST(FbxWasm599, IrVersionBumped) {
    * Emit flipped from synthesize to refuse for a whole block class (any block
    * whose last flag-definer is an IMUL), so stale v8 sidecars must invalidate
    * rather than serve the fail-open wasm they already hold. */
-  ASSERT_EQ(11u, (u32)FBX_IR_VERSION);
+  ASSERT_EQ(12u, (u32)FBX_IR_VERSION); /* firebox#T3R3: region-only forms */
 }
 
 TEST(FbxWasm599, FlagSynthDifferentOpKindProducesDifferentBytes) {
@@ -3503,6 +3503,44 @@ TEST(FbxRegionExec, UnaryFlagsMatchBlinkAtEveryWidth) {
       }
     }
   }
+}
+
+TEST(FbxRegionExec, SegmentBasesAndBaselessAddresses) {
+  /* firebox#T3R3: mov %fs:0x28,%rax; mov 0x601010,%rcx (no base, no index);
+   * lea 0x8(,%rdi,4),%rdx (no base); mov %rbx,%gs:0x8(%rdi); mov
+   * 0x600ff4(,%rdi,2),%r8d (no base, an index); jmp . (an exit).  The segment
+   * bases are the Machine's, read at run time (blink/address.c AddSegment). */
+  static const struct RgInsn b0[] = {
+      {RX_CODE + 0, 9, {0x64, 0x48, 0x8b, 0x04, 0x25, 0x28, 0, 0, 0}},
+      {RX_CODE + 9, 8, {0x48, 0x8b, 0x0c, 0x25, 0x10, 0x10, 0x60, 0x00}},
+      {RX_CODE + 17, 8, {0x48, 0x8d, 0x14, 0xbd, 0x08, 0, 0, 0}},
+      {RX_CODE + 25, 5, {0x65, 0x48, 0x89, 0x5f, 0x08}},
+      {RX_CODE + 30, 8, {0x44, 0x8b, 0x04, 0x7d, 0xf4, 0x0f, 0x60, 0x00}},
+      {RX_CODE + 38, 2, {0xeb, 0xfe}},
+  };
+  static const struct RgInsn b1[] = {{RX_CODE + 38, 2, {0xeb, 0xfe}}};
+  const struct RgInsn *blocks[2] = {b0, b1};
+  unsigned lens[2] = {6, 1};
+  struct Machine m0;
+  struct RxRun r;
+  u64 v;
+  RxMachine(&m0);
+  m0.fs.base = RX_DATA_VA - 0x20;
+  m0.gs.base = RX_DATA_VA;
+  RxExec(blocks, lens, 1, &m0, 0, &r);
+  ASSERT_EQ(0, r.err);
+  EXPECT_EQ(0u, r.rc);
+  EXPECT_EQ(RX_CODE + 38, r.m.ip);
+  memcpy(&v, "ata:0123", 8);
+  EXPECT_EQ(v, RxG(&r.m, 0)); /* fs.base + 0x28 = data + 8 */
+  memcpy(&v, "456789ab", 8);
+  EXPECT_EQ(v, RxG(&r.m, 1));
+  EXPECT_EQ(0x10u * 4 + 8, RxG(&r.m, 2));
+  memcpy(&v, &r.frames[0][0x18], 8); /* gs.base + rdi + 8 */
+  EXPECT_EQ(RxG(&m0, 3), v);
+  memcpy(&v, "89ab\0\0\0\0", 8); /* data + 0x14, zero-extended */
+  EXPECT_EQ(v, RxG(&r.m, 8));
+  EXPECT_EQ(m0.flags, r.m.flags);
 }
 
 TEST(FbxRegionExec, UnaryAuxiliaryCarryIsTheHardwares) {

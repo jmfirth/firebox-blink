@@ -209,8 +209,14 @@ extern "C" {
  *     TEST rAX,imm lift; CALL r/m lifts to CALL_INDIRECT and JMP r/m to the
  *     new JMP_INDIRECT; PUSH/POP/CALL/RET with an operand-size prefix BAILOUT
  *     (they had lifted at 8 bytes).  The per-block emitter refuses every new
- *     shape; only regions lower them. */
-#define FBX_IR_VERSION 11u
+ *     shape; only regions lower them.
+ *   12 — firebox#T3R3 (region coverage): new IR for input that bailed out
+ *     before, region lifts only.  A LOAD/STORE carries a segment override in
+ *     `seg` (the former _pad0); an absolute LOAD/STORE address (src1_kind
+ *     IMM) may take an index (src2 / dst GREG + scale) and is also the
+ *     no-base SIB form `[index*scale + disp32]`; LEA may have no base
+ *     (src1_kind NONE, index in src2). */
+#define FBX_IR_VERSION 12u
 
 /* ────────────────────────────────────────────────────────────────────────── */
 /* IR opcodes.                                                                */
@@ -400,7 +406,11 @@ struct FbxIrInst {
   u8 dst_kind;   /* FBX_IR_KIND_* */
   u8 src1_kind;  /* FBX_IR_KIND_* */
   u8 src2_kind;  /* FBX_IR_KIND_* */
-  u8 _pad0;
+  u8 seg;        /* firebox#T3R3: a LOAD/STORE's segment override, blink's
+                  * Sego(rde) (1 ES .. 6 GS; 0 none): the address gains
+                  * m->seg[seg - 1].base at run time, as blink/address.c
+                  * AddSegment does.  Region lifts only; the former `_pad0`
+                  * (same offset, zeroed by fbx_ir_inst_zero). */
   u16 _pad1;
   u32 dst;       /* vreg index or greg id */
   u32 src1;      /* vreg index or greg id or narrow imm */
