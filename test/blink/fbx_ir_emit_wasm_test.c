@@ -3742,6 +3742,98 @@ TEST(FbxRegionExec, ImulCarriesItsOverflowFlags) {
   }
 }
 
+TEST(FbxRegionExec, CmovAndTestMemoryImmediate) {
+  /* firebox#T3R3: cmovcc rdx, rbx at widths 8, 4 and 2 for every condition
+   * but P/NP, over every CF/ZF/SF/OF combination, against kConditionCode
+   * and OpCmovImpl's write (a 4-byte write zero-extends either way).  Then
+   * test [rdi+d], imm at widths 1, 4 and 8 against kAlu[ALU_AND]. */
+  static const u8 pre[3] = {0x48, 0x00, 0x66};
+  static const u32 fl[4] = {1u << 0, 1u << 6, 1u << 7, 1u << 11};
+  unsigned wi, cc, f, k;
+  for (wi = 0; wi < 3; ++wi) {
+    for (cc = 0; cc < 16; ++cc) {
+      if (cc == 0xA || cc == 0xB) continue;
+      for (f = 0; f < 16; ++f) {
+        struct RgInsn b[2];
+        const struct RgInsn *blocks[1] = {b};
+        unsigned lens[1] = {2}, n = 0;
+        struct Machine m0, om;
+        struct RxRun r;
+        u64 src = 0x8899aabbccddeeffull, old = 0x1122334455667788ull, want;
+        memset(b, 0, sizeof b);
+        if (pre[wi]) b[0].bytes[n++] = pre[wi];
+        b[0].bytes[n++] = 0x0f;
+        b[0].bytes[n++] = (u8)(0x40 + cc);
+        b[0].bytes[n++] = 0xd3;
+        b[0].ip = RX_CODE;
+        b[0].len = (u8)n;
+        b[1].ip = RX_CODE + n;
+        b[1].len = 2;
+        b[1].bytes[0] = 0xeb;
+        b[1].bytes[1] = 0xfe;
+        RxMachine(&m0);
+        m0.flags = 0x202 | (0x5Au << 24);
+        for (k = 0; k < 4; ++k) {
+          if (f & (1u << k)) m0.flags |= fl[k];
+        }
+        RxSetG(&m0, 2, old);
+        RxSetG(&m0, 3, src);
+        om = m0;
+        want = kConditionCode[cc](&om) ? src : old;
+        want = wi == 0 ? want : wi == 1 ? (u32)want
+                                        : (old & ~0xffffull) | (want & 0xffff);
+        RxExec(blocks, lens, 1, &m0, 0, &r);
+        ASSERT_EQ(0, r.err);
+        EXPECT_EQ(want, RxG(&r.m, 2));
+        EXPECT_EQ(m0.flags, r.m.flags);
+        EXPECT_EQ(RX_CODE + n, r.m.ip);
+      }
+    }
+  }
+  {
+    static const struct {
+      u8 len, bytes[12], w;
+      u32 off;
+      u64 imm;
+    } t[] = {
+        {4, {0xf6, 0x47, 0x05, 0xa5}, 1, 5, 0xa5},
+        {4, {0xf6, 0x47, 0x02, 0x80}, 1, 2, 0x80},
+        {4, {0xf6, 0x47, 0x02, 0x00}, 1, 2, 0x00},
+        {7, {0xf7, 0x47, 0x04, 0x00, 0x00, 0x00, 0x80}, 4, 4, 0x80000000u},
+        {7, {0xf7, 0x47, 0x04, 0x6e, 0x00, 0x00, 0x00}, 4, 4, 0x6e},
+        {8, {0x48, 0xf7, 0x47, 0x08, 0x00, 0x00, 0x00, 0x80}, 8, 8,
+         0xffffffff80000000ull},
+        {8, {0x48, 0xf7, 0x47, 0x08, 0x01, 0x00, 0x00, 0x00}, 8, 8, 1},
+    };
+    for (k = 0; k < sizeof t / sizeof t[0]; ++k) {
+      struct RgInsn b[2];
+      const struct RgInsn *blocks[1] = {b};
+      unsigned lens[1] = {2};
+      struct Machine m0, om;
+      struct RxRun r;
+      u64 mv = 0;
+      memset(b, 0, sizeof b);
+      b[0].ip = RX_CODE;
+      b[0].len = t[k].len;
+      memcpy(b[0].bytes, t[k].bytes, t[k].len);
+      b[1].ip = RX_CODE + t[k].len;
+      b[1].len = 2;
+      b[1].bytes[0] = 0xeb;
+      b[1].bytes[1] = 0xfe;
+      RxMachine(&m0);
+      RxSetG(&m0, 7, RX_DATA_VA);
+      om = m0;
+      memcpy(&mv, "region-data:0123456789abcdef" + t[k].off, t[k].w);
+      kAlu[ALU_AND][t[k].w == 1 ? 0 : t[k].w == 4 ? 2 : 3](&om, mv, t[k].imm);
+      RxExec(blocks, lens, 1, &m0, 0, &r);
+      ASSERT_EQ(0, r.err);
+      EXPECT_EQ(om.flags, r.m.flags);
+      EXPECT_EQ(RX_CODE + t[k].len, r.m.ip);
+      EXPECT_EQ(RX_DATA_VA, RxG(&r.m, 7));
+    }
+  }
+}
+
 TEST(FbxRegionExec, SegmentBasesAndBaselessAddresses) {
   /* firebox#T3R3: mov %fs:0x28,%rax; mov 0x601010,%rcx (no base, no index);
    * lea 0x8(,%rdi,4),%rdx (no base); mov %rbx,%gs:0x8(%rdi); mov

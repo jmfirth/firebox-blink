@@ -245,6 +245,7 @@ static const char *const kOpcodeNames[FBX_IR_OP_LAST_] = {
     [FBX_IR_OP_SHR] = "SHR",
     [FBX_IR_OP_SAR] = "SAR",
     [FBX_IR_OP_SEXT] = "SEXT",
+    [FBX_IR_OP_CMOV] = "CMOV",
 };
 
 const char *fbx_ir_opcode_name(u8 opcode) {
@@ -512,6 +513,10 @@ static int LiftOperandRoles(u64 mop) {
     case 0x0F7: case 0x0FF: /* firebox#T3R2: groups 3 and 5 */
     case 0x0C1: case 0x0D1: case 0x0D3: /* firebox#T3R3: group 2 */
     case 0x063: case 0x1BF: /* firebox#T3R3: MOVSXD, MOVSX r, r/m16 */
+    case 0x140: case 0x141: case 0x142: case 0x143: /* firebox#T3R3: CMOVcc */
+    case 0x144: case 0x145: case 0x146: case 0x147:
+    case 0x148: case 0x149: case 0x14A: case 0x14B:
+    case 0x14C: case 0x14D: case 0x14E: case 0x14F:
       return FBX_LIFT_HAS_MODRM;
     case 0x08D:
       return FBX_LIFT_HAS_MODRM | FBX_LIFT_NO_SEG;
@@ -1270,7 +1275,14 @@ static int LiftUnaryRegion(struct LiftCtx *ctx, u64 rde, i64 disp, u64 uimm0,
     ctx->flags |= FBX_IR_BLOCK_FLAG_HAS_INDIRECT_BR;
     return 1;
   }
-  if (!IsModrmRegister(rde)) return -1; /* read-modify-write: Tier 1 */
+  if (!IsModrmRegister(rde)) {
+    /* firebox#T3R3: TEST [m], imm only reads memory. */
+    if ((mop == 0x0F6 || mop == 0x0F7) && sub == 0) {
+      return LiftAluMemRegion(ctx, rde, disp, width, FBX_IR_OP_TEST,
+                              /*mem_is_lhs=*/1, /*imm_rhs=*/1, uimm0);
+    }
+    return -1; /* read-modify-write: Tier 1 */
+  }
   if (mop == 0x0F6 || mop == 0x0F7) {
     switch (sub) {
       case 0: /* TEST r, imm */
@@ -1689,6 +1701,41 @@ static int LiftByteSourceRegion(struct LiftCtx *ctx, u64 rde, u32 *out) {
   return 1;
 }
 
+/* firebox#T3R3 — CMOVcc r, r (0F 40..4F), regions only.  blink/machine.c
+ * OpCmovImpl: the destination is written either way (WriteRegister: a
+ * 4-byte write zero-extends even when the condition fails).  The memory
+ * form, and P/NP (no region predicate for PF), stay with Tier 1. */
+static int LiftCmovRegion(struct LiftCtx *ctx, u64 rde, u64 mop) {
+  u8 width = WidthFromRde(rde, 0);
+  u32 src, old, z;
+  struct FbxIrInst *cm, *set;
+  if (!ctx->region || !IsModrmRegister(rde)) return -1;
+  if ((mop & 0xEu) == 0xAu) return -1;
+  if (!LiftGetReg(ctx, width, (u32)RexbRm(rde), &src)) return 0;
+  if (!LiftGetReg(ctx, width, (u32)RexrReg(rde), &old)) return 0;
+  cm = CtxEmit(ctx);
+  if (!cm) return 0;
+  z = CtxAllocVreg(ctx);
+  cm->opcode = FBX_IR_OP_CMOV;
+  cm->width = width;
+  cm->dst_kind = FBX_IR_KIND_VREG;
+  cm->dst = z;
+  cm->src1_kind = FBX_IR_KIND_VREG;
+  cm->src1 = src;
+  cm->src2_kind = FBX_IR_KIND_VREG;
+  cm->src2 = old;
+  cm->imm = mop & 0xFu;
+  set = CtxEmit(ctx);
+  if (!set) return 0;
+  set->opcode = FBX_IR_OP_REG_SET;
+  set->width = width;
+  set->dst_kind = FBX_IR_KIND_GREG;
+  set->dst = (u32)RexrReg(rde);
+  set->src1_kind = FBX_IR_KIND_VREG;
+  set->src1 = z;
+  return 1;
+}
+
 /* firebox#T3R3 — sign extension, regions only:
  *   0x063 MOVSXD r64, r/m32 (REX.W)      0x1BE MOVSX r, r/m8
  *   0x1BF MOVSX r, r/m16                 0x098 CWDE (EAX = sext AX) and
@@ -1935,6 +1982,11 @@ static int LiftOneOp(struct LiftCtx *ctx, const struct FbxTcEntry *e,
     case 0x1B7: return LiftMovzx(ctx, rde, e->disp, 2);
     case 0x063: case 0x098: case 0x1BE: case 0x1BF: /* firebox#T3R3 */
       return LiftSextRegion(ctx, rde, e->disp, mop);
+    case 0x140: case 0x141: case 0x142: case 0x143: /* firebox#T3R3 */
+    case 0x144: case 0x145: case 0x146: case 0x147:
+    case 0x148: case 0x149: case 0x14A: case 0x14B:
+    case 0x14C: case 0x14D: case 0x14E: case 0x14F:
+      return LiftCmovRegion(ctx, rde, mop);
     /* ALU group r/m, imm — 0x80 (byte imm), 0x81 (imm32), 0x83 (imm8 sx). */
     case 0x080: return LiftAlui(ctx, rde, e->disp, e->uimm0, 1);
     case 0x081:

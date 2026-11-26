@@ -821,6 +821,7 @@ static int CoverageGateMode(const struct FbxIrBlock *ir,
       case FBX_IR_OP_SHR:
       case FBX_IR_OP_SAR:
       case FBX_IR_OP_SEXT:
+      case FBX_IR_OP_CMOV:
         if (region) continue;
         SetFail(fail, FBX_IR_EMIT_UNSUPPORTED_OPCODE, op);
         return 0;
@@ -877,6 +878,10 @@ static int CoverageGateMode(const struct FbxIrBlock *ir,
         case 0x0A8: case 0x0A9:
         case 0x0C1: case 0x0D1: case 0x0D3: /* firebox#T3R3 */
         case 0x063: case 0x098: case 0x1BE: case 0x1BF:
+        case 0x140: case 0x141: case 0x142: case 0x143:
+        case 0x144: case 0x145: case 0x146: case 0x147:
+        case 0x148: case 0x149: case 0x14C: case 0x14D:
+        case 0x14E: case 0x14F: /* not P/NP (0x14A/0x14B) */
           ok = 1;
           break;
         case 0x0C6: case 0x0C7:
@@ -4407,6 +4412,13 @@ int fbx_ir_region_member_ok(const struct FbxIrBlock *ir,
               p->src2_kind == FBX_IR_KIND_VREG && p->src2 < ir->nvregs &&
               (p->width == 2 || p->width == 4 || p->width == 8);
         break;
+      case FBX_IR_OP_CMOV: /* firebox#T3R3 */
+        ok &= p->dst_kind == FBX_IR_KIND_VREG && p->dst < ir->nvregs &&
+              p->src1_kind == FBX_IR_KIND_VREG && p->src1 < ir->nvregs &&
+              p->src2_kind == FBX_IR_KIND_VREG && p->src2 < ir->nvregs &&
+              (p->width == 2 || p->width == 4 || p->width == 8) &&
+              p->imm < 16 && (p->imm & 0xEu) != 0xAu;
+        break;
       case FBX_IR_OP_SEXT: /* firebox#T3R3 */
         ok &= p->dst_kind == FBX_IR_KIND_VREG && p->dst < ir->nvregs &&
               p->src1_kind == FBX_IR_KIND_VREG && p->src1 < ir->nvregs &&
@@ -5380,6 +5392,16 @@ static int RegionEmitMember(struct RegionEmit *r, u32 i) {
           RegionI64Const(b, WidthMask(p->width));
           fbx_wasm_buffer_u8(b, WASM_OP_I64_AND);
         }
+        fbx_wasm_buffer_u8(b, WASM_OP_LOCAL_SET);
+        fbx_wasm_buffer_uleb(b, VregLocal(p->dst));
+        break;
+      case FBX_IR_OP_CMOV: /* firebox#T3R3 */
+        fbx_wasm_buffer_u8(b, WASM_OP_LOCAL_GET);
+        fbx_wasm_buffer_uleb(b, VregLocal(p->src1));
+        fbx_wasm_buffer_u8(b, WASM_OP_LOCAL_GET);
+        fbx_wasm_buffer_uleb(b, VregLocal(p->src2));
+        if (!EmitJccPredicate(b, (u32)p->imm)) return 0;
+        fbx_wasm_buffer_u8(b, WASM_OP_SELECT);
         fbx_wasm_buffer_u8(b, WASM_OP_LOCAL_SET);
         fbx_wasm_buffer_uleb(b, VregLocal(p->dst));
         break;
