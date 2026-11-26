@@ -398,6 +398,11 @@ void Fbxt2ResetEnvCacheForTest(void) {
 /* firebox#T3R2: store-log entries a verifying region carries (its ctx is
  * allocated with the log behind it; see FBX_REGION_EMIT_LOG). */
 #define FBX_T2_REGION_LOG_CAP 1024u
+/* firebox#T3R3: a pending region's retries (Fbxt2TryRegion). */
+#define FBX_T2_REGION_PENDING_MAX_ATTEMPTS 200u
+#define FBX_T2_REGION_RETRY_MIN_STRIDE 1024u
+_Static_assert(FBX_T2_REGION_PENDING_MAX_ATTEMPTS < 256u,
+               "pending_attempts is a u8");
 
 struct Fbxt2RegionCtx {
   struct FbxT2BlockCtx ctx; /* first: the module reads it */
@@ -510,6 +515,21 @@ static int Fbxt2TryRegion(struct Machine *m, struct FbxTcBlock *b,
   enum FbxIrEmitFailReason why = FBX_IR_EMIT_OK;
   u8 why_op = 0;
   int logging = g_t2_region_verify_every != 0;
+  u32 nm;
+  if (st->region_wasm) {
+    /* firebox#T3R3: the compile of this region is pending.  Offer the same
+     * bytes again: re-forming the region would offer a different module
+     * whenever a member's hotness moved, queueing one more compile on the
+     * host's single worker each time and never landing the first. */
+    fbx_ir_free(entry_ir);
+    buf.data = st->region_wasm;
+    buf.len = st->region_wasm_len;
+    buf.cap = st->region_wasm_len;
+    buf.oom = 0;
+    st->region_wasm = NULL; /* ownership back here until the outcome */
+    nm = st->region_members;
+    goto offer;
+  }
   if (!entry_ir) return 0;
   if (!fbx_ir_region_member_ok(entry_ir, b, &why, &why_op)) {
     T2TraceLine(g_t2_trace_verbose,
@@ -569,6 +589,8 @@ static int Fbxt2TryRegion(struct Machine *m, struct FbxTcBlock *b,
                 (unsigned long long)b->start_pc);
     goto done;
   }
+  nm = n;
+offer:
   {
     size_t sz = logging ? sizeof(struct Fbxt2RegionCtx)
                         : sizeof(struct FbxT2BlockCtx);
@@ -593,27 +615,35 @@ static int Fbxt2TryRegion(struct Machine *m, struct FbxTcBlock *b,
   }
   funcref = fbx_t2_instantiate((u64)(uintptr_t)m->system, buf.data,
                                (u32)buf.len, ctx);
-  fbx_wasm_buffer_free(&buf);
   if (funcref == FBX_T2_INSTANTIATE_PENDING) {
-    /* Same bounded retry as the per-block path (see Fbxt2TryEscalate). */
+    /* firebox#T3R3: keep the bytes (see above) and poll on a stride that
+     * starts at 1024 hits and doubles to 65536: a retry is
+     * now only a cache probe, so it is cheap to make often, and the one
+     * worker may need seconds to reach this module under load. */
+    u32 shift = st->pending_attempts < 6u ? st->pending_attempts : 6u;
     free(ctx);
     T2TraceLine(g_t2_trace_escalations,
                 "[t2 escalate] sys=%p pc=%#llx outcome=region_pending "
                 "members=%u attempts=%u\n",
                 (void *)m->system, (unsigned long long)b->start_pc,
-                (unsigned)n, (unsigned)st->pending_attempts + 1u);
-    if (++st->pending_attempts < FBX_T2_PENDING_MAX_ATTEMPTS) {
+                (unsigned)nm, (unsigned)st->pending_attempts + 1u);
+    if (++st->pending_attempts < FBX_T2_REGION_PENDING_MAX_ATTEMPTS) {
+      st->region_wasm = buf.data;
+      st->region_wasm_len = (u32)buf.len;
+      st->region_members = nm;
       st->attempted = 0;
-      st->retry_at_hits = b->hits + FBX_T2_PENDING_RETRY_STRIDE;
+      st->retry_at_hits = b->hits + (FBX_T2_REGION_RETRY_MIN_STRIDE << shift);
       handled = 1;
     } else {
-      /* Out of attempts (membership may have kept changing the bytes): stop
-       * trying regions here and give the per-block path its own attempts. */
+      /* Out of attempts: stop trying regions here and give the per-block
+       * path its own attempts. */
+      fbx_wasm_buffer_free(&buf);
       st->region = FBX_T2_REGION_ABANDONED;
       st->pending_attempts = 0;
     }
     goto done;
   }
+  fbx_wasm_buffer_free(&buf);
   if (funcref < 0) {
     free(ctx);
     goto done;
@@ -622,12 +652,12 @@ static int Fbxt2TryRegion(struct Machine *m, struct FbxTcBlock *b,
   st->funcref = funcref;
   st->region = FBX_T2_REGION_INSTALLED;
   atomic_fetch_add_explicit(&g_t2_region_stats.built, 1, memory_order_relaxed);
-  atomic_fetch_add_explicit(&g_t2_region_stats.members, n,
+  atomic_fetch_add_explicit(&g_t2_region_stats.members, nm,
                             memory_order_relaxed);
   T2TraceLine(g_t2_trace_escalations,
               "[t2 escalate] sys=%p pc=%#llx outcome=region members=%u "
               "funcref=%d\n",
-              (void *)m->system, (unsigned long long)b->start_pc, (unsigned)n,
+              (void *)m->system, (unsigned long long)b->start_pc, (unsigned)nm,
               funcref);
   handled = 1;
 done:

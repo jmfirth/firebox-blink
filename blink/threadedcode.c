@@ -535,6 +535,8 @@ static void T2MapDropAll(struct FbxT2MachineState *ms) {
       /* firebox#719 ctx, owned by this Machine alone. */
       free(ms->slots[i].block_ctx);
       ms->slots[i].block_ctx = NULL;
+      free(ms->slots[i].region_wasm); /* firebox#T3R3 */
+      ms->slots[i].region_wasm = NULL;
       ms->slots[i].used = 0;
     }
   }

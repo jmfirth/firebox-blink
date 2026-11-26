@@ -151,6 +151,12 @@ struct FbxT2BlockState {
   u32 dispatches;
   u32 filled;
   u32 retry_at_hits;
+  /* firebox#T3R3: a region whose compile is still pending keeps the bytes it
+   * offered (malloc'd; freed on install, abandon and map drop), so every
+   * retry offers the same module rather than re-forming the region. */
+  u8 *region_wasm;
+  u32 region_wasm_len;
+  u32 region_members;
 };
 
 /* firebox#HYS — a Machine's Tier-2 map.  Open-addressed, linear-probed,
