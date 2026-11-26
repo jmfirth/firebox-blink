@@ -332,6 +332,22 @@ u8 *ResolveAddress(struct Machine *m, i64 v) {
   ThrowSegmentationFault(m, v);
 }
 
+/* firebox#KPA: ResolveAddress for a WRITE.  ResolveAddress asks the page for
+ * PAGE_U only, so every store that reached guest memory through it
+ * (PUSH/CALL via AccessRam, BeginStore's STOS/MOVS/FPU/SSE stores, the moffs
+ * MOV forms, the REP MOVSB/STOSB fast paths) succeeded on a PROT_READ page,
+ * where Linux raises SIGSEGV with SEGV_ACCERR.  At CPL 3 this also asks for
+ * PAGE_RW, the mask ReserveAddress already uses for a writable access;
+ * LookupAddress2 sets SEGV_ACCERR on the mismatch. */
+u8 *ResolveAddressWrite(struct Machine *m, i64 v) {
+  u8 *r;
+  u64 need;
+  if (HasLinearMapping()) return ToHost(v);
+  need = Cpl(m) == 3 ? PAGE_U | PAGE_RW : 0;
+  if ((r = LookupAddress2(m, v, need, need))) return r;
+  ThrowSegmentationFault(m, v);
+}
+
 bool IsValidMemory(struct Machine *m, i64 virt, i64 size, int prot) {
   i64 p, pe;
   u64 pte, mask, need;
@@ -478,13 +494,17 @@ u8 *ReserveAddress(struct Machine *m, i64 v, size_t n, bool writable) {
   }
 }
 
+/* `protect_rom` is set exactly for a store (AccessRam's !d), which must find
+ * the page writable (firebox#KPA). */
 static u8 *AccessRam2(struct Machine *m, i64 v, size_t n, void *p[2], u8 *tmp,
                       bool copy, bool protect_rom) {
   u8 *a, *b;
   unsigned k;
+  u8 *(*resolve)(struct Machine *, i64) =
+      protect_rom ? ResolveAddressWrite : ResolveAddress;
   unassert(n <= 4096);
   if ((v & 4095) + n <= 4096) {
-    a = ResolveAddress(m, v);
+    a = resolve(m, v);
     if (!protect_rom || !IsRomAddress(m, a)) return a;
     if (copy) memcpy(tmp, a, n);
     return tmp;
@@ -493,8 +513,8 @@ static u8 *AccessRam2(struct Machine *m, i64 v, size_t n, void *p[2], u8 *tmp,
   k = 4096;
   k -= v & 4095;
   unassert(k <= 4096);
-  a = ResolveAddress(m, v);
-  b = ResolveAddress(m, v + k);
+  a = resolve(m, v);
+  b = resolve(m, v + k);
   if (copy) {
     memcpy(tmp, a, k);
     memcpy(tmp + k, b, n - k);

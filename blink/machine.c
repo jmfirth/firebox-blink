@@ -352,7 +352,7 @@ static void OpMovAlOb(P) {
 static void OpMovObAl(P) {
   i64 addr = AddressOb(A);
   SetReadAddr(m, addr, 1);
-  Store8(ResolveAddress(m, addr), Get8(m->ax));
+  Store8(ResolveAddressWrite(m, addr), Get8(m->ax)); /* firebox#KPA */
 }
 
 static void OpMovRaxOvqp(P) {
@@ -364,7 +364,7 @@ static void OpMovRaxOvqp(P) {
 static void OpMovOvqpRax(P) {
   i64 v = DataSegment(A, disp);
   SetWriteAddr(m, v, 1 << RegLog2(rde));
-  WriteMemory(rde, ResolveAddress(m, v), Get64(m->ax));
+  WriteMemory(rde, ResolveAddressWrite(m, v), Get64(m->ax)); /* firebox#KPA */
 }
 
 static void OpMovEbGb(P) {
