@@ -784,12 +784,36 @@ static int LiftLoadOperand(struct LiftCtx *ctx, u64 rde, i64 disp, u8 width,
  * (MOV r/m, imm).  STORE encoding: src1 GREG base or src1_kind IMM with the
  * absolute VA in imm; src2 VREG value; the optional SIB index rides in dst
  * (GREG) with `scale`; imm is the disp for the register forms. */
+static int LiftEmitStore(struct LiftCtx *ctx, const struct LiftAddr *a,
+                         u8 width, u32 val_vreg) {
+  struct FbxIrInst *st = CtxEmit(ctx);
+  if (!st) return 0;
+  st->opcode = FBX_IR_OP_STORE;
+  st->width = width;
+  st->src2_kind = FBX_IR_KIND_VREG;
+  st->src2 = val_vreg;
+  st->seg = a->seg;
+  if (a->abs) {
+    st->src1_kind = FBX_IR_KIND_IMM;
+    st->imm = a->va;
+  } else {
+    st->src1_kind = FBX_IR_KIND_GREG;
+    st->src1 = a->base;
+    st->imm = (u64)a->disp;
+  }
+  if (a->scale != 0) {
+    st->dst_kind = FBX_IR_KIND_GREG;
+    st->dst = a->index;
+    st->scale = a->scale;
+  }
+  return 1;
+}
+
 static int LiftStoreRegion(struct LiftCtx *ctx, u64 rde, i64 disp, u8 width,
                            int imm_src, u64 uimm0) {
   struct LiftAddr a;
   u32 val_vreg;
   struct FbxIrInst *get;
-  struct FbxIrInst *st;
   if (!LiftClassifyAddr(ctx, rde, disp, &a)) return -1;
   get = CtxEmit(ctx);
   if (!get) return 0;
@@ -805,27 +829,7 @@ static int LiftStoreRegion(struct LiftCtx *ctx, u64 rde, i64 disp, u8 width,
     get->src1_kind = FBX_IR_KIND_GREG;
     get->src1 = (u32)RexrReg(rde);
   }
-  st = CtxEmit(ctx);
-  if (!st) return 0;
-  st->opcode = FBX_IR_OP_STORE;
-  st->width = width;
-  st->src2_kind = FBX_IR_KIND_VREG;
-  st->src2 = val_vreg;
-  st->seg = a.seg;
-  if (a.abs) {
-    st->src1_kind = FBX_IR_KIND_IMM;
-    st->imm = a.va;
-  } else {
-    st->src1_kind = FBX_IR_KIND_GREG;
-    st->src1 = a.base;
-    st->imm = (u64)a.disp;
-  }
-  if (a.scale != 0) {
-    st->dst_kind = FBX_IR_KIND_GREG;
-    st->dst = a.index;
-    st->scale = a.scale;
-  }
-  return 1;
+  return LiftEmitStore(ctx, &a, width, val_vreg);
 }
 
 /* Emit `vreg = LOAD{load_width} [base (+ index*scale) + disp]` and
@@ -1225,12 +1229,75 @@ static int LiftAluTail(struct LiftCtx *ctx, u8 width, u8 op, u32 lhs, u32 rhs,
  * READ memory only: `op r, [m]` (r is the destination), `cmp/test [m], r`,
  * and `cmp [m], imm`.  The read-modify-write forms (`op [m], r`, `op [m],
  * imm` for every op but CMP/TEST) are refused: Tier 1 runs them. */
+/* firebox#T3R3 — read-modify-write `op [m], src`, regions only: LOAD, the
+ * ALU op, a STORE to the same address, then the flags.  The STORE comes
+ * before the flags so a STORE that misses (no write permission, a page not
+ * mapped writable yet) leaves at this instruction with nothing committed;
+ * Tier 1 runs it again from the start.  `kind` is the SET_FLAGS_RAW kind,
+ * 0 for NOT.  The LOCK forms never reach here (LiftOperandShapeUnmodelled). */
+static int LiftRmwRegion(struct LiftCtx *ctx, u64 rde, i64 disp, u8 width,
+                         u8 op, u32 o, u8 kind, int sub_from_zero) {
+  struct LiftAddr a;
+  struct FbxIrInst *ld, *alu, *fl;
+  u32 m, z;
+  if (!ctx->region) return -1;
+  if (!LiftClassifyAddr(ctx, rde, disp, &a)) return -1;
+  ld = CtxEmit(ctx);
+  if (!ld) return 0;
+  m = CtxAllocVreg(ctx);
+  ld->opcode = FBX_IR_OP_LOAD;
+  ld->width = width;
+  ld->dst_kind = FBX_IR_KIND_VREG;
+  ld->dst = m;
+  LiftSetLoadAddr(ld, &a);
+  if (sub_from_zero) { /* NEG: 0 - m */
+    if (!LiftGetImm(ctx, width, 0, &o)) return 0;
+  }
+  alu = CtxEmit(ctx);
+  if (!alu) return 0;
+  z = CtxAllocVreg(ctx);
+  alu->opcode = op;
+  alu->width = width;
+  alu->dst_kind = FBX_IR_KIND_VREG;
+  alu->dst = z;
+  alu->src1_kind = FBX_IR_KIND_VREG;
+  alu->src1 = sub_from_zero ? o : m;
+  alu->src2_kind = FBX_IR_KIND_VREG;
+  alu->src2 = sub_from_zero ? m : o;
+  if (!LiftEmitStore(ctx, &a, width, z)) return 0;
+  if (kind) {
+    fl = CtxEmit(ctx);
+    if (!fl) return 0;
+    fl->opcode = FBX_IR_OP_SET_FLAGS_RAW;
+    fl->width = width;
+    fl->imm = kind;
+    fl->src1_kind = FBX_IR_KIND_VREG;
+    fl->src2_kind = FBX_IR_KIND_VREG;
+    if (sub_from_zero) {
+      fl->src1 = m; /* FBX_IR_FLAGS_NEG: src1 = x */
+      fl->src2 = m;
+    } else {
+      fl->src1 = m;
+      fl->src2 = o;
+    }
+  }
+  return 1;
+}
+
 static int LiftAluMemRegion(struct LiftCtx *ctx, u64 rde, i64 disp, u8 width,
                             u8 op, int mem_is_lhs, int imm_rhs, u64 uimm0) {
   u32 m, o;
   int rc;
   if (!ctx->region) return -1;
-  if (mem_is_lhs && op != FBX_IR_OP_CMP && op != FBX_IR_OP_TEST) return -1;
+  if (mem_is_lhs && op != FBX_IR_OP_CMP && op != FBX_IR_OP_TEST) {
+    /* firebox#T3R3: read-modify-write */
+    if (imm_rhs) {
+      if (!LiftGetImm(ctx, width, uimm0, &o)) return 0;
+    } else {
+      if (!LiftGetReg(ctx, width, (u32)RexrReg(rde), &o)) return 0;
+    }
+    return LiftRmwRegion(ctx, rde, disp, width, op, o, op, 0);
+  }
   rc = LiftLoadOperand(ctx, rde, disp, width, &m);
   if (rc <= 0) return rc;
   if (imm_rhs) {
@@ -1276,12 +1343,28 @@ static int LiftUnaryRegion(struct LiftCtx *ctx, u64 rde, i64 disp, u64 uimm0,
     return 1;
   }
   if (!IsModrmRegister(rde)) {
-    /* firebox#T3R3: TEST [m], imm only reads memory. */
-    if ((mop == 0x0F6 || mop == 0x0F7) && sub == 0) {
-      return LiftAluMemRegion(ctx, rde, disp, width, FBX_IR_OP_TEST,
-                              /*mem_is_lhs=*/1, /*imm_rhs=*/1, uimm0);
+    /* firebox#T3R3: TEST [m], imm only reads memory; NOT, NEG, INC and
+     * DEC [m] are read-modify-write (LiftRmwRegion). */
+    if (mop == 0x0F6 || mop == 0x0F7) {
+      switch (sub) {
+        case 0:
+          return LiftAluMemRegion(ctx, rde, disp, width, FBX_IR_OP_TEST,
+                                  /*mem_is_lhs=*/1, /*imm_rhs=*/1, uimm0);
+        case 2:
+          if (!LiftGetImm(ctx, width, ~(u64)0, &k)) return 0;
+          return LiftRmwRegion(ctx, rde, disp, width, FBX_IR_OP_XOR, k, 0, 0);
+        case 3:
+          return LiftRmwRegion(ctx, rde, disp, width, FBX_IR_OP_SUB, 0,
+                               FBX_IR_FLAGS_NEG, 1);
+        default:
+          return -1;
+      }
     }
-    return -1; /* read-modify-write: Tier 1 */
+    if (sub != 0 && sub != 1) return -1;
+    if (!LiftGetImm(ctx, width, 1, &k)) return 0;
+    return LiftRmwRegion(ctx, rde, disp, width,
+                         sub == 0 ? FBX_IR_OP_ADD : FBX_IR_OP_SUB, k,
+                         sub == 0 ? FBX_IR_FLAGS_INC : FBX_IR_FLAGS_DEC, 0);
   }
   if (mop == 0x0F6 || mop == 0x0F7) {
     switch (sub) {

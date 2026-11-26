@@ -2746,8 +2746,19 @@ TEST(FbxRegion, MembersThatCannotBeLoweredAreRefused) {
   EXPECT_EQ(0, RegionMemberOkBytes(movsx16, 2));
   EXPECT_EQ(0, RegionMemberOkBytes(hbdst, 2));
   EXPECT_EQ(0, RegionMemberOkBytes(sys, 1));
-  EXPECT_EQ(0, RegionMemberOkBytes(rmw, 2));
-  EXPECT_EQ(0, RegionMemberOkBytes(incm, 2));
+  EXPECT_EQ(1, RegionMemberOkBytes(rmw, 2));  /* firebox#T3R3 */
+  EXPECT_EQ(1, RegionMemberOkBytes(incm, 2));
+  {
+    static const struct RgInsn adcm[] = { /* adc [rax], ebx ; jne */
+        {0x1000, 2, {0x11, 0x18}}, {0x1002, 2, {0x75, 0xfc}}};
+    static const struct RgInsn sbbmi[] = { /* sbb dword [rax], 1 ; jne */
+        {0x1000, 3, {0x83, 0x18, 0x01}}, {0x1003, 2, {0x75, 0xfb}}};
+    static const struct RgInsn lockadd[] = { /* lock add [rax], ebx ; jne */
+        {0x1000, 3, {0xf0, 0x01, 0x18}}, {0x1003, 2, {0x75, 0xfb}}};
+    EXPECT_EQ(0, RegionMemberOkBytes(adcm, 2));
+    EXPECT_EQ(0, RegionMemberOkBytes(sbbmi, 2));
+    EXPECT_EQ(0, RegionMemberOkBytes(lockadd, 2));
+  }
   EXPECT_EQ(0, RegionMemberOkBytes(push16, 2));
   EXPECT_EQ(0, RegionMemberOkBytes(mulr, 2));
   EXPECT_EQ(0, RegionMemberOkBytes(pushm, 2));
@@ -3831,6 +3842,84 @@ TEST(FbxRegionExec, CmovAndTestMemoryImmediate) {
       EXPECT_EQ(RX_CODE + t[k].len, r.m.ip);
       EXPECT_EQ(RX_DATA_VA, RxG(&r.m, 7));
     }
+  }
+}
+
+TEST(FbxRegionExec, ReadModifyWriteMemory) {
+  /* firebox#T3R3: `op [m], r`, `op [m], imm`, INC/DEC/NEG/NOT [m] against
+   * kAlu on the same operands: the memory written and the flags.  Then the
+   * same `add [m], 1` on the read-only page leaves at the instruction with
+   * memory and flags untouched. */
+  static const struct {
+    u8 len, bytes[8], w, alu;
+    u32 off;
+    u64 y;
+  } t[] = {
+      {3, {0x48, 0x01, 0x1f}, 8, ALU_ADD, 0, 0x8000000180000081ull},
+      {3, {0x29, 0x5f, 0x04}, 4, ALU_SUB, 4, 0x80000081ull},
+      {3, {0x20, 0x5f, 0x03}, 1, ALU_AND, 3, 0x81},
+      {2, {0x08, 0x1f}, 1, ALU_OR, 0, 0x81},
+      {3, {0x83, 0x07, 0x01}, 4, ALU_ADD, 0, 1},
+      {5, {0x48, 0x83, 0x6f, 0x08, 0x80}, 8, ALU_SUB, 8, 0xffffffffffffff80ull},
+      {4, {0x80, 0x77, 0x02, 0xff}, 1, ALU_XOR, 2, 0xff},
+      {7, {0x81, 0x4f, 0x04, 0x00, 0x00, 0x00, 0x80}, 4, ALU_OR, 4, 0x80000000u},
+      {5, {0x66, 0x83, 0x47, 0x06, 0x7f}, 2, ALU_ADD, 6, 0x7f},
+      {2, {0xff, 0x07}, 4, ALU_INC, 0, 0},
+      {4, {0x48, 0xff, 0x4f, 0x08}, 8, ALU_DEC, 8, 0},
+      {3, {0xf6, 0x5f, 0x01}, 1, ALU_NEG, 1, 0},
+      {3, {0xf7, 0x57, 0x04}, 4, ALU_NOT, 4, 0},
+  };
+  static const char kData[] = "region-data:0123456789abcdef";
+  unsigned k;
+  for (k = 0; k < sizeof t / sizeof t[0]; ++k) {
+    struct RgInsn b[2];
+    const struct RgInsn *blocks[1] = {b};
+    unsigned lens[1] = {2}, len = t[k].len;
+    struct Machine m0, om;
+    struct RxRun r;
+    u64 x = 0, z, got = 0;
+    memset(b, 0, sizeof b);
+    b[0].ip = RX_CODE;
+    b[0].len = (u8)len;
+    memcpy(b[0].bytes, t[k].bytes, len);
+    b[1].ip = RX_CODE + len;
+    b[1].len = 2;
+    b[1].bytes[0] = 0xeb;
+    b[1].bytes[1] = 0xfe;
+    RxMachine(&m0);
+    m0.flags = 0x202 | 0x8d5 | (0x33u << 24);
+    RxSetG(&m0, 3, 0x8000000180000081ull);
+    RxSetG(&m0, 7, RX_DATA_VA);
+    om = m0;
+    memcpy(&x, kData + t[k].off, t[k].w);
+    z = (u64)kAlu[t[k].alu][t[k].w == 1 ? 0 : t[k].w == 2 ? 1 : t[k].w == 4 ? 2 : 3](
+        &om, x, t[k].y);
+    RxExec(blocks, lens, 1, &m0, 0, &r);
+    if (r.err) fprintf(stderr, "rmw case %u: %s\n", k, r.why);
+    ASSERT_EQ(0, r.err);
+    memcpy(&got, &r.frames[0][t[k].off], t[k].w);
+    EXPECT_EQ(t[k].w == 8 ? z : z & ((1ull << (8 * t[k].w)) - 1), got);
+    EXPECT_EQ(om.flags, r.m.flags);
+    EXPECT_EQ(RX_CODE + len, r.m.ip);
+    EXPECT_EQ(0, memcmp(r.frames[0] + t[k].off + t[k].w,
+                        kData + t[k].off + t[k].w, 4));
+  }
+  {
+    static const struct RgInsn ro[] = {{RX_CODE, 3, {0x83, 0x07, 0x01}},
+                                       {RX_CODE + 3, 2, {0xeb, 0xfe}}};
+    const struct RgInsn *blocks[1] = {ro};
+    unsigned lens[1] = {2};
+    struct Machine m0;
+    struct RxRun r;
+    RxMachine(&m0);
+    m0.flags = 0x202 | 0x8d5 | (0x33u << 24);
+    RxSetG(&m0, 7, RX_RO_VA);
+    RxExec(blocks, lens, 1, &m0, 0, &r);
+    ASSERT_EQ(0, r.err);
+    EXPECT_EQ(RX_CODE, r.m.ip);
+    EXPECT_EQ(m0.flags, r.m.flags);
+    EXPECT_EQ(0, r.frames[1][0]);
+    EXPECT_EQ(0u, r.log_used);
   }
 }
 
