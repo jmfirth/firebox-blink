@@ -1798,6 +1798,7 @@ struct FbxIrBlock *fbx_ir_lift_region(const struct FbxTcBlock *tc) {
 
 static struct FbxIrBlock *LiftBlock(const struct FbxTcBlock *tc, int region) {
   struct LiftCtx ctx;
+  u32 mark;
   struct FbxIrBlock *blk;
   u32 i;
   /* firebox#CM4 — the PC after the last op we successfully lifted; the target
@@ -1843,6 +1844,7 @@ static struct FbxIrBlock *LiftBlock(const struct FbxTcBlock *tc, int region) {
       }
     }
     if (!EmitPcMark(&ctx, e->ip)) goto fail;
+    mark = ctx.ninsts;
     ctx.next_pc = next_pc;
     /* firebox#T3R2: the region lowerings assume 64-bit mode (stack width,
      * RIP-relative addressing); anything else stays on Tier 1. */
@@ -1853,7 +1855,10 @@ static struct FbxIrBlock *LiftBlock(const struct FbxTcBlock *tc, int region) {
     }
     if (rc == 0) goto fail; /* alloc */
     if (rc < 0) {
-      /* Unsupported opcode — emit BAILOUT and stop. */
+      /* Unsupported opcode — emit BAILOUT and stop.  firebox#T3R2: drop
+       * anything the lifter emitted for this instruction before refusing
+       * it, so the bailout follows only whole instructions. */
+      ctx.ninsts = mark;
       if (!EmitBailout(&ctx, e->ip, FBX_IR_BAILOUT_UNSUPPORTED)) goto fail;
       break;
     }
