@@ -174,10 +174,23 @@ static bool g_t2_region = false;
 static bool g_t2_region_count = false;
 static u32 g_t2_region_verify_every = 0;
 
+static void Fbxt2RegionEnv(void);
+static bool g_t2_region;
+
+/* firebox#T3R2: with regions on, a block escalates (and a region takes a
+ * member) only once it is this hot.  At the per-block default of 100, the
+ * region path compiles hundreds of lukewarm regions per run and its members
+ * are the blocks that happened to be hot first: MEASURED on py, user CPU 77s
+ * against stock's 35-46s; at 20000, 20s, and rg 16s against 55s (sweep of
+ * 1000/5000/20000/100000 in the #T3R2 report). */
+#define FBX_T2_REGION_HOTNESS_THRESHOLD 20000u
+
 u32 Fbxt2HotnessThreshold(void) {
   if (!g_t2_threshold_cached) {
     const char *e = getenv("FBX_T2_HOTNESS_THRESHOLD");
     g_t2_threshold_cached = 1;
+    Fbxt2RegionEnv();
+    g_t2_threshold = g_t2_region ? FBX_T2_REGION_HOTNESS_THRESHOLD : 100u;
     if (e && *e) {
       long v = strtol(e, NULL, 10);
       if (v > 0 && v <= 1000000L) {
