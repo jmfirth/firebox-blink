@@ -198,8 +198,19 @@ extern "C" {
  *   10 — firebox#JJJ: LOAD gains an optional SIB index (src2 GREG + scale,
  *     `[base + index*scale + disp]`), and MOVZX r, m8/m16 lifts to a narrow
  *     LOAD + REG_SET instead of a BAILOUT.  The same IR bytes mean something
- *     new for a LOAD whose src2 was never inspected before. */
-#define FBX_IR_VERSION 10u
+ *     new for a LOAD whose src2 was never inspected before.
+ *   11 — firebox#T3R2 (region coverage): new IR for input that bailed out
+ *     before.  STORE gains an optional SIB index (dst GREG + scale); LOAD may
+ *     take an absolute address (src1_kind IMM, imm = the RIP-relative VA);
+ *     SET_FLAGS_RAW gains the INC/DEC/NEG kinds (FBX_IR_FLAGS_*); the
+ *     ALU/CMP/TEST memory-source forms lift to LOAD + ALU (their memory-
+ *     destination read-modify-write forms now BAILOUT where they used to lift
+ *     to a register read of the base); NOT/NEG/INC/DEC, TEST r/m,imm and
+ *     TEST rAX,imm lift; CALL r/m lifts to CALL_INDIRECT and JMP r/m to the
+ *     new JMP_INDIRECT; PUSH/POP/CALL/RET with an operand-size prefix BAILOUT
+ *     (they had lifted at 8 bytes).  The per-block emitter refuses every new
+ *     shape; only regions lower them. */
+#define FBX_IR_VERSION 11u
 
 /* ────────────────────────────────────────────────────────────────────────── */
 /* IR opcodes.                                                                */
@@ -284,7 +295,8 @@ enum FbxIrOpcode {
   FBX_IR_OP_CALL_DIRECT = 17,   /* direct call; imm = target PC,
                                    src2 = return PC */
   FBX_IR_OP_CALL_INDIRECT = 18, /* indirect call; src1 = target vreg,
-                                   src2 = return PC */
+                                   imm = return PC (firebox#T3R2: full
+                                   width; lowered by regions only) */
   FBX_IR_OP_RET = 19,           /* return; pops from guest stack */
 
   /* Block-end bailout — exit the translated path, resume on Tier 1.  Used
@@ -329,6 +341,10 @@ enum FbxIrOpcode {
    * Tier 1 computes them (correct-or-refuse — the #677/#735 pattern). */
   FBX_IR_OP_IMUL = 24,
 
+  /* firebox#T3R2 — indirect jump (JMP r/m64): src1_kind = VREG, src1 = the
+   * target.  Block terminator.  Lowered by regions only. */
+  FBX_IR_OP_JMP_INDIRECT = 25,
+
   /* Sentinel — count of defined opcodes.  Used by validation; not emitted. */
   FBX_IR_OP_LAST_,
 };
@@ -339,6 +355,14 @@ enum FbxIrOpcode {
 /* Pinned values — see Versioning above.  Same cross-build determinism        */
 /* concern.                                                                   */
 /* ────────────────────────────────────────────────────────────────────────── */
+
+/* firebox#T3R2 — SET_FLAGS_RAW kinds beyond the ALU opcodes (imm carries the
+ * kind).  INC/DEC keep CF (they read it); NEG sets CF = AF = (x != 0).  src1 =
+ * the operand vreg; src2 = the vreg holding 1 (INC/DEC) or the operand
+ * again (NEG).  The flag values are blink/alu.c's IncN, DecN and NegN. */
+#define FBX_IR_FLAGS_INC 0x40u
+#define FBX_IR_FLAGS_DEC 0x41u
+#define FBX_IR_FLAGS_NEG 0x42u
 
 #define FBX_IR_KIND_NONE 0   /* operand not used */
 #define FBX_IR_KIND_VREG 1   /* virtual register; index in .src/.dst */
@@ -464,6 +488,11 @@ void fbx_ir_inst_zero(struct FbxIrInst *inst);
  * byte-identical output (verified by fbx_ir_lift_test.c).
  */
 struct FbxIrBlock *fbx_ir_lift(const struct FbxTcBlock *tc);
+
+/* firebox#T3R2: the same lift for a Tier-2 region member.  It also lifts the
+ * forms only fbx_ir_emit_region_wasm lowers (see FBX_IR_VERSION 11); the
+ * per-block emitter refuses every one of them. */
+struct FbxIrBlock *fbx_ir_lift_region(const struct FbxTcBlock *tc);
 
 /* Free a block returned from fbx_ir_lift(). */
 void fbx_ir_free(struct FbxIrBlock *ir);

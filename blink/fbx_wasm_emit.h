@@ -259,11 +259,18 @@ u32 fbx_ir_region_successors(const struct FbxIrBlock *ir,
                              const struct FbxTcBlock *tc, u64 out[2]);
 
 /* Emit one module for members irs/tcs[0..n), entered at member 0.  Every exit
- * stores m->ip; it returns 1 when a LOAD in member 0 missed the TLB (Tier 1
- * resumes at that LOAD in the dispatched block) and 0 otherwise.  `budget` bounds the back-edges one dispatch
- * takes.  `count_insns` makes the module store the number of guest
- * instructions it completed in ctx->consts[0] (verification only).  Returns
- * 1 on success, 0 if any member is refused. */
+ * stores m->ip; it returns 1 when a memory access in member 0 could not be
+ * translated (Tier 1 resumes at that instruction in the dispatched block)
+ * and 0 otherwise.  `budget` bounds the back-edges one dispatch takes.
+ * `count_insns` is a set of FBX_REGION_EMIT_* bits (verification only):
+ * COUNT makes the module store the number of guest instructions it completed
+ * in ctx->consts[0]; LOG (firebox#T3R2) makes every store first append
+ * {host offset, width, overwritten bytes} to the log described by
+ * ctx->consts[1..3] (base, used, capacity), leaving the region before a
+ * store that finds it full.  Returns 1 on success, 0 if any member is
+ * refused. */
+#define FBX_REGION_EMIT_COUNT 1
+#define FBX_REGION_EMIT_LOG 2
 int fbx_ir_emit_region_wasm(const struct FbxIrBlock *const *irs,
                             const struct FbxTcBlock *const *tcs, u32 n,
                             int count_insns, u32 budget,

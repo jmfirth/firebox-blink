@@ -293,7 +293,7 @@ TEST(FbxIrLift, MovZvqpIvqp) {
 
 TEST(FbxIrLift, MovImm) {
   /* opcode 0xC7: MOV r/m, imm32. */
-  struct FbxTcBlock *tc = MakeTc(0x0C7, 0, 0x12345678, 0, 0x400000, 7,
+  struct FbxTcBlock *tc = MakeTc(0x0C7, LIFT_RDE_MOD3, 0x12345678, 0, 0x400000, 7,
                                  FBX_TC_KIND_NORMAL);
   struct FbxIrBlock *ir = fbx_ir_lift(tc);
   ASSERT_NOTNULL(ir);
@@ -467,7 +467,7 @@ TEST(FbxIrLift, LeaSibNoBaseRefused) {
 
 TEST(FbxIrLift, AddRR) {
   /* opcode 0x01: ADD r/m64, r64. */
-  struct FbxTcBlock *tc = MakeTc(0x001, 0, 0, 0, 0x400000, 3,
+  struct FbxTcBlock *tc = MakeTc(0x001, LIFT_RDE_MOD3, 0, 0, 0x400000, 3,
                                  FBX_TC_KIND_NORMAL);
   struct FbxIrBlock *ir = fbx_ir_lift(tc);
   ASSERT_NOTNULL(ir);
@@ -484,7 +484,7 @@ TEST(FbxIrLift, SetFlagsRawCarriesOperandsV2) {
    * v1's "imm-only" encoding.  Both LiftAluRR and LiftAlui have to maintain
    * this contract — covered by ADD r/m, r (LiftAluRR) below + AluiSubImm
    * test variant. */
-  struct FbxTcBlock *tc = MakeTc(0x001, 0, 0, 0, 0x400000, 3,
+  struct FbxTcBlock *tc = MakeTc(0x001, LIFT_RDE_MOD3, 0, 0, 0x400000, 3,
                                  FBX_TC_KIND_NORMAL);
   struct FbxIrBlock *ir = fbx_ir_lift(tc);
   u32 i;
@@ -507,7 +507,7 @@ TEST(FbxIrLift, SetFlagsRawCarriesOperandsV2) {
 TEST(FbxIrLift, SetFlagsRawCarriesOperandsV2Alui) {
   /* Same v2 IR contract for LiftAlui (opcode 0x83 group-1 r/m, imm8). */
   u64 rde_extra = ((u64)5) << 0; /* ModrmReg=5 → SUB */
-  struct FbxTcBlock *tc = MakeTc(0x083, rde_extra, 0x10, 0, 0x400000, 4,
+  struct FbxTcBlock *tc = MakeTc(0x083, rde_extra | LIFT_RDE_MOD3, 0x10, 0, 0x400000, 4,
                                  FBX_TC_KIND_NORMAL);
   struct FbxIrBlock *ir = fbx_ir_lift(tc);
   u32 i;
@@ -529,7 +529,7 @@ TEST(FbxIrLift, SetFlagsRawCarriesOperandsV2Alui) {
 TEST(FbxIrLift, AluiSubImm) {
   /* opcode 0x83: group 1 r/m, imm8 — pick SUB via ModrmReg=5. */
   u64 rde_extra = ((u64)5) << 0; /* ModrmReg=5 */
-  struct FbxTcBlock *tc = MakeTc(0x083, rde_extra, 0x10, 0, 0x400000, 4,
+  struct FbxTcBlock *tc = MakeTc(0x083, rde_extra | LIFT_RDE_MOD3, 0x10, 0, 0x400000, 4,
                                  FBX_TC_KIND_NORMAL);
   struct FbxIrBlock *ir = fbx_ir_lift(tc);
   ASSERT_NOTNULL(ir);
@@ -541,7 +541,7 @@ TEST(FbxIrLift, AluiSubImm) {
 
 TEST(FbxIrLift, CmpRR) {
   /* opcode 0x39: CMP r/m, r. */
-  struct FbxTcBlock *tc = MakeTc(0x039, 0, 0, 0, 0x400000, 3,
+  struct FbxTcBlock *tc = MakeTc(0x039, LIFT_RDE_MOD3, 0, 0, 0x400000, 3,
                                  FBX_TC_KIND_NORMAL);
   struct FbxIrBlock *ir = fbx_ir_lift(tc);
   ASSERT_NOTNULL(ir);
@@ -757,12 +757,12 @@ TEST(FbxIrLift, MultiInstBlock) {
   b->entries = (struct FbxTcEntry *)calloc(3, sizeof(struct FbxTcEntry));
   /* [0]: ADD r/m, r at 0x400000 (mopcode 0x001). */
   b->entries[0].ip = 0x400000;
-  b->entries[0].rde = (u64)0x001 << 050;
+  b->entries[0].rde = (u64)0x001 << 050 | LIFT_RDE_MOD3; /* register form */
   b->entries[0].oplen = 3;
   b->entries[0].kind = FBX_TC_KIND_NORMAL;
   /* [1]: MOV r/m, r at 0x400003 (mopcode 0x089). */
   b->entries[1].ip = 0x400003;
-  b->entries[1].rde = (u64)0x089 << 050;
+  b->entries[1].rde = (u64)0x089 << 050 | LIFT_RDE_MOD3;
   b->entries[1].oplen = 3;
   b->entries[1].kind = FBX_TC_KIND_NORMAL;
   /* [2]: JE rel8 at 0x400006 (mopcode 0x074) — block-terminating. */
@@ -805,7 +805,7 @@ TEST(FbxIrLift, NullInputReturnsNull) {
 
 TEST(FbxIrLift, MirrorAddRRm) {
   /* opcode 0x003: ADD r, r/m.  Lift to REG_GET x2 + ADD + REG_SET + flags. */
-  struct FbxTcBlock *tc = MakeTc(0x003, 0, 0, 0, 0x400000, 3,
+  struct FbxTcBlock *tc = MakeTc(0x003, LIFT_RDE_MOD3, 0, 0, 0x400000, 3,
                                  FBX_TC_KIND_NORMAL);
   struct FbxIrBlock *ir = fbx_ir_lift(tc);
   ASSERT_NOTNULL(ir);
@@ -820,7 +820,7 @@ TEST(FbxIrLift, MirrorAddRRm) {
 
 TEST(FbxIrLift, MirrorSubRRm) {
   /* opcode 0x02B: SUB r, r/m. */
-  struct FbxTcBlock *tc = MakeTc(0x02B, 0, 0, 0, 0x400000, 3,
+  struct FbxTcBlock *tc = MakeTc(0x02B, LIFT_RDE_MOD3, 0, 0, 0x400000, 3,
                                  FBX_TC_KIND_NORMAL);
   struct FbxIrBlock *ir = fbx_ir_lift(tc);
   ASSERT_NOTNULL(ir);
@@ -832,7 +832,7 @@ TEST(FbxIrLift, MirrorSubRRm) {
 
 TEST(FbxIrLift, MirrorCmpRRm) {
   /* opcode 0x03B: CMP r, r/m.  CMP must NOT emit REG_SET (flag-only op). */
-  struct FbxTcBlock *tc = MakeTc(0x03B, 0, 0, 0, 0x400000, 3,
+  struct FbxTcBlock *tc = MakeTc(0x03B, LIFT_RDE_MOD3, 0, 0, 0x400000, 3,
                                  FBX_TC_KIND_NORMAL);
   struct FbxIrBlock *ir = fbx_ir_lift(tc);
   ASSERT_NOTNULL(ir);
@@ -846,7 +846,7 @@ TEST(FbxIrLift, MirrorCmpRRm) {
 
 TEST(FbxIrLift, MirrorXorRRm) {
   /* opcode 0x033: XOR r, r/m. */
-  struct FbxTcBlock *tc = MakeTc(0x033, 0, 0, 0, 0x400000, 3,
+  struct FbxTcBlock *tc = MakeTc(0x033, LIFT_RDE_MOD3, 0, 0, 0x400000, 3,
                                  FBX_TC_KIND_NORMAL);
   struct FbxIrBlock *ir = fbx_ir_lift(tc);
   ASSERT_NOTNULL(ir);
@@ -857,7 +857,7 @@ TEST(FbxIrLift, MirrorXorRRm) {
 
 TEST(FbxIrLift, MirrorAndRRm) {
   /* opcode 0x023: AND r, r/m. */
-  struct FbxTcBlock *tc = MakeTc(0x023, 0, 0, 0, 0x400000, 3,
+  struct FbxTcBlock *tc = MakeTc(0x023, LIFT_RDE_MOD3, 0, 0, 0x400000, 3,
                                  FBX_TC_KIND_NORMAL);
   struct FbxIrBlock *ir = fbx_ir_lift(tc);
   ASSERT_NOTNULL(ir);
@@ -868,7 +868,7 @@ TEST(FbxIrLift, MirrorAndRRm) {
 
 TEST(FbxIrLift, MirrorOrRRm) {
   /* opcode 0x00B: OR r, r/m. */
-  struct FbxTcBlock *tc = MakeTc(0x00B, 0, 0, 0, 0x400000, 3,
+  struct FbxTcBlock *tc = MakeTc(0x00B, LIFT_RDE_MOD3, 0, 0, 0x400000, 3,
                                  FBX_TC_KIND_NORMAL);
   struct FbxIrBlock *ir = fbx_ir_lift(tc);
   ASSERT_NOTNULL(ir);
@@ -879,7 +879,7 @@ TEST(FbxIrLift, MirrorOrRRm) {
 
 TEST(FbxIrLift, MirrorByteAddRRm) {
   /* opcode 0x002: ADD r8, r/m8.  Byte-form mirror.  Width should be 1. */
-  struct FbxTcBlock *tc = MakeTc(0x002, 0, 0, 0, 0x400000, 2,
+  struct FbxTcBlock *tc = MakeTc(0x002, LIFT_RDE_MOD3, 0, 0, 0x400000, 2,
                                  FBX_TC_KIND_NORMAL);
   struct FbxIrBlock *ir = fbx_ir_lift(tc);
   u32 i;
@@ -909,9 +909,9 @@ TEST(FbxIrLift, MirrorRegisterAssignment) {
    *   RexbRm=5  → bits 7-10 = 5 → 5 << 7 = 0x280 = 0640o (octal)
    */
   u64 rde_extra = (u64)3 | ((u64)5 << 7);
-  struct FbxTcBlock *tc_a = MakeTc(0x001, rde_extra, 0, 0, 0x400000, 3,
+  struct FbxTcBlock *tc_a = MakeTc(0x001, rde_extra | LIFT_RDE_MOD3, 0, 0, 0x400000, 3,
                                    FBX_TC_KIND_NORMAL);
-  struct FbxTcBlock *tc_b = MakeTc(0x003, rde_extra, 0, 0, 0x400000, 3,
+  struct FbxTcBlock *tc_b = MakeTc(0x003, rde_extra | LIFT_RDE_MOD3, 0, 0, 0x400000, 3,
                                    FBX_TC_KIND_NORMAL);
   struct FbxIrBlock *a = fbx_ir_lift(tc_a);
   struct FbxIrBlock *b = fbx_ir_lift(tc_b);

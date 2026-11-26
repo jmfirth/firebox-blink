@@ -366,9 +366,24 @@ static int Mod3(u64 rde) {
   return ((u32)ModrmMod(rde) == 3);
 }
 
+/* firebox#T3R2: `region` selects the region member's gate.  A region member
+ * is lifted by fbx_ir_lift_region and lowered by RegionEmitMember, which
+ * also take the forms listed under `region` below; fbx_ir_region_member_ok
+ * then checks every IR operand.  The per-block gate (region == 0) is
+ * unchanged, except that it also refuses those region-only IR shapes. */
+static int CoverageGateMode(const struct FbxIrBlock *ir,
+                            const struct FbxTcBlock *tc,
+                            struct FbxEmitFailCtx *fail, int region);
+
 static int CoverageGate(const struct FbxIrBlock *ir,
                         const struct FbxTcBlock *tc,
                         struct FbxEmitFailCtx *fail) {
+  return CoverageGateMode(ir, tc, fail, 0);
+}
+
+static int CoverageGateMode(const struct FbxIrBlock *ir,
+                            const struct FbxTcBlock *tc,
+                            struct FbxEmitFailCtx *fail, int region) {
   u32 i;
   u32 tc_idx;
   int saw_flag_reader = 0;
@@ -475,6 +490,12 @@ static int CoverageGate(const struct FbxIrBlock *ir,
           case FBX_IR_OP_CMP:
           case FBX_IR_OP_TEST:
             break;
+          case FBX_IR_FLAGS_INC: /* firebox#T3R2: regions only */
+          case FBX_IR_FLAGS_DEC:
+          case FBX_IR_FLAGS_NEG:
+            if (region) break;
+            SetFail(fail, FBX_IR_EMIT_SET_FLAGS_RAW_BAD, p->opcode);
+            return 0;
           default:
             SetFail(fail, FBX_IR_EMIT_SET_FLAGS_RAW_BAD, p->opcode);
             return 0;
@@ -538,8 +559,11 @@ static int CoverageGate(const struct FbxIrBlock *ir,
       u8 op = ir->insts[i].opcode;
       if (op == FBX_IR_OP_IMUL) {
         imul_flags_pending = 1;
-      } else if (op == FBX_IR_OP_SET_FLAGS_RAW) {
-        imul_flags_pending = 0; /* a real flag-def overwrites the shadow */
+      } else if (op == FBX_IR_OP_SET_FLAGS_RAW &&
+                 (u8)ir->insts[i].imm != FBX_IR_FLAGS_INC &&
+                 (u8)ir->insts[i].imm != FBX_IR_FLAGS_DEC) {
+        /* a real flag-def overwrites the shadow (INC/DEC keep CF) */
+        imul_flags_pending = 0;
       } else if (op == FBX_IR_OP_BRANCH_COND || op == FBX_IR_OP_GET_FLAG) {
         if (imul_flags_pending) {
           SetFail(fail, FBX_IR_EMIT_IMUL_FLAGS_LIVE, op);
@@ -633,10 +657,12 @@ static int CoverageGate(const struct FbxIrBlock *ir,
      * exactly that wrap, so on wasm64 they take the refusal whatever the
      * mapping mode.  LOAD/STORE are safe: they translate and bail above 4 GiB
      * (EmitGuestVaToHostOffsetOrBailout, check (f)). */
+    /* firebox#T3R2: a region translates every stack access (RegionStack*),
+     * so the refusal below is the per-block path's. */
 #ifdef __wasm64__
-    if (1) {
+    if (!region) {
 #else
-    if (!HasLinearMapping()) {
+    if (!region && !HasLinearMapping()) {
 #endif
       /* firebox#738 — the wide (8-byte / i64) guest LOAD is RE-ENABLED here.
        * SESSION 4 proved the wide LOAD INNOCENT (the LOAD value is byte-faithful
@@ -731,6 +757,11 @@ static int CoverageGate(const struct FbxIrBlock *ir,
       case FBX_IR_OP_PUSH:         /* #602 */
       case FBX_IR_OP_POP:          /* #602 */
         continue;
+      case FBX_IR_OP_CALL_INDIRECT: /* firebox#T3R2: regions only */
+      case FBX_IR_OP_JMP_INDIRECT:
+        if (region) continue;
+        SetFail(fail, FBX_IR_EMIT_UNSUPPORTED_OPCODE, op);
+        return 0;
       default:
         SetFail(fail, FBX_IR_EMIT_UNSUPPORTED_OPCODE, op);
         return 0;
@@ -756,6 +787,34 @@ static int CoverageGate(const struct FbxIrBlock *ir,
     }
     rde = e->rde;
     mop = Mopcode(rde);
+    /* firebox#T3R2: the forms a region member's lift lowers.  The lift is
+     * the authority on each one's operands (fbx_ir_lift.c LiftOperandRoles,
+     * LiftUnaryRegion, LiftAluMemRegion, LiftStoreRegion), refusing the
+     * read-modify-write memory forms and every group member it does not
+     * name; fbx_ir_region_member_ok refuses a member that BAILs anywhere. */
+    if (region) {
+      int ok = 0;
+      switch (mop) {
+        case 0x000: case 0x001: case 0x008: case 0x009:
+        case 0x020: case 0x021: case 0x028: case 0x029:
+        case 0x030: case 0x031: case 0x038: case 0x039:
+        case 0x084: case 0x085:
+        case 0x002: case 0x003: case 0x00A: case 0x00B:
+        case 0x022: case 0x023: case 0x02A: case 0x02B:
+        case 0x032: case 0x033: case 0x03A: case 0x03B:
+        case 0x080: case 0x081: case 0x083:
+        case 0x0F6: case 0x0F7: case 0x0FE: case 0x0FF:
+        case 0x0A8: case 0x0A9:
+          ok = 1;
+          break;
+        case 0x0C6: case 0x0C7:
+          ok = ModrmReg(rde) == 0;
+          break;
+        default:
+          break;
+      }
+      if (ok) continue;
+    }
     /* MOV r/m, r and MOV r, r/m and ALU-RR and TEST. */
     switch (mop) {
       /* #677 — MOV r/m, r (0x88/0x89) and MOV r, r/m (0x8A/0x8B): the
@@ -936,6 +995,16 @@ static int CoverageGate(const struct FbxIrBlock *ir,
         SetFail(fail, FBX_IR_EMIT_LEA_SIB_FORM, p->opcode);
         return 0;
       }
+    }
+    /* firebox#T3R2: the region-only memory shapes — an absolute (RIP-
+     * relative) address, a STORE's SIB index in dst — are not the per-block
+     * emitter's; it would read the address from src1 as a register. */
+    if (!region &&
+        (p->opcode == FBX_IR_OP_LOAD || p->opcode == FBX_IR_OP_STORE) &&
+        (p->src1_kind != FBX_IR_KIND_GREG ||
+         (p->opcode == FBX_IR_OP_STORE && p->dst_kind != FBX_IR_KIND_NONE))) {
+      SetFail(fail, FBX_IR_EMIT_KIND_MISMATCH, p->opcode);
+      return 0;
     }
     /* firebox#JJJ: a LOAD's src2 is its optional SIB index (GREG + scale);
      * nothing else may ride there. */
@@ -3231,6 +3300,11 @@ static int FlagsDefIsLive(const struct FbxIrBlock *ir, u32 idx) {
   for (j = idx + 1u; j < ir->ninsts; ++j) {
     switch (ir->insts[j].opcode) {
       case FBX_IR_OP_SET_FLAGS_RAW:
+        /* firebox#T3R2: INC/DEC keep CF, so they READ this definition. */
+        if ((u8)ir->insts[j].imm == FBX_IR_FLAGS_INC ||
+            (u8)ir->insts[j].imm == FBX_IR_FLAGS_DEC) {
+          return 1;
+        }
         return 0; /* overwritten, with no read or exit in between */
       case FBX_IR_OP_PC_MARK:
       case FBX_IR_OP_REG_GET:
@@ -4077,14 +4151,18 @@ struct RegionEmit {
   u32 n;
   u16 maxv;
   int count;
+  int log;       /* firebox#T3R2: log each store (FBX_REGION_EMIT_LOG) */
   u32 l_g0;      /* G0..G15: guest registers (i64) */
   u32 l_mmu_va;  /* i64 */
   u32 l_mmu_entry;
   u32 l_exit_pc;
   u32 l_icount;
+  u32 l_tmp;     /* i64: a stack op's value (firebox#T3R2) */
   u32 l_cur;     /* i32: member the dispatcher enters */
   u32 l_budget;  /* i32: dispatcher entries left */
   u32 l_rc;      /* i32: the exit code the epilogue returns */
+  u32 l_off;     /* i32: a store's host offset (firebox#T3R2) */
+  u32 l_logp;    /* i32: the store-log entry being written */
 };
 
 static u32 RegionG(const struct RegionEmit *r, u32 greg) {
@@ -4096,6 +4174,24 @@ static int RegionWidthOk(u8 w) {
 }
 
 static u8 RegionWidth(u8 w) { return w ? w : 8u; }
+
+static int RegionScaleOk(u32 s) { return s == 1 || s == 2 || s == 4 || s == 8; }
+
+/* firebox#T3R2: the ops that end a region member.  CALL_DIRECT continues at
+ * its target (a member, or an exit); the others exit, but for the branches. */
+static int RegionIsTerminator(u8 op) {
+  switch (op) {
+    case FBX_IR_OP_BRANCH_COND:
+    case FBX_IR_OP_BRANCH_TAKEN:
+    case FBX_IR_OP_CALL_DIRECT:
+    case FBX_IR_OP_CALL_INDIRECT:
+    case FBX_IR_OP_JMP_INDIRECT:
+    case FBX_IR_OP_RET:
+      return 1;
+    default:
+      return 0;
+  }
+}
 
 static const struct FbxIrInst *RegionTerminator(const struct FbxIrBlock *ir) {
   u32 i;
@@ -4119,20 +4215,17 @@ int fbx_ir_region_member_ok(const struct FbxIrBlock *ir,
     SetFail(&fail, FBX_IR_EMIT_EMPTY_IR, 0);
     goto refuse;
   }
-  if (!CoverageGate(ir, tc, &fail)) goto refuse;
+  if (!CoverageGateMode(ir, tc, &fail, 1)) goto refuse;
   term = RegionTerminator(ir);
-  if (!term || (term->opcode != FBX_IR_OP_BRANCH_COND &&
-                term->opcode != FBX_IR_OP_BRANCH_TAKEN)) {
+  if (!term || !RegionIsTerminator(term->opcode)) {
     SetFail(&fail, FBX_IR_EMIT_UNSUPPORTED_OPCODE, term ? term->opcode : 0);
     goto refuse;
   }
   for (i = 0; i < ir->ninsts; ++i) {
     const struct FbxIrInst *p = &ir->insts[i];
     int ok = 1;
-    if (p->opcode != FBX_IR_OP_PC_MARK && p != term &&
-        (p->opcode == FBX_IR_OP_BRANCH_COND ||
-         p->opcode == FBX_IR_OP_BRANCH_TAKEN)) {
-      ok = 0; /* a branch that is not the terminator */
+    if (p != term && RegionIsTerminator(p->opcode)) {
+      ok = 0; /* control flow that is not the terminator */
     }
     switch (p->opcode) {
       case FBX_IR_OP_PC_MARK:
@@ -4152,13 +4245,46 @@ int fbx_ir_region_member_ok(const struct FbxIrBlock *ir,
                p->src1_kind == FBX_IR_KIND_IMM);
         break;
       case FBX_IR_OP_LOAD:
+        /* base (+ index*scale) + disp, or (firebox#T3R2) an absolute VA */
         ok &= p->dst_kind == FBX_IR_KIND_VREG && p->dst < ir->nvregs &&
               RegionWidthOk(p->width) &&
-              p->src1_kind == FBX_IR_KIND_GREG && p->src1 < 16u &&
-              (p->src2_kind == FBX_IR_KIND_NONE ||
-               (p->src2_kind == FBX_IR_KIND_GREG && p->src2 < 16u &&
-                (p->scale == 1 || p->scale == 2 || p->scale == 4 ||
-                 p->scale == 8)));
+              ((p->src1_kind == FBX_IR_KIND_GREG && p->src1 < 16u &&
+                (p->src2_kind == FBX_IR_KIND_NONE ||
+                 (p->src2_kind == FBX_IR_KIND_GREG && p->src2 < 16u &&
+                  RegionScaleOk(p->scale)))) ||
+               (p->src1_kind == FBX_IR_KIND_IMM &&
+                p->src2_kind == FBX_IR_KIND_NONE));
+        break;
+      case FBX_IR_OP_STORE:
+        /* firebox#T3R2: value in src2; base in src1 with the index in dst,
+         * or an absolute VA */
+        ok &= RegionWidthOk(p->width) &&
+              p->src2_kind == FBX_IR_KIND_VREG && p->src2 < ir->nvregs &&
+              ((p->src1_kind == FBX_IR_KIND_GREG && p->src1 < 16u &&
+                (p->dst_kind == FBX_IR_KIND_NONE ||
+                 (p->dst_kind == FBX_IR_KIND_GREG && p->dst < 16u &&
+                  RegionScaleOk(p->scale)))) ||
+               (p->src1_kind == FBX_IR_KIND_IMM &&
+                p->dst_kind == FBX_IR_KIND_NONE));
+        break;
+      case FBX_IR_OP_PUSH:
+        ok &= p->width == 8 && p->src1_kind == FBX_IR_KIND_GREG &&
+              p->src1 < 16u;
+        break;
+      case FBX_IR_OP_POP:
+        ok &= p->width == 8 && p->dst_kind == FBX_IR_KIND_GREG && p->dst < 16u;
+        break;
+      case FBX_IR_OP_CALL_DIRECT:
+        /* CoverageGateMode checked it is last and src2 == (u32)end_pc. */
+        break;
+      case FBX_IR_OP_CALL_INDIRECT:
+        ok &= p->src1_kind == FBX_IR_KIND_VREG && p->src1 < ir->nvregs &&
+              p->imm == tc->end_pc;
+        break;
+      case FBX_IR_OP_JMP_INDIRECT:
+        ok &= p->src1_kind == FBX_IR_KIND_VREG && p->src1 < ir->nvregs;
+        break;
+      case FBX_IR_OP_RET:
         break;
       case FBX_IR_OP_ADD:
       case FBX_IR_OP_SUB:
@@ -4219,7 +4345,8 @@ u32 fbx_ir_region_successors(const struct FbxIrBlock *ir,
     out[1] = term->imm;
     return 2;
   }
-  if (term->opcode == FBX_IR_OP_BRANCH_TAKEN) {
+  if (term->opcode == FBX_IR_OP_BRANCH_TAKEN ||
+      term->opcode == FBX_IR_OP_CALL_DIRECT) {
     out[0] = term->imm;
     return 1;
   }
@@ -4428,6 +4555,319 @@ static void RegionTranslate(struct RegionEmit *r, u32 i, u64 cur_pc,
   EmitGuestVaHostOffset(b, r->l_mmu_va, r->l_mmu_entry);
 }
 
+/* ── firebox#T3R2: region memory writes, stack ops, unary flags ─────────── */
+
+#define WASM_OP_I64_GE_U 0x5Au
+
+/* Store-log slots in the region's FbxT2BlockCtx, used only by a counting
+ * (verifying) region: consts[1] = log base, [2] = entries used, [3] =
+ * capacity.  Each entry is FBX_REGION_LOG_ENTRY bytes: u32 host offset, u32
+ * width, u64 the bytes the store overwrote.  fbx_t2_glue.c's verifier undoes
+ * the stores with it and compares the bytes Tier 1 writes. */
+#define FBX_REGION_LOG_BASE 1u
+#define FBX_REGION_LOG_USED 2u
+#define FBX_REGION_LOG_CAP 3u
+#define FBX_REGION_LOG_ENTRY 16u
+_Static_assert(FBX_REGION_LOG_CAP < FBX_T2_BLOCK_CTX_MAX_CONSTS,
+               "region store-log slots fit the block ctx");
+
+/* Leave the region at `cur_pc` with the current instruction NOT executed,
+ * from `depth` levels below member i's top level (see RegionTranslate). */
+static void RegionExitMiss(struct RegionEmit *r, u32 i, u64 cur_pc,
+                           u32 depth) {
+  RegionExit(r, cur_pc, r->n - i + depth, /*uncount=*/1, i == 0 ? 1 : 0);
+}
+
+static void RegionCtxConst(struct RegionEmit *r, u32 k) {
+  struct FbxWasmBuffer *b = r->body;
+  fbx_wasm_buffer_u8(b, WASM_OP_LOCAL_GET);
+  fbx_wasm_buffer_uleb(b, EMIT_LOCAL_BLOCK_CTX);
+  fbx_wasm_buffer_u8(b, WASM_OP_I64_LOAD);
+  fbx_wasm_buffer_uleb(b, 3);
+  fbx_wasm_buffer_uleb(b, FBX_T2_CTX_OFF_CONST(k));
+}
+
+static void RegionStoreOp(struct FbxWasmBuffer *b, u8 width) {
+  switch (width) {
+    case 1:
+      fbx_wasm_buffer_u8(b, WASM_OP_I64_STORE8);
+      fbx_wasm_buffer_uleb(b, 0);
+      break;
+    case 2:
+      fbx_wasm_buffer_u8(b, WASM_OP_I64_STORE16);
+      fbx_wasm_buffer_uleb(b, 1);
+      break;
+    case 4:
+      fbx_wasm_buffer_u8(b, WASM_OP_I64_STORE32);
+      fbx_wasm_buffer_uleb(b, 2);
+      break;
+    default:
+      fbx_wasm_buffer_u8(b, WASM_OP_I64_STORE);
+      fbx_wasm_buffer_uleb(b, 3);
+      break;
+  }
+  fbx_wasm_buffer_uleb(b, 0);
+}
+
+/* Counting regions only: append {l_off, width, old bytes} to the store log,
+ * or, when it is full, leave with the store not executed. */
+static void RegionLogStore(struct RegionEmit *r, u32 i, u64 cur_pc,
+                           u8 width) {
+  struct FbxWasmBuffer *b = r->body;
+  RegionCtxConst(r, FBX_REGION_LOG_USED);
+  RegionCtxConst(r, FBX_REGION_LOG_CAP);
+  fbx_wasm_buffer_u8(b, WASM_OP_I64_GE_U);
+  fbx_wasm_buffer_u8(b, WASM_OP_IF);
+  fbx_wasm_buffer_u8(b, WASM_BLOCKTYPE_EMPTY);
+  RegionExitMiss(r, i, cur_pc, 1u);
+  fbx_wasm_buffer_u8(b, WASM_OP_END);
+  RegionCtxConst(r, FBX_REGION_LOG_BASE);
+  RegionCtxConst(r, FBX_REGION_LOG_USED);
+  RegionI64Const(b, 4); /* log2 FBX_REGION_LOG_ENTRY */
+  fbx_wasm_buffer_u8(b, WASM_OP_I64_SHL);
+  fbx_wasm_buffer_u8(b, WASM_OP_I64_ADD);
+  fbx_wasm_buffer_u8(b, WASM_OP_I32_WRAP_I64);
+  fbx_wasm_buffer_u8(b, WASM_OP_LOCAL_SET);
+  fbx_wasm_buffer_uleb(b, r->l_logp);
+  fbx_wasm_buffer_u8(b, WASM_OP_LOCAL_GET);
+  fbx_wasm_buffer_uleb(b, r->l_logp);
+  fbx_wasm_buffer_u8(b, WASM_OP_LOCAL_GET);
+  fbx_wasm_buffer_uleb(b, r->l_off);
+  fbx_wasm_buffer_u8(b, WASM_OP_I32_STORE);
+  fbx_wasm_buffer_uleb(b, 2);
+  fbx_wasm_buffer_uleb(b, 0);
+  fbx_wasm_buffer_u8(b, WASM_OP_LOCAL_GET);
+  fbx_wasm_buffer_uleb(b, r->l_logp);
+  fbx_wasm_buffer_u8(b, WASM_OP_I32_CONST);
+  fbx_wasm_buffer_sleb(b, width);
+  fbx_wasm_buffer_u8(b, WASM_OP_I32_STORE);
+  fbx_wasm_buffer_uleb(b, 2);
+  fbx_wasm_buffer_uleb(b, 4);
+  fbx_wasm_buffer_u8(b, WASM_OP_LOCAL_GET);
+  fbx_wasm_buffer_uleb(b, r->l_logp);
+  fbx_wasm_buffer_u8(b, WASM_OP_LOCAL_GET);
+  fbx_wasm_buffer_uleb(b, r->l_off);
+  RegionLoadOp(b, width);
+  fbx_wasm_buffer_u8(b, WASM_OP_I64_STORE);
+  fbx_wasm_buffer_uleb(b, 3);
+  fbx_wasm_buffer_uleb(b, 8);
+  fbx_wasm_buffer_u8(b, WASM_OP_LOCAL_GET);
+  fbx_wasm_buffer_uleb(b, EMIT_LOCAL_BLOCK_CTX);
+  RegionCtxConst(r, FBX_REGION_LOG_USED);
+  RegionI64Const(b, 1);
+  fbx_wasm_buffer_u8(b, WASM_OP_I64_ADD);
+  fbx_wasm_buffer_u8(b, WASM_OP_I64_STORE);
+  fbx_wasm_buffer_uleb(b, 3);
+  fbx_wasm_buffer_uleb(b, FBX_T2_CTX_OFF_CONST(FBX_REGION_LOG_USED));
+}
+
+/* Consume the guest VA on the stack and write local `val_local` there,
+ * `width` bytes — or leave with the instruction not executed.  Nothing the
+ * instruction does may be committed before this (its translation is the
+ * only point it can fail). */
+static void RegionMemWrite(struct RegionEmit *r, u32 i, u64 cur_pc, u8 width,
+                           u32 val_local) {
+  struct FbxWasmBuffer *b = r->body;
+  RegionTranslate(r, i, cur_pc, /*need_rw=*/1, width);
+  fbx_wasm_buffer_u8(b, WASM_OP_LOCAL_SET);
+  fbx_wasm_buffer_uleb(b, r->l_off);
+  if (r->log) RegionLogStore(r, i, cur_pc, width);
+  fbx_wasm_buffer_u8(b, WASM_OP_LOCAL_GET);
+  fbx_wasm_buffer_uleb(b, r->l_off);
+  fbx_wasm_buffer_u8(b, WASM_OP_LOCAL_GET);
+  fbx_wasm_buffer_uleb(b, val_local);
+  RegionStoreOp(b, width);
+}
+
+/* rsp += delta (64-bit stack: PUSH/POP/CALL/RET without 0x66, which the
+ * lift refuses). */
+static void RegionBumpRsp(struct RegionEmit *r, i64 delta) {
+  struct FbxWasmBuffer *b = r->body;
+  fbx_wasm_buffer_u8(b, WASM_OP_LOCAL_GET);
+  fbx_wasm_buffer_uleb(b, RegionG(r, FBX_GREG_RSP));
+  RegionI64Const(b, (u64)delta);
+  fbx_wasm_buffer_u8(b, WASM_OP_I64_ADD);
+  fbx_wasm_buffer_u8(b, WASM_OP_LOCAL_SET);
+  fbx_wasm_buffer_uleb(b, RegionG(r, FBX_GREG_RSP));
+}
+
+/* push l_tmp: write [rsp - 8], then rsp -= 8 (blink/stack.c PushN). */
+static void RegionPushTmp(struct RegionEmit *r, u32 i, u64 cur_pc) {
+  struct FbxWasmBuffer *b = r->body;
+  fbx_wasm_buffer_u8(b, WASM_OP_LOCAL_GET);
+  fbx_wasm_buffer_uleb(b, RegionG(r, FBX_GREG_RSP));
+  RegionI64Const(b, (u64)(i64)-8);
+  fbx_wasm_buffer_u8(b, WASM_OP_I64_ADD);
+  RegionMemWrite(r, i, cur_pc, 8, r->l_tmp);
+  RegionBumpRsp(r, -8);
+}
+
+/* l_tmp = [rsp], then rsp += 8 (blink/stack.c PopN). */
+static void RegionPopTmp(struct RegionEmit *r, u32 i, u64 cur_pc) {
+  struct FbxWasmBuffer *b = r->body;
+  fbx_wasm_buffer_u8(b, WASM_OP_LOCAL_GET);
+  fbx_wasm_buffer_uleb(b, RegionG(r, FBX_GREG_RSP));
+  RegionTranslate(r, i, cur_pc, /*need_rw=*/0, 8);
+  RegionLoadOp(b, 8);
+  fbx_wasm_buffer_u8(b, WASM_OP_LOCAL_SET);
+  fbx_wasm_buffer_uleb(b, r->l_tmp);
+  RegionBumpRsp(r, 8);
+}
+
+/* Leave the region for the guest PC in local `pc_local` (indirect control
+ * flow), from member i's top level. */
+static void RegionExitTo(struct RegionEmit *r, u32 i, u32 pc_local) {
+  struct FbxWasmBuffer *b = r->body;
+  fbx_wasm_buffer_u8(b, WASM_OP_LOCAL_GET);
+  fbx_wasm_buffer_uleb(b, pc_local);
+  fbx_wasm_buffer_u8(b, WASM_OP_LOCAL_SET);
+  fbx_wasm_buffer_uleb(b, r->l_exit_pc);
+  fbx_wasm_buffer_u8(b, WASM_OP_BR);
+  fbx_wasm_buffer_uleb(b, r->n - i);
+}
+
+/* f |= (i64 condition on the stack, as i32) << bit */
+static void RegionOrFlag(struct FbxWasmBuffer *b, u32 f, u32 bit) {
+  fbx_wasm_buffer_u8(b, WASM_OP_I32_CONST);
+  fbx_wasm_buffer_sleb(b, bit);
+  fbx_wasm_buffer_u8(b, WASM_OP_I32_SHL);
+  fbx_wasm_buffer_u8(b, WASM_OP_LOCAL_GET);
+  fbx_wasm_buffer_uleb(b, f);
+  fbx_wasm_buffer_u8(b, WASM_OP_I32_OR);
+  fbx_wasm_buffer_u8(b, WASM_OP_LOCAL_SET);
+  fbx_wasm_buffer_uleb(b, f);
+}
+
+/* The flags blink/alu.c's IncN / DecN / NegN leave, for operand `x_local`
+ * at `width`.  Blink's values, which are not all the hardware's: INC is
+ * called with y = 0, so its AF is always 0; NEG's AF is (x != 0).  INC and
+ * DEC keep CF (BumpFlags).  PF is the lazy byte at bits 24..31, as in
+ * AluFlags. */
+static void RegionUnaryFlags(struct RegionEmit *r, u8 kind, u32 x_local,
+                             u8 width) {
+  struct FbxWasmBuffer *b = r->body;
+  u32 z = ScratchZLocal(r->maxv), f = ScratchFlagsLocal(r->maxv);
+  u32 sign = SignBitPos(width);
+  u64 mask = WidthMask(width);
+  /* z = (x op) & mask */
+  if (kind == FBX_IR_FLAGS_NEG) {
+    RegionI64Const(b, 0);
+    EmitMaskedVreg(b, x_local, width);
+    fbx_wasm_buffer_u8(b, WASM_OP_I64_SUB);
+  } else {
+    EmitMaskedVreg(b, x_local, width);
+    RegionI64Const(b, 1);
+    fbx_wasm_buffer_u8(b, kind == FBX_IR_FLAGS_INC ? WASM_OP_I64_ADD
+                                                   : WASM_OP_I64_SUB);
+  }
+  RegionI64Const(b, mask);
+  fbx_wasm_buffer_u8(b, WASM_OP_I64_AND);
+  fbx_wasm_buffer_u8(b, WASM_OP_LOCAL_SET);
+  fbx_wasm_buffer_uleb(b, z);
+  /* f = m->flags & ~(CF|ZF|SF|OF|AF|PF byte), keeping CF for INC/DEC */
+  fbx_wasm_buffer_u8(b, WASM_OP_LOCAL_GET);
+  fbx_wasm_buffer_uleb(b, EMIT_LOCAL_M_PTR);
+  fbx_wasm_buffer_u8(b, WASM_OP_I32_LOAD);
+  fbx_wasm_buffer_uleb(b, 2);
+  fbx_wasm_buffer_uleb(b, M_OFF_FLAGS);
+  fbx_wasm_buffer_u8(b, WASM_OP_I32_CONST);
+  fbx_wasm_buffer_sleb(b, (i64)(i32)(EMIT_FLAGS_CLEAR_MASK |
+                                     (kind == FBX_IR_FLAGS_NEG
+                                          ? 0u
+                                          : 1u << EMIT_FLAGS_CF)));
+  fbx_wasm_buffer_u8(b, WASM_OP_I32_AND);
+  fbx_wasm_buffer_u8(b, WASM_OP_LOCAL_SET);
+  fbx_wasm_buffer_uleb(b, f);
+  /* ZF */
+  fbx_wasm_buffer_u8(b, WASM_OP_LOCAL_GET);
+  fbx_wasm_buffer_uleb(b, z);
+  fbx_wasm_buffer_u8(b, WASM_OP_I64_EQZ);
+  RegionOrFlag(b, f, EMIT_FLAGS_ZF);
+  /* SF */
+  fbx_wasm_buffer_u8(b, WASM_OP_LOCAL_GET);
+  fbx_wasm_buffer_uleb(b, z);
+  RegionI64Const(b, sign);
+  fbx_wasm_buffer_u8(b, WASM_OP_I64_SHR_U);
+  fbx_wasm_buffer_u8(b, WASM_OP_I32_WRAP_I64);
+  RegionOrFlag(b, f, EMIT_FLAGS_SF);
+  /* OF */
+  if (kind == FBX_IR_FLAGS_NEG) {
+    EmitMaskedVreg(b, x_local, width); /* x == the sign bit alone */
+    RegionI64Const(b, (u64)1 << sign);
+    fbx_wasm_buffer_u8(b, WASM_OP_I64_EQ);
+  } else {
+    /* INC: ((z ^ x) & (z ^ 1)) >> sign;  DEC: ((z ^ x) & (x ^ 1)) >> sign */
+    fbx_wasm_buffer_u8(b, WASM_OP_LOCAL_GET);
+    fbx_wasm_buffer_uleb(b, z);
+    EmitMaskedVreg(b, x_local, width);
+    fbx_wasm_buffer_u8(b, WASM_OP_I64_XOR);
+    if (kind == FBX_IR_FLAGS_INC) {
+      fbx_wasm_buffer_u8(b, WASM_OP_LOCAL_GET);
+      fbx_wasm_buffer_uleb(b, z);
+    } else {
+      EmitMaskedVreg(b, x_local, width);
+    }
+    RegionI64Const(b, 1);
+    fbx_wasm_buffer_u8(b, WASM_OP_I64_XOR);
+    fbx_wasm_buffer_u8(b, WASM_OP_I64_AND);
+    RegionI64Const(b, sign);
+    fbx_wasm_buffer_u8(b, WASM_OP_I64_SHR_U);
+    fbx_wasm_buffer_u8(b, WASM_OP_I32_WRAP_I64);
+  }
+  RegionOrFlag(b, f, EMIT_FLAGS_OF);
+  /* AF (INC: always 0) and, for NEG, CF */
+  if (kind == FBX_IR_FLAGS_DEC) {
+    EmitMaskedVreg(b, x_local, width);
+    RegionI64Const(b, 15);
+    fbx_wasm_buffer_u8(b, WASM_OP_I64_AND);
+    fbx_wasm_buffer_u8(b, WASM_OP_LOCAL_GET);
+    fbx_wasm_buffer_uleb(b, z);
+    RegionI64Const(b, 15);
+    fbx_wasm_buffer_u8(b, WASM_OP_I64_AND);
+    fbx_wasm_buffer_u8(b, WASM_OP_I64_LT_U);
+    RegionOrFlag(b, f, EMIT_FLAGS_AF);
+  } else if (kind == FBX_IR_FLAGS_NEG) {
+    EmitMaskedVreg(b, x_local, width);
+    RegionI64Const(b, 0);
+    fbx_wasm_buffer_u8(b, WASM_OP_I64_NE);
+    RegionOrFlag(b, f, EMIT_FLAGS_AF);
+    EmitMaskedVreg(b, x_local, width);
+    RegionI64Const(b, 0);
+    fbx_wasm_buffer_u8(b, WASM_OP_I64_NE);
+    RegionOrFlag(b, f, EMIT_FLAGS_CF);
+  }
+  /* PF byte */
+  fbx_wasm_buffer_u8(b, WASM_OP_LOCAL_GET);
+  fbx_wasm_buffer_uleb(b, z);
+  RegionI64Const(b, 0xFF);
+  fbx_wasm_buffer_u8(b, WASM_OP_I64_AND);
+  fbx_wasm_buffer_u8(b, WASM_OP_I32_WRAP_I64);
+  RegionOrFlag(b, f, 24u);
+  fbx_wasm_buffer_u8(b, WASM_OP_LOCAL_GET);
+  fbx_wasm_buffer_uleb(b, EMIT_LOCAL_M_PTR);
+  fbx_wasm_buffer_u8(b, WASM_OP_LOCAL_GET);
+  fbx_wasm_buffer_uleb(b, f);
+  fbx_wasm_buffer_u8(b, WASM_OP_I32_STORE);
+  fbx_wasm_buffer_uleb(b, 2);
+  fbx_wasm_buffer_uleb(b, M_OFF_FLAGS);
+}
+
+/* Push a memory operand's VA: base (+ index*scale) + disp, or absolute. */
+static void RegionMemEa(struct RegionEmit *r, const struct FbxIrInst *p,
+                        int index_in_dst) {
+  if (p->src1_kind == FBX_IR_KIND_IMM) {
+    RegionI64Const(r->body, p->imm);
+    return;
+  }
+  if (index_in_dst) {
+    RegionEa(r, p->src1, p->dst_kind == FBX_IR_KIND_GREG, p->dst, p->scale,
+             p->imm);
+  } else {
+    RegionEa(r, p->src1, p->src2_kind == FBX_IR_KIND_GREG, p->src2, p->scale,
+             p->imm);
+  }
+}
+
 static int RegionEmitMember(struct RegionEmit *r, u32 i) {
   struct FbxWasmBuffer *b = r->body;
   const struct FbxIrBlock *ir = r->irs[i];
@@ -4477,8 +4917,7 @@ static int RegionEmitMember(struct RegionEmit *r, u32 i) {
         break;
       case FBX_IR_OP_LOAD: {
         u8 w = RegionWidth(p->width);
-        RegionEa(r, p->src1, p->src2_kind == FBX_IR_KIND_GREG, p->src2,
-                 p->scale, p->imm);
+        RegionMemEa(r, p, /*index_in_dst=*/0);
         RegionTranslate(r, i, cur_pc, /*need_rw=*/0, w);
         RegionLoadOp(b, w);
         fbx_wasm_buffer_u8(b, WASM_OP_LOCAL_SET);
@@ -4492,8 +4931,54 @@ static int RegionEmitMember(struct RegionEmit *r, u32 i) {
       case FBX_IR_OP_XOR:
         if (!EmitAlu(b, p)) return 0;
         break;
+      case FBX_IR_OP_STORE:
+        RegionMemEa(r, p, /*index_in_dst=*/1);
+        RegionMemWrite(r, i, cur_pc, RegionWidth(p->width),
+                       VregLocal(p->src2));
+        break;
+      case FBX_IR_OP_PUSH:
+        fbx_wasm_buffer_u8(b, WASM_OP_LOCAL_GET); /* the value before rsp */
+        fbx_wasm_buffer_uleb(b, RegionG(r, p->src1));
+        fbx_wasm_buffer_u8(b, WASM_OP_LOCAL_SET);
+        fbx_wasm_buffer_uleb(b, r->l_tmp);
+        RegionPushTmp(r, i, cur_pc);
+        break;
+      case FBX_IR_OP_POP:
+        RegionPopTmp(r, i, cur_pc);
+        fbx_wasm_buffer_u8(b, WASM_OP_LOCAL_GET); /* after rsp: pop %rsp */
+        fbx_wasm_buffer_uleb(b, r->l_tmp);
+        fbx_wasm_buffer_u8(b, WASM_OP_LOCAL_SET);
+        fbx_wasm_buffer_uleb(b, RegionG(r, p->dst));
+        break;
+      case FBX_IR_OP_CALL_DIRECT:
+        RegionI64Const(b, tc->end_pc);
+        fbx_wasm_buffer_u8(b, WASM_OP_LOCAL_SET);
+        fbx_wasm_buffer_uleb(b, r->l_tmp);
+        RegionPushTmp(r, i, cur_pc);
+        RegionGoto(r, i, p->imm, 0u);
+        return 1;
+      case FBX_IR_OP_CALL_INDIRECT:
+        RegionI64Const(b, tc->end_pc);
+        fbx_wasm_buffer_u8(b, WASM_OP_LOCAL_SET);
+        fbx_wasm_buffer_uleb(b, r->l_tmp);
+        RegionPushTmp(r, i, cur_pc);
+        RegionExitTo(r, i, VregLocal(p->src1));
+        return 1;
+      case FBX_IR_OP_JMP_INDIRECT:
+        RegionExitTo(r, i, VregLocal(p->src1));
+        return 1;
+      case FBX_IR_OP_RET:
+        RegionPopTmp(r, i, cur_pc);
+        RegionExitTo(r, i, r->l_tmp);
+        return 1;
       case FBX_IR_OP_SET_FLAGS_RAW:
         if (!RegionFlagsLive(ir, j)) break;
+        if ((u8)p->imm == FBX_IR_FLAGS_INC || (u8)p->imm == FBX_IR_FLAGS_DEC ||
+            (u8)p->imm == FBX_IR_FLAGS_NEG) {
+          RegionUnaryFlags(r, (u8)p->imm, VregLocal(p->src1),
+                           RegionWidth(p->width));
+          break;
+        }
         EmitFlagsAfterAlu(b, r->maxv, (u8)p->imm, VregLocal(p->src1),
                           VregLocal(p->src2), RegionWidth(p->width));
         break;
@@ -4552,9 +5037,25 @@ int fbx_ir_emit_region_wasm(const struct FbxIrBlock *const *irs,
           break;
         case FBX_IR_OP_LOAD:
         case FBX_IR_OP_LEA:
-          used |= 1u << p->src1;
+          if (p->src1_kind == FBX_IR_KIND_GREG) used |= 1u << p->src1;
           if (p->src2_kind == FBX_IR_KIND_GREG) used |= 1u << p->src2;
           if (p->opcode == FBX_IR_OP_LEA) written |= 1u << p->dst;
+          break;
+        case FBX_IR_OP_STORE:
+          if (p->src1_kind == FBX_IR_KIND_GREG) used |= 1u << p->src1;
+          if (p->dst_kind == FBX_IR_KIND_GREG) used |= 1u << p->dst;
+          break;
+        case FBX_IR_OP_PUSH:
+          used |= 1u << p->src1;
+          written |= 1u << FBX_GREG_RSP;
+          break;
+        case FBX_IR_OP_POP:
+          written |= 1u << p->dst | 1u << FBX_GREG_RSP;
+          break;
+        case FBX_IR_OP_CALL_DIRECT:
+        case FBX_IR_OP_CALL_INDIRECT:
+        case FBX_IR_OP_RET:
+          written |= 1u << FBX_GREG_RSP;
           break;
         default:
           break;
@@ -4567,7 +5068,8 @@ int fbx_ir_emit_region_wasm(const struct FbxIrBlock *const *irs,
   r.tcs = tcs;
   r.n = n;
   r.maxv = (u16)maxv;
-  r.count = count_insns;
+  r.count = (count_insns & FBX_REGION_EMIT_COUNT) != 0;
+  r.log = (count_insns & FBX_REGION_EMIT_LOG) != 0;
   /* Locals: params m_ptr(0) ctx(1); vregs at VregLocal (2..); scratch_z,
    * scratch_flags where EmitFlagsAfterAlu(maxv) expects them; then ours. */
   r.l_g0 = EMIT_LOCAL_VREG_BASE + maxv + EMIT_NUM_SCRATCH_LOCALS;
@@ -4575,9 +5077,12 @@ int fbx_ir_emit_region_wasm(const struct FbxIrBlock *const *irs,
   r.l_mmu_entry = r.l_mmu_va + 1u;
   r.l_exit_pc = r.l_mmu_va + 2u;
   r.l_icount = r.l_mmu_va + 3u;
-  r.l_cur = r.l_mmu_va + 4u;
-  r.l_budget = r.l_mmu_va + 5u;
-  r.l_rc = r.l_mmu_va + 6u;
+  r.l_tmp = r.l_mmu_va + 4u;
+  r.l_cur = r.l_mmu_va + 5u;
+  r.l_budget = r.l_mmu_va + 6u;
+  r.l_rc = r.l_mmu_va + 7u;
+  r.l_off = r.l_mmu_va + 8u;
+  r.l_logp = r.l_mmu_va + 9u;
   fbx_wasm_buffer_init(&fn);
   r.body = &fn;
   fbx_wasm_buffer_uleb(&fn, 4);
@@ -4585,9 +5090,9 @@ int fbx_ir_emit_region_wasm(const struct FbxIrBlock *const *irs,
   fbx_wasm_buffer_u8(&fn, WASM_VALTYPE_I64);
   fbx_wasm_buffer_uleb(&fn, 1);              /* scratch_flags */
   fbx_wasm_buffer_u8(&fn, WASM_VALTYPE_I32);
-  fbx_wasm_buffer_uleb(&fn, FBX_REGION_NGREGS + 4u); /* G0..15, mmu x2, exit, icount */
+  fbx_wasm_buffer_uleb(&fn, FBX_REGION_NGREGS + 5u); /* G0..15, mmu x2, exit, icount, tmp */
   fbx_wasm_buffer_u8(&fn, WASM_VALTYPE_I64);
-  fbx_wasm_buffer_uleb(&fn, 3);              /* cur, budget, rc */
+  fbx_wasm_buffer_uleb(&fn, 5);              /* cur, budget, rc, off, logp */
   fbx_wasm_buffer_u8(&fn, WASM_VALTYPE_I32);
   /* Prologue: the registers the region reads or writes, into locals. */
   for (k = 0; k < FBX_REGION_NGREGS; ++k) {

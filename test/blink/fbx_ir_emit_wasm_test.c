@@ -1956,7 +1956,7 @@ TEST(FbxWasm599, IrVersionBumped) {
    * Emit flipped from synthesize to refuse for a whole block class (any block
    * whose last flag-definer is an IMUL), so stale v8 sidecars must invalidate
    * rather than serve the fail-open wasm they already hold. */
-  ASSERT_EQ(10u, (u32)FBX_IR_VERSION);
+  ASSERT_EQ(11u, (u32)FBX_IR_VERSION);
 }
 
 TEST(FbxWasm599, FlagSynthDifferentOpKindProducesDifferentBytes) {
@@ -2630,13 +2630,15 @@ TEST(FbxRegion, RgDfaLoopMembersAreAdmittedAndEmit) {
   }
 }
 
-/* Lift-and-ask helper: is this one-or-two instruction block a member? */
+/* Lift-and-ask helper: is this one-or-two instruction block a member?  The
+ * block is lifted as a region member (fbx_ir_lift_region), as
+ * fbx_t2_glue.c's Fbxt2TryRegion lifts it. */
 static int RegionMemberOkBytes(const struct RgInsn *ins, unsigned n) {
   struct FbxTcBlock *tc = DecodeTc(ins, n);
   struct FbxIrBlock *ir;
   int ok;
   if (!tc) return -1;
-  ir = fbx_ir_lift(tc);
+  ir = fbx_ir_lift_region(tc);
   if (!ir) {
     FreeTc(tc);
     return -1;
@@ -2647,33 +2649,94 @@ static int RegionMemberOkBytes(const struct RgInsn *ins, unsigned n) {
   return ok;
 }
 
-TEST(FbxRegion, MembersThatWriteMemoryOrCannotBeLoweredAreRefused) {
-  /* mov [rax+8], ebx ; jne — a STORE: regions never write guest memory. */
-  static const struct RgInsn store[] = {
-      {0x1000, 3, {0x89, 0x58, 0x08}}, {0x1003, 2, {0x75, 0xfb}}};
-  /* cmp eax, ebx ; jp — PF/NP is not synthesizable. */
-  static const struct RgInsn jp[] = {
-      {0x1000, 2, {0x39, 0xd8}}, {0x1002, 2, {0x7a, 0xfc}}};
-  /* cmp eax, ebx ; jne — the positive control: admitted. */
+/* Does the PER-BLOCK lift of this block BAIL? */
+static int PerBlockLiftBails(const struct RgInsn *ins, unsigned n) {
+  struct FbxTcBlock *tc = DecodeTc(ins, n);
+  struct FbxIrBlock *ir;
+  int bails;
+  if (!tc) return -1;
+  ir = fbx_ir_lift(tc);
+  if (!ir) {
+    FreeTc(tc);
+    return -1;
+  }
+  bails = (ir->flags & FBX_IR_BLOCK_FLAG_HAS_BAILOUT) != 0;
+  fbx_ir_free(ir);
+  FreeTc(tc);
+  return bails;
+}
+
+TEST(FbxRegion, MembersThatCannotBeLoweredAreRefused) {
+  /* cmp eax, ebx ; jne — admitted. */
   static const struct RgInsn jne[] = {
       {0x1000, 2, {0x39, 0xd8}}, {0x1002, 2, {0x75, 0xfc}}};
-  /* push rbx ; jmp — a stack op. */
-  static const struct RgInsn push[] = {
+  /* firebox#T3R2: stores, stack ops, calls and returns are region members. */
+  static const struct RgInsn store[] = { /* mov [rax+8], ebx ; jne */
+      {0x1000, 3, {0x89, 0x58, 0x08}}, {0x1003, 2, {0x75, 0xfb}}};
+  static const struct RgInsn store_ix[] = { /* mov [r12+rdi], bpl ; jne */
+      {0x1000, 4, {0x41, 0x88, 0x2c, 0x3c}}, {0x1004, 2, {0x75, 0xfa}}};
+  static const struct RgInsn push[] = { /* push rbx ; jmp */
       {0x1000, 1, {0x53}}, {0x1001, 2, {0xeb, 0xfd}}};
-  /* imul eax, ebx ; jmp — IMUL is per-block only. */
-  static const struct RgInsn imul[] = {
-      {0x1000, 3, {0x0f, 0xaf, 0xc3}}, {0x1003, 2, {0xeb, 0xfb}}};
-  /* syscall — a BAILOUT. */
-  static const struct RgInsn sys[] = {{0x1000, 2, {0x0f, 0x05}}};
-  /* ret */
   static const struct RgInsn ret[] = {{0x1000, 1, {0xc3}}};
+  static const struct RgInsn callr[] = {{0x1000, 2, {0xff, 0xd0}}}; /* call rax */
+  static const struct RgInsn jmpm[] = { /* jmp [rip+0x10] */
+      {0x1000, 6, {0xff, 0x25, 0x10, 0x00, 0x00, 0x00}}};
+  static const struct RgInsn inc[] = { /* inc rax ; jne */
+      {0x1000, 3, {0x48, 0xff, 0xc0}}, {0x1003, 2, {0x75, 0xfb}}};
+  static const struct RgInsn neg[] = { /* neg rcx ; jne */
+      {0x1000, 3, {0x48, 0xf7, 0xd9}}, {0x1003, 2, {0x75, 0xfb}}};
+  static const struct RgInsn cmpm[] = { /* cmp [rax+rcx], r14b ; jne */
+      {0x1000, 4, {0x44, 0x38, 0x34, 0x08}}, {0x1004, 2, {0x75, 0xfa}}};
+  static const struct RgInsn testi[] = { /* test al, 1 ; jne */
+      {0x1000, 2, {0xa8, 0x01}}, {0x1002, 2, {0x75, 0xfc}}};
+  /* Refused: */
+  static const struct RgInsn jp[] = { /* cmp eax, ebx ; jp — PF/NP */
+      {0x1000, 2, {0x39, 0xd8}}, {0x1002, 2, {0x7a, 0xfc}}};
+  static const struct RgInsn imul[] = { /* imul eax, ebx ; jmp */
+      {0x1000, 3, {0x0f, 0xaf, 0xc3}}, {0x1003, 2, {0xeb, 0xfb}}};
+  static const struct RgInsn sys[] = {{0x1000, 2, {0x0f, 0x05}}};
+  static const struct RgInsn rmw[] = { /* add [rax], ebx ; jne */
+      {0x1000, 2, {0x01, 0x18}}, {0x1002, 2, {0x75, 0xfc}}};
+  static const struct RgInsn incm[] = { /* inc dword [rax] ; jne */
+      {0x1000, 2, {0xff, 0x00}}, {0x1002, 2, {0x75, 0xfc}}};
+  static const struct RgInsn push16[] = { /* push bx (66) ; jmp */
+      {0x1000, 2, {0x66, 0x53}}, {0x1002, 2, {0xeb, 0xfc}}};
+  static const struct RgInsn mulr[] = { /* mul rbx (F7 /4) ; jmp */
+      {0x1000, 3, {0x48, 0xf7, 0xe3}}, {0x1003, 2, {0xeb, 0xfb}}};
+  static const struct RgInsn pushm[] = { /* push [rax] (FF /6) ; jmp */
+      {0x1000, 2, {0xff, 0x30}}, {0x1002, 2, {0xeb, 0xfc}}};
+  static const struct RgInsn lockinc[] = { /* lock inc dword [rax] ; jmp */
+      {0x1000, 3, {0xf0, 0xff, 0x00}}, {0x1003, 2, {0xeb, 0xfb}}};
   EXPECT_EQ(1, RegionMemberOkBytes(jne, 2));
-  EXPECT_EQ(0, RegionMemberOkBytes(store, 2));
+  EXPECT_EQ(1, RegionMemberOkBytes(store, 2));
+  EXPECT_EQ(1, RegionMemberOkBytes(store_ix, 2));
+  EXPECT_EQ(1, RegionMemberOkBytes(push, 2));
+  EXPECT_EQ(1, RegionMemberOkBytes(ret, 1));
+  EXPECT_EQ(1, RegionMemberOkBytes(callr, 1));
+  EXPECT_EQ(1, RegionMemberOkBytes(jmpm, 1));
+  EXPECT_EQ(1, RegionMemberOkBytes(inc, 2));
+  EXPECT_EQ(1, RegionMemberOkBytes(neg, 2));
+  EXPECT_EQ(1, RegionMemberOkBytes(cmpm, 2));
+  EXPECT_EQ(1, RegionMemberOkBytes(testi, 2));
   EXPECT_EQ(0, RegionMemberOkBytes(jp, 2));
-  EXPECT_EQ(0, RegionMemberOkBytes(push, 2));
   EXPECT_EQ(0, RegionMemberOkBytes(imul, 2));
   EXPECT_EQ(0, RegionMemberOkBytes(sys, 1));
-  EXPECT_EQ(0, RegionMemberOkBytes(ret, 1));
+  EXPECT_EQ(0, RegionMemberOkBytes(rmw, 2));
+  EXPECT_EQ(0, RegionMemberOkBytes(incm, 2));
+  EXPECT_EQ(0, RegionMemberOkBytes(push16, 2));
+  EXPECT_EQ(0, RegionMemberOkBytes(mulr, 2));
+  EXPECT_EQ(0, RegionMemberOkBytes(pushm, 2));
+  EXPECT_EQ(0, RegionMemberOkBytes(lockinc, 2));
+  /* The region-only forms stay off the per-block path: its lift BAILs. */
+  EXPECT_EQ(1, PerBlockLiftBails(store_ix, 2));
+  EXPECT_EQ(1, PerBlockLiftBails(callr, 1));
+  EXPECT_EQ(1, PerBlockLiftBails(jmpm, 1));
+  EXPECT_EQ(1, PerBlockLiftBails(inc, 2));
+  EXPECT_EQ(1, PerBlockLiftBails(neg, 2));
+  EXPECT_EQ(1, PerBlockLiftBails(cmpm, 2));
+  EXPECT_EQ(1, PerBlockLiftBails(testi, 2));
+  EXPECT_EQ(1, PerBlockLiftBails(rmw, 2));
+  EXPECT_EQ(0, PerBlockLiftBails(store, 2)); /* #677's base+disp store */
 }
 
 /* ────────────────────────────────────────────────────────────────────────── */
