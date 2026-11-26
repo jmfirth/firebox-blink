@@ -388,7 +388,7 @@ void Fbxt2ResetEnvCacheForTest(void) {
 
 struct Fbxt2RegionCtx {
   struct FbxT2BlockCtx ctx; /* first: the module reads it */
-  u8 log[FBX_T2_REGION_LOG_CAP][16];
+  u8 log[FBX_T2_REGION_LOG_CAP][FBX_REGION_LOG_ENTRY];
 };
 /* FbxT2BlockState::region.  ABANDONED: the region compile stayed pending for
  * every attempt; the block takes the per-block path, with fresh attempts. */
@@ -573,9 +573,10 @@ static int Fbxt2TryRegion(struct Machine *m, struct FbxTcBlock *b,
   if (logging) {
     /* consts[1..3]: the store log (FBX_REGION_EMIT_LOG) */
     ctx->nconsts = 4;
-    ctx->consts[1] = (u64)(uintptr_t)((struct Fbxt2RegionCtx *)ctx)->log;
-    ctx->consts[2] = 0;
-    ctx->consts[3] = FBX_T2_REGION_LOG_CAP;
+    ctx->consts[FBX_REGION_LOG_BASE] =
+        (u64)(uintptr_t)((struct Fbxt2RegionCtx *)ctx)->log;
+    ctx->consts[FBX_REGION_LOG_USED] = 0;
+    ctx->consts[FBX_REGION_LOG_CAP] = FBX_T2_REGION_LOG_CAP;
   }
   funcref = fbx_t2_instantiate((u64)(uintptr_t)m->system, buf.data,
                                (u32)buf.len, ctx);
@@ -653,11 +654,11 @@ static int Fbxt2RegionVerifiedCall(struct Machine *m,
   pre_flags = m->flags;
   pre_ip = m->ip;
   ctx->consts[0] = 0;
-  ctx->consts[2] = 0;
+  ctx->consts[FBX_REGION_LOG_USED] = 0;
   rc = fbx_t2_call((uintptr_t)(u32)st->funcref, m_ptr,
                    (i32)(intptr_t)st->block_ctx);
   n = ctx->consts[0];
-  nlog = ctx->consts[2];
+  nlog = ctx->consts[FBX_REGION_LOG_USED];
   if (nlog > FBX_T2_REGION_LOG_CAP) nlog = FBX_T2_REGION_LOG_CAP; /* cannot */
   for (k = 0; k < nlog; ++k) {
     u32 off, w;
@@ -999,6 +1000,18 @@ int Fbxt2Dispatch(struct Machine *m, struct FbxTcBlock *b,
      * linker-owned) `__indirect_function_table` — see the table's comment. */
     i32 ctx_ptr = (i32)(intptr_t)st->block_ctx;
     if (st->region == FBX_T2_REGION_INSTALLED && g_t2_region_verify_every &&
+        (m->ip != b->start_pc || !IsOrphan(m))) {
+      /* firebox#T3R2: verification is single-threaded.  Every verifying
+       * region shares one store log and the undo rewrites whole windows, so
+       * with a second thread it would race that thread's stores.  Tier 1
+       * runs the block instead (exit 1 at its first entry), loudly. */
+      static _Atomic(int) said;
+      if (!atomic_exchange_explicit(&said, 1, memory_order_relaxed)) {
+        T2TraceLine(1, "[t2 region] verify: the process has threads; "
+                       "regions are not run while verifying\n");
+      }
+      exit_code = 1;
+    } else if (st->region == FBX_T2_REGION_INSTALLED && g_t2_region_verify_every &&
         atomic_fetch_add_explicit(&g_t2_region_stats.tick, 1,
                                   memory_order_relaxed) %
                 g_t2_region_verify_every == 0) {
@@ -1007,7 +1020,7 @@ int Fbxt2Dispatch(struct Machine *m, struct FbxTcBlock *b,
       if (st->region == FBX_T2_REGION_INSTALLED && g_t2_region_verify_every) {
         /* firebox#T3R2: this region logs its stores; an unverified call
          * starts from an empty log too. */
-        ((struct FbxT2BlockCtx *)st->block_ctx)->consts[2] = 0;
+        ((struct FbxT2BlockCtx *)st->block_ctx)->consts[FBX_REGION_LOG_USED] = 0;
       }
       exit_code = fbx_t2_call((uintptr_t)(u32)st->funcref, m_ptr, ctx_ptr);
       if (st->region == FBX_T2_REGION_INSTALLED && g_t2_region_count) {

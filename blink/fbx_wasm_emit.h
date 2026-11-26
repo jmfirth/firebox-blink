@@ -277,6 +277,12 @@ u32 fbx_ir_region_successors(const struct FbxIrBlock *ir,
  * refused. */
 #define FBX_REGION_EMIT_COUNT 1
 #define FBX_REGION_EMIT_LOG 2
+/* The store log's FbxT2BlockCtx slots and entry size, shared by the emitter
+ * and fbx_t2_glue.c's verifier (layout: fbx_ir_emit_wasm.c, RegionLogStore). */
+#define FBX_REGION_LOG_BASE 1u
+#define FBX_REGION_LOG_USED 2u
+#define FBX_REGION_LOG_CAP 3u
+#define FBX_REGION_LOG_ENTRY 16u
 int fbx_ir_emit_region_wasm(const struct FbxIrBlock *const *irs,
                             const struct FbxTcBlock *const *tcs, u32 n,
                             int count_insns, u32 budget,
