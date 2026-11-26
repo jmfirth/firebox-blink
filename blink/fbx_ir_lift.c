@@ -503,7 +503,13 @@ static int LiftOperandRoles(u64 mop) {
     case 0x080: case 0x0C6: case 0x1B6:
     case 0x0F6: case 0x0FE: /* firebox#T3R2: TEST/NOT/NEG, INC/DEC r/m8 */
     case 0x1BE: /* firebox#T3R3: MOVSX r, r/m8 */
+    case 0x190: case 0x191: case 0x192: case 0x193: /* firebox#T3R3: SETcc */
+    case 0x194: case 0x195: case 0x196: case 0x197:
+    case 0x198: case 0x199: case 0x19A: case 0x19B:
+    case 0x19C: case 0x19D: case 0x19E: case 0x19F:
       return FBX_LIFT_HAS_MODRM | FBX_LIFT_RM_BYTE;
+    case 0x11F: /* firebox#T3R3: NOP r/m (no access, any segment) */
+      return FBX_LIFT_HAS_MODRM | FBX_LIFT_NO_SEG;
     /* Word/dword/qword ModRM ops — no byte register in either field. */
     case 0x089: case 0x08B: case 0x0C7:
     case 0x001: case 0x009: case 0x021: case 0x029: case 0x031: case 0x039:
@@ -537,7 +543,7 @@ static int LiftOperandRoles(u64 mop) {
     case 0x18C: case 0x18D: case 0x18E: case 0x18F:
     case 0x0E8: case 0x0E9: case 0x0EB: case 0x0C3:
     case 0x0A8: case 0x0A9: /* firebox#T3R2: TEST AL/rAX, imm */
-    case 0x098: /* firebox#T3R3: CWDE/CDQE */
+    case 0x098: case 0x099: /* firebox#T3R3: CWDE/CDQE, CDQ/CQO */
     case 0x050: case 0x051: case 0x052: case 0x053:
     case 0x054: case 0x055: case 0x056: case 0x057:
     case 0x058: case 0x059: case 0x05A: case 0x05B:
@@ -621,7 +627,8 @@ static int LiftOperandShapeUnmodelled(u64 rde, u64 mop, int region) {
   if (mop == 0x0FF && !(ModrmReg(rde) <= 2 || ModrmReg(rde) == 4)) return 1;
   /* firebox#T3R3: sign extension into 4 or 8 bytes only (no operand-size
    * prefix: CBW, MOVSX r16), and MOVSXD only with REX.W. */
-  if ((mop == 0x063 || mop == 0x098 || mop == 0x1BE || mop == 0x1BF) &&
+  if ((mop == 0x063 || mop == 0x098 || mop == 0x099 || mop == 0x1BE ||
+       mop == 0x1BF) &&
       Osz(rde)) {
     return 1;
   }
@@ -1819,6 +1826,72 @@ static int LiftCmovRegion(struct LiftCtx *ctx, u64 rde, u64 mop) {
   return 1;
 }
 
+/* firebox#T3R3 — SETcc r/m8 (0F 90..9F), regions only: a CMOV of 1 and 0
+ * at width 1, into the byte register or a byte STORE.  P/NP stay refused.
+ * CDQ/CQO (0x99): rDX = rAX >> (8 * width - 1), arithmetic; no flags. */
+static int LiftSetccRegion(struct LiftCtx *ctx, u64 rde, i64 disp, u64 mop) {
+  struct LiftAddr a;
+  struct FbxIrInst *cm, *set;
+  u32 one, zero, z;
+  if (!ctx->region || (mop & 0xEu) == 0xAu) return -1;
+  if (!IsModrmRegister(rde) && !LiftClassifyAddr(ctx, rde, disp, &a)) {
+    return -1;
+  }
+  if (!LiftGetImm(ctx, 1, 1, &one)) return 0;
+  if (!LiftGetImm(ctx, 1, 0, &zero)) return 0;
+  cm = CtxEmit(ctx);
+  if (!cm) return 0;
+  z = CtxAllocVreg(ctx);
+  cm->opcode = FBX_IR_OP_CMOV;
+  cm->width = 1;
+  cm->dst_kind = FBX_IR_KIND_VREG;
+  cm->dst = z;
+  cm->src1_kind = FBX_IR_KIND_VREG;
+  cm->src1 = one;
+  cm->src2_kind = FBX_IR_KIND_VREG;
+  cm->src2 = zero;
+  cm->imm = mop & 0xFu;
+  if (!IsModrmRegister(rde)) return LiftEmitStore(ctx, &a, 1, z);
+  set = CtxEmit(ctx);
+  if (!set) return 0;
+  set->opcode = FBX_IR_OP_REG_SET;
+  set->width = 1;
+  set->dst_kind = FBX_IR_KIND_GREG;
+  set->dst = (u32)RexbRm(rde);
+  set->src1_kind = FBX_IR_KIND_VREG;
+  set->src1 = z;
+  return 1;
+}
+
+static int LiftCqoRegion(struct LiftCtx *ctx, u64 rde) {
+  u8 w = WidthFromRde(rde, 0);
+  u32 x, c, z;
+  struct FbxIrInst *sh, *set;
+  if (!ctx->region || (w != 4 && w != 8)) return -1;
+  if (!LiftGetReg(ctx, w, 0, &x)) return 0;
+  if (!LiftGetImm(ctx, 1, 8u * w - 1u, &c)) return 0;
+  sh = CtxEmit(ctx);
+  if (!sh) return 0;
+  z = CtxAllocVreg(ctx);
+  sh->opcode = FBX_IR_OP_SAR;
+  sh->width = w;
+  sh->dst_kind = FBX_IR_KIND_VREG;
+  sh->dst = z;
+  sh->src1_kind = FBX_IR_KIND_VREG;
+  sh->src1 = x;
+  sh->src2_kind = FBX_IR_KIND_VREG;
+  sh->src2 = c;
+  set = CtxEmit(ctx);
+  if (!set) return 0;
+  set->opcode = FBX_IR_OP_REG_SET;
+  set->width = w;
+  set->dst_kind = FBX_IR_KIND_GREG;
+  set->dst = 2; /* rDX */
+  set->src1_kind = FBX_IR_KIND_VREG;
+  set->src1 = z;
+  return 1;
+}
+
 /* firebox#T3R3 — sign extension, regions only:
  *   0x063 MOVSXD r64, r/m32 (REX.W)      0x1BE MOVSX r, r/m8
  *   0x1BF MOVSX r, r/m16                 0x098 CWDE (EAX = sext AX) and
@@ -2065,6 +2138,15 @@ static int LiftOneOp(struct LiftCtx *ctx, const struct FbxTcEntry *e,
     case 0x1B7: return LiftMovzx(ctx, rde, e->disp, 2);
     case 0x063: case 0x098: case 0x1BE: case 0x1BF: /* firebox#T3R3 */
       return LiftSextRegion(ctx, rde, e->disp, mop);
+    case 0x099: /* firebox#T3R3 */
+      return LiftCqoRegion(ctx, rde);
+    case 0x11F: /* firebox#T3R3: multi-byte NOP: nothing to do */
+      return ctx->region ? 1 : -1;
+    case 0x190: case 0x191: case 0x192: case 0x193: /* firebox#T3R3 */
+    case 0x194: case 0x195: case 0x196: case 0x197:
+    case 0x198: case 0x199: case 0x19A: case 0x19B:
+    case 0x19C: case 0x19D: case 0x19E: case 0x19F:
+      return LiftSetccRegion(ctx, rde, e->disp, mop);
     case 0x140: case 0x141: case 0x142: case 0x143: /* firebox#T3R3 */
     case 0x144: case 0x145: case 0x146: case 0x147:
     case 0x148: case 0x149: case 0x14A: case 0x14B:

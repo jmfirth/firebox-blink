@@ -882,6 +882,11 @@ static int CoverageGateMode(const struct FbxIrBlock *ir,
         case 0x144: case 0x145: case 0x146: case 0x147:
         case 0x148: case 0x149: case 0x14C: case 0x14D:
         case 0x14E: case 0x14F: /* not P/NP (0x14A/0x14B) */
+        case 0x190: case 0x191: case 0x192: case 0x193:
+        case 0x194: case 0x195: case 0x196: case 0x197:
+        case 0x198: case 0x199: case 0x19C: case 0x19D:
+        case 0x19E: case 0x19F: /* not P/NP */
+        case 0x099: case 0x11F:
           ok = 1;
           break;
         case 0x0C6: case 0x0C7:
@@ -4416,7 +4421,8 @@ int fbx_ir_region_member_ok(const struct FbxIrBlock *ir,
         ok &= p->dst_kind == FBX_IR_KIND_VREG && p->dst < ir->nvregs &&
               p->src1_kind == FBX_IR_KIND_VREG && p->src1 < ir->nvregs &&
               p->src2_kind == FBX_IR_KIND_VREG && p->src2 < ir->nvregs &&
-              (p->width == 2 || p->width == 4 || p->width == 8) &&
+              (p->width == 1 || p->width == 2 || p->width == 4 ||
+               p->width == 8) &&
               p->imm < 16 && (p->imm & 0xEu) != 0xAu;
         break;
       case FBX_IR_OP_SEXT: /* firebox#T3R3 */

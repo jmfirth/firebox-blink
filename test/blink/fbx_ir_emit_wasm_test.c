@@ -3923,6 +3923,107 @@ TEST(FbxRegionExec, ReadModifyWriteMemory) {
   }
 }
 
+TEST(FbxRegionExec, SetccCqoAndNops) {
+  /* firebox#T3R3: setcc dl (no REX), setcc r9b, setcc [rdi+3] for every
+   * condition but P/NP over every CF/ZF/SF/OF combination against
+   * kConditionCode; CDQ/CQO; 0F 1F NOPs (memory operand never touched,
+   * segment and operand-size prefixes included). */
+  static const u32 fl[4] = {1u << 0, 1u << 6, 1u << 7, 1u << 11};
+  unsigned cc, f, k, form;
+  for (form = 0; form < 3; ++form) {
+    for (cc = 0; cc < 16; ++cc) {
+      if (cc == 0xA || cc == 0xB) continue;
+      for (f = 0; f < 16; ++f) {
+        struct RgInsn b[2];
+        const struct RgInsn *blocks[1] = {b};
+        unsigned lens[1] = {2}, n = 0;
+        struct Machine m0, om;
+        struct RxRun r;
+        u64 want;
+        memset(b, 0, sizeof b);
+        if (form == 1) b[0].bytes[n++] = 0x41;
+        b[0].bytes[n++] = 0x0f;
+        b[0].bytes[n++] = (u8)(0x90 + cc);
+        if (form == 2) {
+          b[0].bytes[n++] = 0x47; /* [rdi+3] */
+          b[0].bytes[n++] = 0x03;
+        } else {
+          b[0].bytes[n++] = form == 1 ? 0xc1 : 0xc2; /* r9b / dl */
+        }
+        b[0].ip = RX_CODE;
+        b[0].len = (u8)n;
+        b[1].ip = RX_CODE + n;
+        b[1].len = 2;
+        b[1].bytes[0] = 0xeb;
+        b[1].bytes[1] = 0xfe;
+        RxMachine(&m0);
+        m0.flags = 0x202 | (0x5Au << 24);
+        for (k = 0; k < 4; ++k) {
+          if (f & (1u << k)) m0.flags |= fl[k];
+        }
+        RxSetG(&m0, 2, 0x1122334455667788ull);
+        RxSetG(&m0, 9, 0x8899aabbccddeeffull);
+        RxSetG(&m0, 7, RX_DATA_VA);
+        om = m0;
+        want = kConditionCode[cc](&om) ? 1 : 0;
+        RxExec(blocks, lens, 1, &m0, 0, &r);
+        ASSERT_EQ(0, r.err);
+        if (form == 0) EXPECT_EQ(0x1122334455667700ull | want, RxG(&r.m, 2));
+        if (form == 1) EXPECT_EQ(0x8899aabbccddee00ull | want, RxG(&r.m, 9));
+        if (form == 2) {
+          EXPECT_EQ(want, r.frames[0][3]);
+          EXPECT_EQ('g', r.frames[0][2]);
+          EXPECT_EQ('o', r.frames[0][4]);
+        }
+        EXPECT_EQ(m0.flags, r.m.flags);
+        EXPECT_EQ(RX_CODE + n, r.m.ip);
+      }
+    }
+  }
+  {
+    static const struct {
+      u8 len, bytes[12];
+      u64 rax, rdx_want;
+    } t[] = {
+        {2, {0x48, 0x99}, 0x8000000000000000ull, ~0ull},
+        {2, {0x48, 0x99}, 0x7fffffffffffffffull, 0},
+        {1, {0x99}, 0x0000000080000000ull, 0x00000000ffffffffull},
+        {1, {0x99}, 0xffffffff7fffffffull, 0},
+        {3, {0x0f, 0x1f, 0x00}, 1, 0x1100},
+        {5, {0x0f, 0x1f, 0x44, 0x00, 0x00}, 1, 0x1100},
+        {10, {0x66, 0x2e, 0x0f, 0x1f, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00}, 1,
+         0x1100},
+        {4, {0x64, 0x0f, 0x1f, 0xc0}, 1, 0x1100}, /* nop eax, fs prefix */
+    };
+    for (k = 0; k < sizeof t / sizeof t[0]; ++k) {
+      struct RgInsn b[2];
+      const struct RgInsn *blocks[1] = {b};
+      unsigned lens[1] = {2};
+      struct Machine m0;
+      struct RxRun r;
+      memset(b, 0, sizeof b);
+      b[0].ip = RX_CODE;
+      b[0].len = t[k].len;
+      memcpy(b[0].bytes, t[k].bytes, t[k].len);
+      b[1].ip = RX_CODE + t[k].len;
+      b[1].len = 2;
+      b[1].bytes[0] = 0xeb;
+      b[1].bytes[1] = 0xfe;
+      RxMachine(&m0);
+      RxSetG(&m0, 0, t[k].rax);
+      RxSetG(&m0, 2, 0x1100);
+      if (t[k].len >= 3) RxSetG(&m0, 0, 0x7ff000000000ull); /* nop [rax]: unmapped */
+      RxExec(blocks, lens, 1, &m0, 0, &r);
+      ASSERT_EQ(0, r.err);
+      EXPECT_EQ(t[k].rdx_want, RxG(&r.m, 2));
+      EXPECT_EQ(RxG(&m0, 0), RxG(&r.m, 0));
+      EXPECT_EQ(m0.flags, r.m.flags);
+      EXPECT_EQ(RX_CODE + t[k].len, r.m.ip);
+      EXPECT_EQ(0u, r.log_used);
+    }
+  }
+}
+
 TEST(FbxRegionExec, SegmentBasesAndBaselessAddresses) {
   /* firebox#T3R3: mov %fs:0x28,%rax; mov 0x601010,%rcx (no base, no index);
    * lea 0x8(,%rdi,4),%rdx (no base); mov %rbx,%gs:0x8(%rdi); mov

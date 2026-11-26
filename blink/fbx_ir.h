@@ -219,7 +219,8 @@ extern "C" {
  *     1, imm8 or CL, widths 4 and 8) with the FBX_IR_FLAGS_SH* kinds.
  *     SEXT (MOVSXD, MOVSX, CWDE/CDQE); MOVZX from AH/CH/DH/BH as REG_GET
  *     at width 2 and SHR by 8.  IMUL in regions, with FBX_IR_FLAGS_IMUL.
- *     CMOV (0F 40..4F, register form); TEST [m], imm (F6/F7 /0). */
+ *     CMOV (0F 40..4F, register form; also SETcc as CMOV of 1 and 0 at
+ *     width 1); TEST [m], imm (F6/F7 /0); CDQ/CQO as SAR; 0F 1F NOP. */
 #define FBX_IR_VERSION 12u
 
 /* ────────────────────────────────────────────────────────────────────────── */
@@ -370,9 +371,10 @@ enum FbxIrOpcode {
    * Lowered by regions only. */
   FBX_IR_OP_SEXT = 29,
 
-  /* firebox#T3R3 — CMOVcc (register form): dst(vreg) = condition imm (the
-   * Jcc low nibble, never P/NP) holds on the current flags ? src1(vreg) :
-   * src2(vreg).  Reads the flags.  Lowered by regions only. */
+  /* firebox#T3R3 — CMOVcc (register form) and SETcc: dst(vreg) = condition
+   * imm (the Jcc low nibble, never P/NP) holds on the current flags ?
+   * src1(vreg) : src2(vreg), at width 1 (SETcc), 2, 4 or 8.  Reads the
+   * flags.  Lowered by regions only. */
   FBX_IR_OP_CMOV = 30,
 
   /* Sentinel — count of defined opcodes.  Used by validation; not emitted. */
