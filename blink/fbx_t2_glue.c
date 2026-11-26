@@ -626,13 +626,14 @@ done:
  * same starting state through FbxInterpretOne, and compare.  The guest state
  * a region can change is the general registers, flags, ip and (firebox#T3R2)
  * the memory its stores wrote.  A verifying region logs every store's host
- * offset, width and overwritten bytes (FBX_REGION_EMIT_LOG); the region's
- * final bytes at each logged address are read, the stores are undone in
- * reverse, the interpreter runs, and those bytes are compared too.  This
- * catches a wrong value or a wrong address; a store the region failed to
- * make at all, to an address it never wrote, is not seen here (the whole-
- * program differentials are what see that).  The interpreter's result is
- * kept. */
+ * offset and the 8 bytes from there (FBX_REGION_EMIT_LOG); the region's
+ * final bytes in each logged window are read, the stores are undone in
+ * reverse, the interpreter runs, and those windows are compared too.  This
+ * catches a wrong value, a wrong address and a store wider than its
+ * instruction; a store the region failed to make at all, outside every
+ * window it did write, is not seen here (the whole-program differentials
+ * are what see that).  Single-threaded only: the undo would race another
+ * thread's writes to the same window.  The interpreter's result is kept. */
 static u64 Fbxt2RegionReadN(u64 off, u32 width) {
   u64 v = 0;
   memcpy(&v, (const void *)(uintptr_t)off, width);
