@@ -250,7 +250,8 @@ i64 Neg8(struct Machine *m, u64 x64, u64 y) {
   u8 x;
   bool cf, of, af;
   x = x64;
-  af = cf = !!x;
+  cf = !!x;
+  af = !!(x & 15); /* firebox#NHB: borrow out of bit 3, not x != 0 */
   of = x == 0x80;
   x = ~x + 1;
   return AluFlags8(m, x, af, of, cf);
@@ -260,7 +261,8 @@ i64 Neg32(struct Machine *m, u64 x64, u64 y) {
   u32 x;
   bool cf, of, af;
   x = x64;
-  af = cf = !!x;
+  cf = !!x;
+  af = !!(x & 15); /* firebox#NHB: borrow out of bit 3, not x != 0 */
   of = x == 0x80000000;
   x = ~x + 1;
   return AluFlags32(m, x, af, of, cf);
@@ -270,7 +272,8 @@ i64 Neg64(struct Machine *m, u64 x64, u64 y) {
   u64 x;
   bool cf, of, af;
   x = x64;
-  af = cf = !!x;
+  cf = !!x;
+  af = !!(x & 15); /* firebox#NHB: borrow out of bit 3, not x != 0 */
   of = x == 0x8000000000000000;
   x = ~x + 1;
   return AluFlags64(m, x, af, of, cf);
@@ -295,7 +298,7 @@ i64 Inc32(struct Machine *m, u64 x64, u64 y) {
   x = x64;
   z = x + 1;
   sf = z >> 31;
-  af = (z & 15) < (y & 15);
+  af = !(z & 15); /* firebox#NHB: carry out of bit 3, whatever y */
   of = ((z ^ x) & (z ^ 1)) >> 31;
   return BumpFlags(m, z, af, of, sf);
 }
@@ -305,7 +308,7 @@ i64 Inc64(struct Machine *m, u64 x, u64 y) {
   u32 of, sf, af;
   z = x + 1;
   sf = z >> 63;
-  af = (z & 15) < (y & 15);
+  af = !(z & 15); /* firebox#NHB: carry out of bit 3, whatever y */
   of = ((z ^ x) & (z ^ 1)) >> 63;
   return BumpFlags(m, z, af, of, sf);
 }
@@ -326,7 +329,7 @@ i64 Inc8(struct Machine *m, u64 x64, u64 y) {
   x = x64;
   z = x + 1;
   sf = z >> 7;
-  af = (z & 15) < (y & 15);
+  af = !(z & 15); /* firebox#NHB: carry out of bit 3, whatever y */
   of = ((z ^ x) & (z ^ 1)) >> 7;
   return BumpFlags(m, z, af, of, sf);
 }
@@ -674,7 +677,8 @@ i64 Neg16(struct Machine *m, u64 x64, u64 y) {
   u16 x;
   bool cf, of, af;
   x = x64;
-  af = cf = !!x;
+  cf = !!x;
+  af = !!(x & 15); /* firebox#NHB: borrow out of bit 3, not x != 0 */
   of = x == 0x8000;
   x = ~x + 1;
   return AluFlags16(m, x, af, of, cf);
@@ -686,7 +690,7 @@ i64 Inc16(struct Machine *m, u64 x64, u64 y) {
   x = x64;
   z = x + 1;
   sf = z >> 15;
-  af = (z & 15) < (y & 15);
+  af = !(z & 15); /* firebox#NHB: carry out of bit 3, whatever y */
   of = ((z ^ x) & (z ^ 1)) >> 15;
   return BumpFlags(m, z, af, of, sf);
 }

@@ -3505,6 +3505,42 @@ TEST(FbxRegionExec, UnaryFlagsMatchBlinkAtEveryWidth) {
   }
 }
 
+TEST(FbxRegionExec, UnaryAuxiliaryCarryIsTheHardwares) {
+  /* firebox#NHB: the regions above match blink/alu.c bit for bit, so blink's
+   * own AF has to be the hardware's: INC carries out of bit 3 iff x's low
+   * nibble is 0xF, DEC borrows iff it is 0, NEG borrows iff it is not 0
+   * (Intel SDM, AF).  It used to be 0 for every INC and (x != 0) for NEG. */
+  static const u64 vals[] = {0, 1, 0xe, 0xf, 0x10, 0x1f, 0x7f, 0x80, 0xff,
+                             0x8000, 0xffff, 0x80000000ull,
+                             0x8000000000000000ull, ~0ull};
+  unsigned v, w, op;
+  for (w = 1; w <= 8; w *= 2) {
+    for (op = 0; op < 3; ++op) {
+      for (v = 0; v < sizeof vals / sizeof vals[0]; ++v) {
+        struct Machine om;
+        u64 x = vals[v];
+        u32 nib = (u32)(x & 15), af;
+        memset(&om, 0, sizeof om);
+        switch (op) {
+          case 0:
+            (void)(w == 8 ? Inc64(&om, x, 0) : w == 4 ? Inc32(&om, x, 0) : w == 2 ? Inc16(&om, x, 0) : Inc8(&om, x, 0));
+            af = nib == 15;
+            break;
+          case 1:
+            (void)(w == 8 ? Dec64(&om, x, 0) : w == 4 ? Dec32(&om, x, 0) : w == 2 ? Dec16(&om, x, 0) : Dec8(&om, x, 0));
+            af = nib == 0;
+            break;
+          default:
+            (void)(w == 8 ? Neg64(&om, x, 0) : w == 4 ? Neg32(&om, x, 0) : w == 2 ? Neg16(&om, x, 0) : Neg8(&om, x, 0));
+            af = nib != 0;
+            break;
+        }
+        EXPECT_EQ(af, (om.flags >> 4) & 1u);
+      }
+    }
+  }
+}
+
 TEST(FbxRegionExec, UntranslatableAccessLeavesWithNothingCommitted) {
   /* The store of member 0 cannot be made: the page is read-only, or not
    * mapped.  The region returns 1 with m->ip AT the store, the instructions

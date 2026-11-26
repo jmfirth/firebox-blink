@@ -4813,10 +4813,10 @@ static void RegionOrFlag(struct FbxWasmBuffer *b, u32 f, u32 bit) {
 }
 
 /* The flags blink/alu.c's IncN / DecN / NegN leave, for operand `x_local`
- * at `width`.  Blink's values, which are not all the hardware's: INC is
- * called with y = 0, so its AF is always 0; NEG's AF is (x != 0).  INC and
- * DEC keep CF (BumpFlags).  PF is the lazy byte at bits 24..31, as in
- * AluFlags. */
+ * at `width`: the hardware's (firebox#NHB), AF included — INC carries out of
+ * bit 3 when the result's low nibble is 0, DEC borrows when x's is 0, NEG
+ * borrows when x's is not 0.  INC and DEC keep CF (BumpFlags).  PF is the
+ * lazy byte at bits 24..31, as in AluFlags. */
 static void RegionUnaryFlags(struct RegionEmit *r, u8 kind, u32 x_local,
                              u8 width) {
   struct FbxWasmBuffer *b = r->body;
@@ -4889,8 +4889,15 @@ static void RegionUnaryFlags(struct RegionEmit *r, u8 kind, u32 x_local,
     fbx_wasm_buffer_u8(b, WASM_OP_I32_WRAP_I64);
   }
   RegionOrFlag(b, f, EMIT_FLAGS_OF);
-  /* AF (INC: always 0) and, for NEG, CF */
-  if (kind == FBX_IR_FLAGS_DEC) {
+  /* AF and, for NEG, CF */
+  if (kind == FBX_IR_FLAGS_INC) {
+    fbx_wasm_buffer_u8(b, WASM_OP_LOCAL_GET);
+    fbx_wasm_buffer_uleb(b, z);
+    RegionI64Const(b, 15);
+    fbx_wasm_buffer_u8(b, WASM_OP_I64_AND);
+    fbx_wasm_buffer_u8(b, WASM_OP_I64_EQZ);
+    RegionOrFlag(b, f, EMIT_FLAGS_AF);
+  } else if (kind == FBX_IR_FLAGS_DEC) {
     EmitMaskedVreg(b, x_local, width);
     RegionI64Const(b, 15);
     fbx_wasm_buffer_u8(b, WASM_OP_I64_AND);
@@ -4902,6 +4909,8 @@ static void RegionUnaryFlags(struct RegionEmit *r, u8 kind, u32 x_local,
     RegionOrFlag(b, f, EMIT_FLAGS_AF);
   } else if (kind == FBX_IR_FLAGS_NEG) {
     EmitMaskedVreg(b, x_local, width);
+    RegionI64Const(b, 15);
+    fbx_wasm_buffer_u8(b, WASM_OP_I64_AND);
     RegionI64Const(b, 0);
     fbx_wasm_buffer_u8(b, WASM_OP_I64_NE);
     RegionOrFlag(b, f, EMIT_FLAGS_AF);

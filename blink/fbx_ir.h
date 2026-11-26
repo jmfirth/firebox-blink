@@ -357,9 +357,10 @@ enum FbxIrOpcode {
 /* ────────────────────────────────────────────────────────────────────────── */
 
 /* firebox#T3R2 — SET_FLAGS_RAW kinds beyond the ALU opcodes (imm carries the
- * kind).  INC/DEC keep CF (they read it); NEG sets CF = AF = (x != 0).  src1 =
+ * kind).  INC/DEC keep CF (they read it); NEG sets CF = (x != 0).  src1 =
  * the operand vreg; src2 = the vreg holding 1 (INC/DEC) or the operand
- * again (NEG).  The flag values are blink/alu.c's IncN, DecN and NegN. */
+ * again (NEG).  The flag values are blink/alu.c's IncN, DecN and NegN, AF
+ * included (firebox#NHB). */
 #define FBX_IR_FLAGS_INC 0x40u
 #define FBX_IR_FLAGS_DEC 0x41u
 #define FBX_IR_FLAGS_NEG 0x42u
