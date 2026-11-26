@@ -298,6 +298,9 @@ static struct FbxT2BlockState *TestT2(struct Machine *m,
 /* ────────────────────────────────────────────────────────────────────────── */
 
 void SetUp(void) {
+  /* These scenarios drive the per-block path; regions are the default
+   * (#T3R4) and are switched off here, as FBX_T2_REGION=0 does. */
+  setenv("FBX_T2_REGION", "0", 1);
   ResetT2Stubs();
   InitTestMachine();
   g_test_tier1_walks = 0;
@@ -580,6 +583,13 @@ TEST(FbxT2E2e, ScenarioEHotnessThresholdEnvOverride) {
 
 TEST(FbxT2E2e, ScenarioEDefaultHotnessThreshold) {
   unsetenv("FBX_T2_HOTNESS_THRESHOLD");
+  Fbxt2ResetEnvCacheForTest();
+  ASSERT_EQ(100, (i64)Fbxt2HotnessThreshold()); /* FBX_T2_REGION=0 (SetUp) */
+  /* firebox#T3R4: regions on by default, at the region threshold. */
+  unsetenv("FBX_T2_REGION");
+  Fbxt2ResetEnvCacheForTest();
+  ASSERT_EQ(20000, (i64)Fbxt2HotnessThreshold());
+  setenv("FBX_T2_REGION", "off", 1);
   Fbxt2ResetEnvCacheForTest();
   ASSERT_EQ(100, (i64)Fbxt2HotnessThreshold());
 }

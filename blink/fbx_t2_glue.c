@@ -170,7 +170,7 @@ static int g_t2_selective_cached = 0;
 static int g_t2_selective_mode = 0;
 /* firebox#JJJ — Tier-2 region knobs; see Fbxt2RegionEnv. */
 static int g_t2_region_cached = 0;
-static bool g_t2_region = false;
+static bool g_t2_region = true;
 static bool g_t2_region_count = false;
 static u32 g_t2_region_verify_every = 0;
 
@@ -361,7 +361,7 @@ void Fbxt2ResetEnvCacheForTest(void) {
   g_t2_deescalate_cached = 0;
   g_t2_deescalate = false;
   g_t2_region_cached = 0;
-  g_t2_region = false;
+  g_t2_region = true;
   g_t2_region_count = false;
   g_t2_region_verify_every = 0;
   g_t2_trace_init = 0;
@@ -387,7 +387,7 @@ void Fbxt2ResetEnvCacheForTest(void) {
 /* per-block path cannot take it or would cover less of it (Fbxt2TryRegion); */
 /* otherwise it takes the per-block path unchanged.                           */
 /*                                                                            */
-/*   FBX_T2_REGION=1          enable (default off while this is measured)    */
+/*   FBX_T2_REGION=0          disable (default on: #T3R4, see Fbxt2RegionEnv) */
 /*   FBX_T2_REGION_VERIFY=N   replay every Nth region dispatch through        */
 /*                            FbxInterpretOne and compare registers, flags   */
 /*                            and ip; report at teardown                      */
@@ -420,13 +420,14 @@ static struct {
   _Atomic(unsigned long long) verify_stores;
 } g_t2_region_stats;
 
-static bool Fbxt2RegionBoolEnv(const char *name, const char *e) {
+static bool Fbxt2RegionBoolEnv(const char *name, const char *e, bool dflt) {
   switch (FbxClassifyBoolEnv(e)) {
     case kFbxBoolOn:
       return true;
     case kFbxBoolOff:
-    case kFbxBoolUnspecified:
       return false;
+    case kFbxBoolUnspecified:
+      return dflt;
     default: {
       char msg[256];
       int len = snprintf(msg, sizeof(msg),
@@ -445,9 +446,16 @@ static bool Fbxt2RegionBoolEnv(const char *name, const char *e) {
 static void Fbxt2RegionEnv(void) {
   const char *e;
   if (g_t2_region_cached) return;
-  g_t2_region = Fbxt2RegionBoolEnv("FBX_T2_REGION", getenv("FBX_T2_REGION"));
-  g_t2_region_count =
-      Fbxt2RegionBoolEnv("FBX_T2_REGION_COUNT", getenv("FBX_T2_REGION_COUNT"));
+  /* firebox#T3R4: regions are the default.  MEASURED quiet against the
+   * per-block path (#JJJ round 4): warm user CPU rg 3.64x, py 3.11x, bb 1.46x;
+   * a first run in a home with no Tier-2 entries faster in wall time on rg,
+   * py and bb, and in user CPU on rg and py.  bb's first-run user CPU is 4%
+   * above the per-block path's: region compiles that land after the run
+   * needed them. */
+  g_t2_region =
+      Fbxt2RegionBoolEnv("FBX_T2_REGION", getenv("FBX_T2_REGION"), true);
+  g_t2_region_count = Fbxt2RegionBoolEnv(
+      "FBX_T2_REGION_COUNT", getenv("FBX_T2_REGION_COUNT"), false);
   e = getenv("FBX_T2_REGION_VERIFY");
   if (e && *e) {
     char *end = NULL;
