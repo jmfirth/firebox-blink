@@ -2144,7 +2144,14 @@ static int LiftOneOp(struct LiftCtx *ctx, const struct FbxTcEntry *e,
     case 0x099: /* firebox#T3R3 */
       return LiftCqoRegion(ctx, rde);
     case 0x11F: /* firebox#T3R3: multi-byte NOP: nothing to do */
-      return ctx->region ? 1 : -1;
+      /* blink/machine.c OpNopEv: ModRM 0105 (OpBofram) and 0007/0107/0207
+       * (OpBinbase) are blinkenlights hooks, not NOPs: Tier 1 runs them. */
+      switch (ModrmMod(rde) << 6 | ModrmReg(rde) << 3 | ModrmRm(rde)) {
+        case 0105: case 0007: case 0107: case 0207:
+          return -1;
+        default:
+          return ctx->region ? 1 : -1;
+      }
     case 0x190: case 0x191: case 0x192: case 0x193: /* firebox#T3R3 */
     case 0x194: case 0x195: case 0x196: case 0x197:
     case 0x198: case 0x199: case 0x19A: case 0x19B:

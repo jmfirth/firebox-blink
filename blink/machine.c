@@ -356,9 +356,12 @@ static void OpMovObAl(P) {
 }
 
 static void OpMovRaxOvqp(P) {
+  /* firebox#KPA review: through Load, so a load that straddles into an
+   * unmapped page faults (one ResolveAddress read past the first page). */
   i64 v = DataSegment(A, disp);
-  SetReadAddr(m, v, 1 << RegLog2(rde));
-  WriteRegister(rde, m->ax, ReadMemory(rde, ResolveAddress(m, v)));
+  u8 b[8];
+  WriteRegister(rde, m->ax,
+                ReadMemory(rde, Load(m, v, (size_t)1 << RegLog2(rde), b)));
 }
 
 static void OpMovOvqpRax(P) {
@@ -1846,7 +1849,7 @@ static const nexgen32e_f kNexgen32e[] = {
     /*126*/ OpUd,                    //
     /*127*/ OpUd,                    //
     /*128*/ OpMov0f28,               // #100  (0.002220%)
-    /*129*/ OpMovWpsVps,             // #99   (0.002294%)
+    /*129*/ OpMov0f29,               // firebox#KPA review: MOVAPS/MOVAPD [m] are aligned stores
     /*12A*/ OpCvt0f2a,               // #173  (0.000112%)
     /*12B*/ OpMov0f2b,               //
     /*12C*/ OpCvtt0f2c,              // #172  (0.000112%)
