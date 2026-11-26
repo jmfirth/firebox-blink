@@ -259,6 +259,9 @@ static void EmitName(struct FbxWasmBuffer *b, const char *s) {
 #define WASM_OP_I64_ADD     0x7Cu
 #define WASM_OP_I64_SUB     0x7Du
 #define WASM_OP_I64_MUL     0x7Eu  /* #794 — IMUL truncating forms */
+#define WASM_OP_I64_DIV_S   0x7Fu  /* firebox#T3R3: IMUL overflow */
+#define WASM_OP_I64_LE_U    0x58u
+#define WASM_OP_I32_MUL     0x6Cu
 #define WASM_OP_I64_AND     0x83u
 #define WASM_OP_I64_OR      0x84u
 #define WASM_OP_I64_XOR     0x85u
@@ -386,6 +389,7 @@ static int FlagsKindReadsPrevious(u8 kind) {
     case FBX_IR_FLAGS_SHL:
     case FBX_IR_FLAGS_SHR:
     case FBX_IR_FLAGS_SAR:
+    case FBX_IR_FLAGS_IMUL: /* keeps SF ZF AF PF */
       return 1;
     default:
       return 0;
@@ -541,6 +545,7 @@ static int CoverageGateMode(const struct FbxIrBlock *ir,
           case FBX_IR_FLAGS_SHL: /* firebox#T3R3 */
           case FBX_IR_FLAGS_SHR:
           case FBX_IR_FLAGS_SAR:
+          case FBX_IR_FLAGS_IMUL:
             if (region) break;
             SetFail(fail, FBX_IR_EMIT_SET_FLAGS_RAW_BAD, p->opcode);
             return 0;
@@ -613,8 +618,10 @@ static int CoverageGateMode(const struct FbxIrBlock *ir,
       if (op == FBX_IR_OP_IMUL) {
         imul_flags_pending = 1;
       } else if (op == FBX_IR_OP_SET_FLAGS_RAW &&
-                 !FlagsKindReadsPrevious((u8)ir->insts[i].imm)) {
-        /* a real flag-def overwrites the shadow (INC/DEC keep CF) */
+                 (!FlagsKindReadsPrevious((u8)ir->insts[i].imm) ||
+                  (u8)ir->insts[i].imm == FBX_IR_FLAGS_IMUL)) {
+        /* a real flag-def overwrites the shadow (INC/DEC keep CF); a
+         * region's FBX_IR_FLAGS_IMUL is IMUL's own (firebox#T3R3) */
         imul_flags_pending = 0;
       } else if (imul_flags_pending && op != FBX_IR_OP_SET_FLAGS_RAW &&
                  !IrOpCannotReadFlagsOrExit(op)) {
@@ -4394,6 +4401,12 @@ int fbx_ir_region_member_ok(const struct FbxIrBlock *ir,
               p->src2_kind == FBX_IR_KIND_VREG && p->src2 < ir->nvregs &&
               (p->width == 4 || p->width == 8);
         break;
+      case FBX_IR_OP_IMUL: /* firebox#T3R3: flags via FBX_IR_FLAGS_IMUL */
+        ok &= p->dst_kind == FBX_IR_KIND_VREG && p->dst < ir->nvregs &&
+              p->src1_kind == FBX_IR_KIND_VREG && p->src1 < ir->nvregs &&
+              p->src2_kind == FBX_IR_KIND_VREG && p->src2 < ir->nvregs &&
+              (p->width == 2 || p->width == 4 || p->width == 8);
+        break;
       case FBX_IR_OP_SEXT: /* firebox#T3R3 */
         ok &= p->dst_kind == FBX_IR_KIND_VREG && p->dst < ir->nvregs &&
               p->src1_kind == FBX_IR_KIND_VREG && p->src1 < ir->nvregs &&
@@ -5162,6 +5175,92 @@ static void RegionShiftFlags(struct RegionEmit *r, u8 kind, u32 x_local,
   fbx_wasm_buffer_u8(b, WASM_OP_END);
 }
 
+/* firebox#T3R3 — blink/divmul.c AluImul's flags: CF = OF = the signed
+ * product of the `width`-byte factors does not fit `width` bytes; SF ZF AF
+ * PF unchanged.  Below 8 bytes the exact product fits an i64.  At 8 bytes,
+ * for a not 0 or -1, the wrapped product p overflowed iff p / a != b (a
+ * nonzero error is a multiple of 2^64, which |a| < 2^63 cannot hide); a = 0
+ * never overflows; a = -1 overflows iff b = INT64_MIN.  The divisor is
+ * forced to 1 in the two special cases, so the div_s cannot trap. */
+static void RegionImulFlags(struct RegionEmit *r, u32 a_local, u32 b_local,
+                            u8 width) {
+  struct FbxWasmBuffer *b = r->body;
+  u32 z = ScratchZLocal(r->maxv), f = ScratchFlagsLocal(r->maxv);
+  fbx_wasm_buffer_u8(b, WASM_OP_LOCAL_GET);
+  fbx_wasm_buffer_uleb(b, EMIT_LOCAL_M_PTR);
+  fbx_wasm_buffer_u8(b, WASM_OP_I32_LOAD);
+  fbx_wasm_buffer_uleb(b, 2);
+  fbx_wasm_buffer_uleb(b, M_OFF_FLAGS);
+  fbx_wasm_buffer_u8(b, WASM_OP_I32_CONST);
+  fbx_wasm_buffer_sleb(b, ~(i64)((1u << EMIT_FLAGS_CF) | (1u << EMIT_FLAGS_OF)));
+  fbx_wasm_buffer_u8(b, WASM_OP_I32_AND);
+  fbx_wasm_buffer_u8(b, WASM_OP_LOCAL_SET);
+  fbx_wasm_buffer_uleb(b, f);
+  if (width != 8) {
+    RegionSext(b, a_local, width);
+    RegionSext(b, b_local, width);
+    fbx_wasm_buffer_u8(b, WASM_OP_I64_MUL);
+    fbx_wasm_buffer_u8(b, WASM_OP_LOCAL_SET);
+    fbx_wasm_buffer_uleb(b, z);
+    RegionSext(b, z, width);
+    fbx_wasm_buffer_u8(b, WASM_OP_LOCAL_GET);
+    fbx_wasm_buffer_uleb(b, z);
+    fbx_wasm_buffer_u8(b, WASM_OP_I64_NE);
+  } else {
+    /* select(b == MIN, select(p / a' != b, 0, a != 0), a == -1) */
+    fbx_wasm_buffer_u8(b, WASM_OP_LOCAL_GET);
+    fbx_wasm_buffer_uleb(b, b_local);
+    RegionI64Const(b, 0x8000000000000000ull);
+    fbx_wasm_buffer_u8(b, WASM_OP_I64_EQ);
+    fbx_wasm_buffer_u8(b, WASM_OP_LOCAL_GET); /* p */
+    fbx_wasm_buffer_uleb(b, a_local);
+    fbx_wasm_buffer_u8(b, WASM_OP_LOCAL_GET);
+    fbx_wasm_buffer_uleb(b, b_local);
+    fbx_wasm_buffer_u8(b, WASM_OP_I64_MUL);
+    RegionI64Const(b, 1);                     /* a' */
+    fbx_wasm_buffer_u8(b, WASM_OP_LOCAL_GET);
+    fbx_wasm_buffer_uleb(b, a_local);
+    fbx_wasm_buffer_u8(b, WASM_OP_LOCAL_GET);
+    fbx_wasm_buffer_uleb(b, a_local);
+    RegionI64Const(b, 1);
+    fbx_wasm_buffer_u8(b, WASM_OP_I64_ADD);   /* a + 1 <= 1 (u) iff a is 0 or -1 */
+    RegionI64Const(b, 1);
+    fbx_wasm_buffer_u8(b, WASM_OP_I64_LE_U);
+    fbx_wasm_buffer_u8(b, WASM_OP_SELECT);    /* a' = special ? 1 : a */
+    fbx_wasm_buffer_u8(b, WASM_OP_I64_DIV_S);
+    fbx_wasm_buffer_u8(b, WASM_OP_LOCAL_GET);
+    fbx_wasm_buffer_uleb(b, b_local);
+    fbx_wasm_buffer_u8(b, WASM_OP_I64_NE);
+    fbx_wasm_buffer_u8(b, WASM_OP_I32_CONST);
+    fbx_wasm_buffer_sleb(b, 0);
+    fbx_wasm_buffer_u8(b, WASM_OP_LOCAL_GET);
+    fbx_wasm_buffer_uleb(b, a_local);
+    fbx_wasm_buffer_u8(b, WASM_OP_I64_EQZ);
+    fbx_wasm_buffer_u8(b, WASM_OP_I32_EQZ);
+    fbx_wasm_buffer_u8(b, WASM_OP_SELECT);    /* a != 0 ? (q != b) : 0 */
+    fbx_wasm_buffer_u8(b, WASM_OP_LOCAL_GET);
+    fbx_wasm_buffer_uleb(b, a_local);
+    RegionI64Const(b, (u64)-1);
+    fbx_wasm_buffer_u8(b, WASM_OP_I64_EQ);
+    fbx_wasm_buffer_u8(b, WASM_OP_SELECT);    /* a == -1 ? (b == MIN) : … */
+  }
+  fbx_wasm_buffer_u8(b, WASM_OP_I32_CONST);
+  fbx_wasm_buffer_sleb(b, (1 << EMIT_FLAGS_CF) | (1 << EMIT_FLAGS_OF));
+  fbx_wasm_buffer_u8(b, WASM_OP_I32_MUL);
+  fbx_wasm_buffer_u8(b, WASM_OP_LOCAL_GET);
+  fbx_wasm_buffer_uleb(b, f);
+  fbx_wasm_buffer_u8(b, WASM_OP_I32_OR);
+  fbx_wasm_buffer_u8(b, WASM_OP_LOCAL_SET);
+  fbx_wasm_buffer_uleb(b, f);
+  fbx_wasm_buffer_u8(b, WASM_OP_LOCAL_GET);
+  fbx_wasm_buffer_uleb(b, EMIT_LOCAL_M_PTR);
+  fbx_wasm_buffer_u8(b, WASM_OP_LOCAL_GET);
+  fbx_wasm_buffer_uleb(b, f);
+  fbx_wasm_buffer_u8(b, WASM_OP_I32_STORE);
+  fbx_wasm_buffer_uleb(b, 2);
+  fbx_wasm_buffer_uleb(b, M_OFF_FLAGS);
+}
+
 /* firebox#T3R3: m->seg[k].base, the segment bases AddSegment adds. */
 #define M_OFF_SEGBASE(k)                                     \
   ((u32)(offsetof(struct Machine, seg) +                     \
@@ -5271,6 +5370,19 @@ static int RegionEmitMember(struct RegionEmit *r, u32 i) {
         fbx_wasm_buffer_u8(b, WASM_OP_LOCAL_SET);
         fbx_wasm_buffer_uleb(b, VregLocal(p->dst));
         break;
+      case FBX_IR_OP_IMUL: /* firebox#T3R3 */
+        fbx_wasm_buffer_u8(b, WASM_OP_LOCAL_GET);
+        fbx_wasm_buffer_uleb(b, VregLocal(p->src1));
+        fbx_wasm_buffer_u8(b, WASM_OP_LOCAL_GET);
+        fbx_wasm_buffer_uleb(b, VregLocal(p->src2));
+        fbx_wasm_buffer_u8(b, WASM_OP_I64_MUL);
+        if (p->width != 8) {
+          RegionI64Const(b, WidthMask(p->width));
+          fbx_wasm_buffer_u8(b, WASM_OP_I64_AND);
+        }
+        fbx_wasm_buffer_u8(b, WASM_OP_LOCAL_SET);
+        fbx_wasm_buffer_uleb(b, VregLocal(p->dst));
+        break;
       case FBX_IR_OP_SEXT: /* firebox#T3R3 */
         RegionSext(b, VregLocal(p->src1), (u8)p->imm);
         if (p->width != 8) {
@@ -5330,6 +5442,11 @@ static int RegionEmitMember(struct RegionEmit *r, u32 i) {
         return 1;
       case FBX_IR_OP_SET_FLAGS_RAW:
         if (!RegionFlagsLive(ir, j)) break;
+        if ((u8)p->imm == FBX_IR_FLAGS_IMUL) {
+          RegionImulFlags(r, VregLocal(p->src1), VregLocal(p->src2),
+                          p->width);
+          break;
+        }
         if ((u8)p->imm == FBX_IR_FLAGS_SHL || (u8)p->imm == FBX_IR_FLAGS_SHR ||
             (u8)p->imm == FBX_IR_FLAGS_SAR) {
           RegionShiftFlags(r, (u8)p->imm, VregLocal(p->src1),

@@ -1525,6 +1525,18 @@ static int LiftImul(struct LiftCtx *ctx, u64 rde, int has_imm, u64 uimm0) {
   set_res->dst = (u32)RexrReg(rde);
   set_res->src1_kind = FBX_IR_KIND_VREG;
   set_res->src1 = res_vreg;
+  if (ctx->region) {
+    /* firebox#T3R3: a region models IMUL's CF/OF (FBX_IR_FLAGS_IMUL). */
+    struct FbxIrInst *fl = CtxEmit(ctx);
+    if (!fl) return 0;
+    fl->opcode = FBX_IR_OP_SET_FLAGS_RAW;
+    fl->width = width;
+    fl->imm = FBX_IR_FLAGS_IMUL;
+    fl->src1_kind = FBX_IR_KIND_VREG;
+    fl->src1 = lhs_vreg;
+    fl->src2_kind = FBX_IR_KIND_VREG;
+    fl->src2 = rhs_vreg;
+  }
   return 1;
 }
 

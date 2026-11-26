@@ -218,7 +218,7 @@ extern "C" {
  *     (src1_kind NONE, index in src2).  SHL/SHR/SAR (group 2 /4 /5 /7 by
  *     1, imm8 or CL, widths 4 and 8) with the FBX_IR_FLAGS_SH* kinds.
  *     SEXT (MOVSXD, MOVSX, CWDE/CDQE); MOVZX from AH/CH/DH/BH as REG_GET
- *     at width 2 and SHR by 8. */
+ *     at width 2 and SHR by 8.  IMUL in regions, with FBX_IR_FLAGS_IMUL. */
 #define FBX_IR_VERSION 12u
 
 /* ────────────────────────────────────────────────────────────────────────── */
@@ -393,6 +393,9 @@ enum FbxIrOpcode {
 #define FBX_IR_FLAGS_SHL 0x43u
 #define FBX_IR_FLAGS_SHR 0x44u
 #define FBX_IR_FLAGS_SAR 0x45u
+/* firebox#T3R3: blink/divmul.c's AluImul, src1/src2 = the factors at
+ * `width`: CF = OF = the signed product overflowed; the others unchanged. */
+#define FBX_IR_FLAGS_IMUL 0x46u
 
 #define FBX_IR_KIND_NONE 0   /* operand not used */
 #define FBX_IR_KIND_VREG 1   /* virtual register; index in .src/.dst */

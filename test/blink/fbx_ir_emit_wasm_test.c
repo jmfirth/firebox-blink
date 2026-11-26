@@ -2694,6 +2694,23 @@ TEST(FbxRegion, MembersThatCannotBeLoweredAreRefused) {
       {0x1000, 2, {0x39, 0xd8}}, {0x1002, 2, {0x7a, 0xfc}}};
   static const struct RgInsn imul[] = { /* imul eax, ebx ; jmp */
       {0x1000, 3, {0x0f, 0xaf, 0xc3}}, {0x1003, 2, {0xeb, 0xfb}}};
+  /* firebox#T3R3 neighbours that stay refused */
+  static const struct RgInsn imulm[] = { /* imul eax, [rbx] ; jmp */
+      {0x1000, 3, {0x0f, 0xaf, 0x03}}, {0x1003, 2, {0xeb, 0xfb}}};
+  static const struct RgInsn rol[] = { /* rol rax, 3 ; jmp */
+      {0x1000, 4, {0x48, 0xc1, 0xc0, 0x03}}, {0x1004, 2, {0xeb, 0xfa}}};
+  static const struct RgInsn shl16[] = { /* shl ax, cl ; jmp */
+      {0x1000, 3, {0x66, 0xd3, 0xe0}}, {0x1003, 2, {0xeb, 0xfb}}};
+  static const struct RgInsn shlm[] = { /* shl dword [rax], 1 ; jmp */
+      {0x1000, 2, {0xd1, 0x20}}, {0x1002, 2, {0xeb, 0xfc}}};
+  static const struct RgInsn cbw[] = { /* cbw ; jmp */
+      {0x1000, 2, {0x66, 0x98}}, {0x1002, 2, {0xeb, 0xfc}}};
+  static const struct RgInsn movsxd32[] = { /* movsxd eax, ebx (no REX.W) */
+      {0x1000, 2, {0x63, 0xc3}}, {0x1002, 2, {0xeb, 0xfc}}};
+  static const struct RgInsn movsx16[] = { /* movsx ax, bl ; jmp */
+      {0x1000, 4, {0x66, 0x0f, 0xbe, 0xc3}}, {0x1004, 2, {0xeb, 0xfa}}};
+  static const struct RgInsn hbdst[] = { /* mov ah, bl ; jmp */
+      {0x1000, 2, {0x88, 0xdc}}, {0x1002, 2, {0xeb, 0xfc}}};
   static const struct RgInsn sys[] = {{0x1000, 2, {0x0f, 0x05}}};
   static const struct RgInsn rmw[] = { /* add [rax], ebx ; jne */
       {0x1000, 2, {0x01, 0x18}}, {0x1002, 2, {0x75, 0xfc}}};
@@ -2719,7 +2736,15 @@ TEST(FbxRegion, MembersThatCannotBeLoweredAreRefused) {
   EXPECT_EQ(1, RegionMemberOkBytes(cmpm, 2));
   EXPECT_EQ(1, RegionMemberOkBytes(testi, 2));
   EXPECT_EQ(0, RegionMemberOkBytes(jp, 2));
-  EXPECT_EQ(0, RegionMemberOkBytes(imul, 2));
+  EXPECT_EQ(1, RegionMemberOkBytes(imul, 2)); /* firebox#T3R3 */
+  EXPECT_EQ(0, RegionMemberOkBytes(imulm, 2));
+  EXPECT_EQ(0, RegionMemberOkBytes(rol, 2));
+  EXPECT_EQ(0, RegionMemberOkBytes(shl16, 2));
+  EXPECT_EQ(0, RegionMemberOkBytes(shlm, 2));
+  EXPECT_EQ(0, RegionMemberOkBytes(cbw, 2));
+  EXPECT_EQ(0, RegionMemberOkBytes(movsxd32, 2));
+  EXPECT_EQ(0, RegionMemberOkBytes(movsx16, 2));
+  EXPECT_EQ(0, RegionMemberOkBytes(hbdst, 2));
   EXPECT_EQ(0, RegionMemberOkBytes(sys, 1));
   EXPECT_EQ(0, RegionMemberOkBytes(rmw, 2));
   EXPECT_EQ(0, RegionMemberOkBytes(incm, 2));
@@ -2736,6 +2761,20 @@ TEST(FbxRegion, MembersThatCannotBeLoweredAreRefused) {
   EXPECT_EQ(1, PerBlockLiftBails(cmpm, 2));
   EXPECT_EQ(1, PerBlockLiftBails(testi, 2));
   EXPECT_EQ(1, PerBlockLiftBails(rmw, 2));
+  {
+    static const struct RgInsn shl[] = { /* shl rax, 3 ; jmp */
+        {0x1000, 4, {0x48, 0xc1, 0xe0, 0x03}}, {0x1004, 2, {0xeb, 0xfa}}};
+    static const struct RgInsn sx[] = { /* movsxd rdx, r11d ; jmp */
+        {0x1000, 3, {0x49, 0x63, 0xd3}}, {0x1003, 2, {0xeb, 0xfb}}};
+    static const struct RgInsn hb[] = { /* movzx ecx, ah ; jmp */
+        {0x1000, 3, {0x0f, 0xb6, 0xcc}}, {0x1003, 2, {0xeb, 0xfb}}};
+    EXPECT_EQ(1, RegionMemberOkBytes(shl, 2)); /* firebox#T3R3 */
+    EXPECT_EQ(1, RegionMemberOkBytes(sx, 2));
+    EXPECT_EQ(1, RegionMemberOkBytes(hb, 2));
+    EXPECT_EQ(1, PerBlockLiftBails(shl, 2));
+    EXPECT_EQ(1, PerBlockLiftBails(sx, 2));
+    EXPECT_EQ(1, PerBlockLiftBails(hb, 2));
+  }
   EXPECT_EQ(0, PerBlockLiftBails(store, 2)); /* #677's base+disp store */
 }
 
@@ -3238,6 +3277,12 @@ static u64 RxRun(struct RxModule *x, u32 fi, const u64 *args, int depth) {
             case 0x7C: r = a + b; break;
             case 0x7D: r = a - b; break;
             case 0x7E: r = a * b; break;
+            case 0x7F: /* i64.div_s traps as wasm does */
+              if (!b || (a == 0x8000000000000000ull && b == ~0ull)) {
+                FAIL("i64.div_s trap");
+              }
+              r = (u64)((i64)a / (i64)b);
+              break;
             case 0x83: r = a & b; break;
             case 0x84: r = a | b; break;
             case 0x85: r = a ^ b; break;
@@ -3628,6 +3673,71 @@ TEST(FbxRegionExec, SignExtensionsAndHighByteSources) {
     EXPECT_EQ(ip, r.m.ip);
     for (j = 0; j < 16; ++j) {
       if (j != k[i].dst && j != 4) EXPECT_EQ(RxG(&m0, j), RxG(&r.m, j));
+    }
+  }
+}
+
+TEST(FbxRegionExec, ImulCarriesItsOverflowFlags) {
+  /* firebox#T3R3: imul r, r/m (0F AF), r, r/m, imm8 (6B) and imm32 (69) at
+   * widths 8, 4 and 2, against blink/divmul.c's AluImul (OpImulGvqpEvqp /
+   * OpImulGvqpEvqpImm): the product and CF = OF = overflow, the other flags
+   * kept.  The values hit the 64-bit special cases (0, -1 with INT64_MIN). */
+  static const u64 vals[] = {0, 1, 2, 3, (u64)-1, (u64)-2, 0x7fffffffull,
+                             0x80000000ull, 0xffffffffull, 0x7fff, 0x8000,
+                             0x100000000ull, 0x7fffffffffffffffull,
+                             0x8000000000000000ull, 0xc000000000000000ull,
+                             0x40000000ull, 0xb504f334ull, 0xb504f333f9de6484ull};
+  static const u8 pre[3][2] = {{0x48, 1}, {0x00, 0}, {0x66, 1}};
+  unsigned a, c, wi, form;
+  for (wi = 0; wi < 3; ++wi) {
+    for (form = 0; form < 3; ++form) {
+      for (a = 0; a < sizeof vals / sizeof vals[0]; ++a) {
+        for (c = 0; c < sizeof vals / sizeof vals[0]; ++c) {
+          struct RgInsn b[2];
+          const struct RgInsn *blocks[1] = {b};
+          unsigned lens[1] = {2}, n = 0;
+          struct Machine m0, om;
+          struct RxRun r;
+          u8 code[16];
+          struct XedDecodedInst xd;
+          if (form && c > 6) continue; /* imm forms: a few immediates */
+          memset(b, 0, sizeof b);
+          if (pre[wi][1]) code[n++] = pre[wi][0];
+          if (form == 0) {
+            code[n++] = 0x0f; code[n++] = 0xaf; code[n++] = 0xd3; /* rdx, rbx */
+          } else if (form == 1) {
+            code[n++] = 0x6b; code[n++] = 0xd3;
+            code[n++] = (u8)(form == 1 ? (c == 4 ? 0xff : c == 5 ? 0x80 : c * 37) : 0);
+          } else {
+            u32 k = c == 4 ? 0xffffffffu : c == 5 ? 0x80000000u : c * 0x10001u;
+            code[n++] = 0x69; code[n++] = 0xd3;
+            if (wi == 2) { memcpy(code + n, &k, 2); n += 2; }
+            else { memcpy(code + n, &k, 4); n += 4; }
+          }
+          b[0].ip = RX_CODE;
+          b[0].len = (u8)n;
+          memcpy(b[0].bytes, code, n);
+          b[1].ip = RX_CODE + n;
+          b[1].len = 2;
+          b[1].bytes[0] = 0xeb;
+          b[1].bytes[1] = 0xfe;
+          RxMachine(&m0);
+          m0.flags = 0x202 | 0x8d5 | (0x33u << 24);
+          RxSetG(&m0, 2, vals[a] ^ 0x5555000000000000ull * (wi != 0));
+          RxSetG(&m0, 3, vals[c]);
+          if (wi == 2) RxSetG(&m0, 2, (vals[a] & 0xffff) | 0x1234567800000000ull);
+          om = m0;
+          memset(&xd, 0, sizeof xd);
+          ASSERT_EQ(0, DecodeInstruction(&xd, code, n, XED_MODE_LONG));
+          if (form == 0) OpImulGvqpEvqp(&om, xd.op.rde, xd.op.disp, xd.op.uimm0);
+          else OpImulGvqpEvqpImm(&om, xd.op.rde, xd.op.disp, xd.op.uimm0);
+          RxExec(blocks, lens, 1, &m0, 0, &r);
+          ASSERT_EQ(0, r.err);
+          EXPECT_EQ(RxG(&om, 2), RxG(&r.m, 2));
+          EXPECT_EQ(om.flags, r.m.flags);
+          EXPECT_EQ(RX_CODE + n, r.m.ip);
+        }
+      }
     }
   }
 }
