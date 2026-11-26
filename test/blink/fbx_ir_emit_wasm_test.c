@@ -2865,3 +2865,666 @@ TEST(Fbx5bw, BranchCondWhoseSrc2DisagreesWithTheBlockEndIsRefused) {
   free(tc->entries);
   free(tc);
 }
+
+/* ────────────────────────────────────────────────────────────────────────── */
+/* firebox#T3R2 — EXECUTE a region.                                            */
+/*                                                                            */
+/* The tests above check what a region module looks like; these run one.  A  */
+/* small interpreter for the WebAssembly subset the emitter produces runs the */
+/* module natively over a byte array standing in for the guest's linear       */
+/* memory, holding a Machine, its System (cr3), a 4-level page table and the  */
+/* guest pages.  The expected state is independent of the emitter: values by  */
+/* hand, flags from blink/alu.c's own Inc64 / Neg64 / Dec8 / Sub8 — the       */
+/* functions Tier 1 runs.  An opcode the interpreter does not know fails the  */
+/* test rather than being skipped.                                            */
+/* ────────────────────────────────────────────────────────────────────────── */
+
+#include "blink/alu.h"
+#include "blink/machine.h"
+
+#define RX_MEM (4u << 20)
+#define RX_MAXF 4
+#define RX_STACK 1024
+#define RX_LABELS 512
+
+struct RxFunc {
+  const u8 *code, *end; /* body, after the locals */
+  u32 nparams, nlocals;
+  u32 type;
+};
+
+struct RxModule {
+  struct RxFunc f[RX_MAXF];
+  u32 nimports, nfuncs;
+  u32 nparams_of_type[8];
+  u8 *mem;
+  int err;
+  char why[96];
+};
+
+static u64 RxUleb(const u8 **p) {
+  u64 v = 0;
+  unsigned s = 0;
+  u8 b;
+  do {
+    b = *(*p)++;
+    v |= (u64)(b & 0x7f) << s;
+    s += 7;
+  } while (b & 0x80);
+  return v;
+}
+
+static i64 RxSleb(const u8 **p) {
+  i64 v = 0;
+  unsigned s = 0;
+  u8 b;
+  do {
+    b = *(*p)++;
+    v |= (i64)(b & 0x7f) << s;
+    s += 7;
+  } while (b & 0x80);
+  if (s < 64 && (b & 0x40)) v |= -((i64)1 << s);
+  return v;
+}
+
+static int RxParse(struct RxModule *x, const u8 *d, size_t n) {
+  const u8 *p = d + 8, *e = d + n;
+  u32 ntypes = 0, i;
+  u32 ftypes[RX_MAXF];
+  memset(x->f, 0, sizeof x->f);
+  x->nimports = x->nfuncs = 0;
+  while (p < e) {
+    u8 id = *p++;
+    u64 len = RxUleb(&p);
+    const u8 *s = p, *se = p + len;
+    if (id == 1) {
+      ntypes = (u32)RxUleb(&s);
+      for (i = 0; i < ntypes && i < 8; ++i) {
+        u32 np, nr;
+        s++; /* 0x60 */
+        np = (u32)RxUleb(&s);
+        s += np;
+        nr = (u32)RxUleb(&s);
+        s += nr;
+        x->nparams_of_type[i] = np;
+      }
+    } else if (id == 2) {
+      u32 k = (u32)RxUleb(&s);
+      for (i = 0; i < k; ++i) {
+        u64 l = RxUleb(&s);
+        s += l;
+        l = RxUleb(&s);
+        s += l;
+        if (*s++ == 0) { /* func */
+          RxUleb(&s);
+          x->nimports++;
+        } else { /* memory: limits */
+          u8 fl = *s++;
+          RxUleb(&s);
+          if (fl & 1) RxUleb(&s);
+        }
+      }
+    } else if (id == 3) {
+      x->nfuncs = (u32)RxUleb(&s);
+      if (x->nfuncs > RX_MAXF) return 0;
+      for (i = 0; i < x->nfuncs; ++i) ftypes[i] = (u32)RxUleb(&s);
+    } else if (id == 10) {
+      u32 k = (u32)RxUleb(&s);
+      if (k != x->nfuncs) return 0;
+      for (i = 0; i < k; ++i) {
+        u64 bl = RxUleb(&s);
+        const u8 *b = s, *be = s + bl;
+        u32 groups = (u32)RxUleb(&b), g, nl = 0;
+        for (g = 0; g < groups; ++g) {
+          nl += (u32)RxUleb(&b);
+          b++; /* valtype */
+        }
+        x->f[i].type = ftypes[i];
+        x->f[i].nparams = x->nparams_of_type[ftypes[i]];
+        x->f[i].nlocals = nl;
+        x->f[i].code = b;
+        x->f[i].end = be;
+        s = be;
+      }
+    }
+    p = se;
+  }
+  return x->nfuncs > 0;
+}
+
+/* Skip one instruction's immediates (after its opcode byte). */
+static int RxSkipImm(u8 op, const u8 **p) {
+  switch (op) {
+    case 0x02: case 0x03: case 0x04:
+      (*p)++; /* blocktype: the emitter only uses 0x40 */
+      return 1;
+    case 0x0C: case 0x0D: case 0x10: case 0x20: case 0x21: case 0x22:
+      RxUleb(p);
+      return 1;
+    case 0x0E: {
+      u64 k = RxUleb(p), i;
+      for (i = 0; i <= k; ++i) RxUleb(p);
+      return 1;
+    }
+    case 0x41: case 0x42:
+      RxSleb(p);
+      return 1;
+    default:
+      if (op >= 0x28 && op <= 0x3E) {
+        RxUleb(p);
+        RxUleb(p);
+      }
+      return 1;
+  }
+}
+
+/* The matching `end` (and `else`) of the block/loop/if whose immediate ends
+ * at `p`. */
+static const u8 *RxFindEnd(const u8 *p, const u8 *e, const u8 **else_at) {
+  int depth = 0;
+  *else_at = NULL;
+  while (p < e) {
+    const u8 *at = p;
+    u8 op = *p++;
+    if (op == 0x02 || op == 0x03 || op == 0x04) {
+      depth++;
+    } else if (op == 0x05 && depth == 0) {
+      *else_at = at;
+    } else if (op == 0x0B) {
+      if (depth == 0) return at;
+      depth--;
+    }
+    RxSkipImm(op, &p);
+  }
+  return NULL;
+}
+
+static int RxMem(struct RxModule *x, u64 a, u32 n) {
+  if (a + n > RX_MEM || a + n < a) {
+    x->err = 1;
+    snprintf(x->why, sizeof x->why, "memory access %#llx+%u out of bounds",
+             (unsigned long long)a, n);
+    return 0;
+  }
+  return 1;
+}
+
+static u64 RxRun(struct RxModule *x, u32 fi, const u64 *args, int depth) {
+  struct RxFunc *f = &x->f[fi];
+  u64 loc[256], st[RX_STACK];
+  struct {
+    const u8 *body; /* a loop's first instruction */
+    const u8 *end;  /* the block's `end` */
+    u32 sp;
+    int loop;
+  } lab[RX_LABELS];
+  u32 sp = 0, nl = 0, i;
+  const u8 *p = f->code;
+  if (depth > 4 || f->nparams + f->nlocals > 256) {
+    x->err = 1;
+    return 0;
+  }
+  memset(loc, 0, sizeof loc);
+  for (i = 0; i < f->nparams; ++i) loc[i] = args[i];
+#define POP() (st[--sp])
+#define PUSH(v) (st[sp++] = (u64)(v))
+#define I32(v) ((u64)(u32)(v))
+#define FAIL(...)                                  \
+  do {                                             \
+    x->err = 1;                                    \
+    snprintf(x->why, sizeof x->why, __VA_ARGS__);  \
+    return 0;                                      \
+  } while (0)
+  for (;;) {
+    u8 op;
+    if (x->err) return 0;
+    if (p >= f->end || sp >= RX_STACK - 4 || nl >= RX_LABELS - 1) {
+      FAIL("ran off the body or the stack");
+    }
+    op = *p++;
+    switch (op) {
+      case 0x00:
+        FAIL("unreachable executed");
+      case 0x02: case 0x03: case 0x04: {
+        const u8 *els, *end;
+        if (*p++ != 0x40) FAIL("blocktype");
+        end = RxFindEnd(p, f->end, &els);
+        if (!end) FAIL("no end");
+        lab[nl].body = p;
+        lab[nl].end = end;
+        lab[nl].loop = op == 0x03;
+        if (op == 0x04) {
+          u32 c = (u32)POP();
+          lab[nl].sp = sp;
+          nl++;
+          if (!c) {
+            if (els) {
+              p = els + 1;
+            } else {
+              p = end + 1;
+              nl--;
+            }
+          }
+        } else {
+          lab[nl].sp = sp;
+          nl++;
+        }
+        break;
+      }
+      case 0x05: /* the then-arm finished: skip the else-arm */
+        if (!nl) FAIL("else outside if");
+        p = lab[nl - 1].end + 1;
+        nl--;
+        break;
+      case 0x0B:
+        if (nl == 0) return sp ? st[sp - 1] : 0;
+        nl--;
+        break;
+      case 0x0C: case 0x0D: case 0x0E: {
+        u64 d;
+        if (op == 0x0E) {
+          u64 k = RxUleb(&p), j, sel = (u32)POP();
+          d = 0;
+          for (j = 0; j <= k; ++j) {
+            u64 t = RxUleb(&p);
+            if (j == sel || (j == k && sel >= k)) d = t;
+          }
+        } else {
+          d = RxUleb(&p);
+          if (op == 0x0D && !(u32)POP()) break;
+        }
+        if (d >= nl) return sp ? st[sp - 1] : 0;
+        {
+          u32 t = nl - 1u - (u32)d;
+          sp = lab[t].sp;
+          if (lab[t].loop) {
+            nl = t + 1u;
+            p = lab[t].body;
+          } else {
+            nl = t;
+            p = lab[t].end + 1;
+          }
+        }
+        break;
+      }
+      case 0x0F:
+        return sp ? st[sp - 1] : 0;
+      case 0x10: {
+        u32 callee = (u32)RxUleb(&p);
+        u64 a[4];
+        u32 np, k;
+        if (callee < x->nimports || callee - x->nimports >= x->nfuncs) {
+          FAIL("call to import %u", callee);
+        }
+        np = x->f[callee - x->nimports].nparams;
+        if (np > 4) FAIL("arity");
+        for (k = np; k-- > 0;) a[k] = POP();
+        PUSH(RxRun(x, callee - x->nimports, a, depth + 1));
+        break;
+      }
+      case 0x1A: sp--; break;
+      case 0x1B: {
+        u32 c = (u32)POP();
+        u64 b = POP(), a = POP();
+        PUSH(c ? a : b);
+        break;
+      }
+      case 0x20: PUSH(loc[RxUleb(&p)]); break;
+      case 0x21: loc[RxUleb(&p)] = POP(); break;
+      case 0x22: loc[RxUleb(&p)] = st[sp - 1]; break;
+      case 0x41: PUSH(I32(RxSleb(&p))); break;
+      case 0x42: PUSH(RxSleb(&p)); break;
+      default:
+        if (op >= 0x28 && op <= 0x3E) {
+          u64 off, a, v = 0;
+          u32 w;
+          RxUleb(&p);
+          off = RxUleb(&p);
+          switch (op) {
+            case 0x28: case 0x35: case 0x36: case 0x3E: w = 4; break;
+            case 0x29: case 0x37: w = 8; break;
+            case 0x2D: case 0x31: case 0x3A: case 0x3C: w = 1; break;
+            case 0x33: case 0x3B: case 0x3D: w = 2; break;
+            default: FAIL("memory opcode %#x", op);
+          }
+          if (op >= 0x36) {
+            v = POP();
+            a = (u32)POP() + off;
+            if (!RxMem(x, a, w)) return 0;
+            memcpy(x->mem + a, &v, w);
+          } else {
+            a = (u32)POP() + off;
+            if (!RxMem(x, a, w)) return 0;
+            memcpy(&v, x->mem + a, w);
+            PUSH(v);
+          }
+          break;
+        }
+        {
+          u64 b, a, r;
+          switch (op) {
+            case 0x45: a = POP(); PUSH((u32)a == 0); continue;
+            case 0x50: a = POP(); PUSH(a == 0); continue;
+            case 0xA7: a = POP(); PUSH(I32(a)); continue;
+            case 0xAD: a = POP(); PUSH((u32)a); continue;
+            case 0xAC: a = POP(); PUSH((u64)(i64)(i32)a); continue;
+            default: break;
+          }
+          b = POP();
+          a = POP();
+          switch (op) {
+            case 0x46: r = (u32)a == (u32)b; break;
+            case 0x47: r = (u32)a != (u32)b; break;
+            case 0x48: r = (i32)a < (i32)b; break;
+            case 0x49: r = (u32)a < (u32)b; break;
+            case 0x4B: r = (u32)a > (u32)b; break;
+            case 0x4D: r = (u32)a <= (u32)b; break;
+            case 0x4F: r = (u32)a >= (u32)b; break;
+            case 0x51: r = a == b; break;
+            case 0x52: r = a != b; break;
+            case 0x53: r = (i64)a < (i64)b; break;
+            case 0x54: r = a < b; break;
+            case 0x56: r = a > b; break;
+            case 0x58: r = a <= b; break;
+            case 0x5A: r = a >= b; break;
+            case 0x6A: r = I32(a + b); break;
+            case 0x6B: r = I32(a - b); break;
+            case 0x6C: r = I32((u32)a * (u32)b); break;
+            case 0x71: r = I32(a & b); break;
+            case 0x72: r = I32(a | b); break;
+            case 0x73: r = I32(a ^ b); break;
+            case 0x74: r = I32((u32)a << (b & 31)); break;
+            case 0x76: r = I32((u32)a >> (b & 31)); break;
+            case 0x7C: r = a + b; break;
+            case 0x7D: r = a - b; break;
+            case 0x7E: r = a * b; break;
+            case 0x83: r = a & b; break;
+            case 0x84: r = a | b; break;
+            case 0x85: r = a ^ b; break;
+            case 0x86: r = a << (b & 63); break;
+            case 0x87: r = (u64)((i64)a >> (b & 63)); break;
+            case 0x88: r = a >> (b & 63); break;
+            default: FAIL("opcode %#x", op);
+          }
+          PUSH(r);
+        }
+    }
+  }
+#undef POP
+#undef PUSH
+#undef I32
+#undef FAIL
+}
+
+/* Guest layout inside the fake linear memory. */
+#define RX_M 0x10000u      /* struct Machine */
+#define RX_S 0x80000u      /* struct System (only cr3 is read) */
+#define RX_CTX 0x100000u   /* struct FbxT2BlockCtx + store log */
+#define RX_PT 0x200000u    /* PML4, PDPT, PD, PT */
+#define RX_FRAME 0x300000u /* guest page frames */
+#define RX_DATA_VA 0x0000000000601000ull
+#define RX_RO_VA 0x0000000000602000ull
+#define RX_STACK_VA 0x0000000000700000ull
+#define RX_CODE 0x401000ull
+
+static void RxMap(u8 *mem, u64 va, u32 frame, u64 extra) {
+  static const unsigned shifts[3] = {39, 30, 21};
+  u32 table = RX_PT, k;
+  for (k = 0; k < 3; ++k) {
+    u32 idx = (u32)((va >> shifts[k]) & 511);
+    u64 e;
+    memcpy(&e, mem + table + idx * 8, 8);
+    if (!(e & PAGE_V)) {
+      e = (u64)(RX_PT + 0x1000u * (k + 1u)) | PAGE_V | PAGE_U | PAGE_RW |
+          PAGE_HOST;
+      memcpy(mem + table + idx * 8, &e, 8);
+    }
+    table = (u32)(e & PAGE_TA);
+  }
+  {
+    u64 e = (u64)frame | PAGE_V | PAGE_U | PAGE_HOST | extra;
+    memcpy(mem + table + ((va >> 12) & 511) * 8, &e, 8);
+  }
+}
+
+struct RxRun {
+  struct Machine m; /* state before; after the run, the region's result */
+  u32 rc;
+  int err;
+  char why[96];
+  u64 log_used;
+  u8 frames[3][4096]; /* data, read-only, stack pages after the run */
+};
+
+/* Lift the blocks as region members, emit, and run from `m0`. */
+static void RxExec(const struct RgInsn *const *blocks, const unsigned *lens,
+                   unsigned nb, const struct Machine *m0, int flags,
+                   struct RxRun *out) {
+  struct FbxTcBlock *tcs[4];
+  struct FbxIrBlock *irs[4];
+  struct FbxWasmBuffer w;
+  struct RxModule x;
+  struct Machine mm;
+  struct FbxT2BlockCtx ctx;
+  u64 args[2], cr3;
+  unsigned i;
+  memset(out, 0, sizeof *out);
+  for (i = 0; i < nb; ++i) {
+    tcs[i] = DecodeTc(blocks[i], lens[i]);
+    irs[i] = tcs[i] ? fbx_ir_lift_region(tcs[i]) : NULL;
+  }
+  fbx_wasm_buffer_init(&w);
+  if (!fbx_ir_emit_region_wasm((const struct FbxIrBlock *const *)irs,
+                               (const struct FbxTcBlock *const *)tcs, nb,
+                               flags, 64, &w)) {
+    out->err = 1;
+    snprintf(out->why, sizeof out->why, "emit refused");
+    goto done;
+  }
+  x.mem = (u8 *)calloc(1, RX_MEM);
+  x.err = 0;
+  x.why[0] = 0;
+  if (!RxParse(&x, w.data, w.len)) {
+    out->err = 1;
+    snprintf(out->why, sizeof out->why, "parse");
+    free(x.mem);
+    goto done;
+  }
+  RxMap(x.mem, RX_DATA_VA, RX_FRAME, PAGE_RW);
+  RxMap(x.mem, RX_RO_VA, RX_FRAME + 0x1000u, 0); /* read-only */
+  RxMap(x.mem, RX_STACK_VA - 0x1000u, RX_FRAME + 0x2000u, PAGE_RW);
+  memcpy(x.mem + RX_FRAME, "region-data:0123456789abcdef", 28);
+  cr3 = RX_PT | PAGE_V | PAGE_RW | PAGE_HOST; /* an entry, as AllocatePageTable makes */
+  memcpy(x.mem + RX_S + offsetof(struct System, cr3), &cr3, 8);
+  mm = *m0;
+  mm.system = (struct System *)(uintptr_t)RX_S; /* an offset in x.mem */
+  memcpy(x.mem + RX_M, &mm, sizeof mm);
+  memset(&ctx, 0, sizeof ctx);
+  ctx.nconsts = 4;
+  ctx.consts[1] = RX_CTX + sizeof ctx; /* the store log */
+  ctx.consts[3] = 64;
+  memcpy(x.mem + RX_CTX, &ctx, sizeof ctx);
+  args[0] = RX_M;
+  args[1] = RX_CTX;
+  out->rc = (u32)RxRun(&x, 0, args, 0);
+  out->err = x.err;
+  memcpy(out->why, x.why, sizeof out->why);
+  memcpy(&out->m, x.mem + RX_M, sizeof out->m);
+  memcpy(&ctx, x.mem + RX_CTX, sizeof ctx);
+  out->log_used = ctx.consts[2];
+  memcpy(out->frames, x.mem + RX_FRAME, sizeof out->frames);
+  free(x.mem);
+done:
+  fbx_wasm_buffer_free(&w);
+  for (i = 0; i < nb; ++i) {
+    fbx_ir_free(irs[i]);
+    if (tcs[i]) FreeTc(tcs[i]);
+  }
+}
+
+static void RxSetG(struct Machine *m, unsigned r, u64 v) { memcpy(m->weg[r], &v, 8); }
+static u64 RxG(const struct Machine *m, unsigned r) {
+  u64 v;
+  memcpy(&v, m->weg[r], 8);
+  return v;
+}
+
+/* A Machine at its defaults, with empty TLB slots (no page matches them). */
+static void RxMachine(struct Machine *m) {
+  unsigned k;
+  memset(m, 0, sizeof *m);
+  for (k = 0; k < 32; ++k) {
+    m->tlb[k].page = (i64)0x7ff0000000000000ll;
+    m->tlb[k].entry = 0;
+  }
+  m->flags = 0x202 | (0x5Au << 24);
+  RxSetG(m, 0, 0x7f);                   /* rax */
+  RxSetG(m, 1, 0x1234);                 /* rcx */
+  RxSetG(m, 2, 0x1100);                 /* rdx: dl = 0 */
+  RxSetG(m, 3, 0xfffffffffffffffeull);  /* rbx */
+  RxSetG(m, 4, RX_STACK_VA);            /* rsp */
+  RxSetG(m, 6, RX_DATA_VA);             /* rsi */
+  RxSetG(m, 7, 0x10);                   /* rdi */
+  m->ip = RX_CODE;
+}
+
+/* inc rax; neg rcx; dec dl; mov [rsi+rdi], al; cmp [rsi+rdi], al;
+ * push rbx; pop rdx; call F                       — member 0 at RX_CODE
+ * F: inc rbx; ret                                  — member 1 */
+static const struct RgInsn kRxMain[] = {
+    {RX_CODE + 0, 3, {0x48, 0xff, 0xc0}},
+    {RX_CODE + 3, 3, {0x48, 0xf7, 0xd9}},
+    {RX_CODE + 6, 2, {0xfe, 0xca}},
+    {RX_CODE + 8, 3, {0x88, 0x04, 0x3e}},
+    {RX_CODE + 11, 3, {0x38, 0x04, 0x3e}},
+    {RX_CODE + 14, 1, {0x53}},
+    {RX_CODE + 15, 1, {0x5a}},
+    {RX_CODE + 16, 5, {0xe8, 0xeb, 0x00, 0x00, 0x00}}, /* -> RX_CODE+0x100 */
+};
+static const struct RgInsn kRxFn[] = {
+    {RX_CODE + 0x100, 3, {0x48, 0xff, 0xc3}},
+    {RX_CODE + 0x103, 1, {0xc3}},
+};
+
+TEST(FbxRegionExec, ArithmeticStoresStackCallAndReturn) {
+  const struct RgInsn *blocks[2] = {kRxMain, kRxFn};
+  unsigned lens[2] = {8, 2};
+  struct Machine m0, om;
+  struct RxRun r;
+  u64 rax, rcx, rbx, ret_slot;
+  int mode;
+  RxMachine(&m0);
+  /* The oracle: blink/alu.c, the functions Tier 1 runs, in program order. */
+  om = m0;
+  rax = (u64)Inc64(&om, RxG(&m0, 0), 0);
+  rcx = (u64)Neg64(&om, RxG(&m0, 1), 0);
+  (void)Dec8(&om, RxG(&m0, 2) & 0xff, 0);
+  (void)Sub8(&om, rax & 0xff, rax & 0xff); /* cmp [mem]=al, al */
+  rbx = (u64)Inc64(&om, RxG(&m0, 3), 0);
+  for (mode = 0; mode < 2; ++mode) {
+    RxExec(blocks, lens, 2, &m0,
+           mode ? FBX_REGION_EMIT_COUNT | FBX_REGION_EMIT_LOG : 0, &r);
+    ASSERT_EQ(0, r.err);
+    EXPECT_EQ(0u, r.rc);
+    EXPECT_EQ(RX_CODE + 21, r.m.ip); /* ret popped the call's return PC */
+    EXPECT_EQ(rax, RxG(&r.m, 0));
+    EXPECT_EQ(rcx, RxG(&r.m, 1));
+    EXPECT_EQ(RxG(&m0, 3), RxG(&r.m, 2)); /* push rbx; pop rdx */
+    EXPECT_EQ(rbx, RxG(&r.m, 3));
+    EXPECT_EQ(RX_STACK_VA, RxG(&r.m, 4));
+    EXPECT_EQ(om.flags, r.m.flags);
+    EXPECT_EQ(rax & 0xff, r.frames[0][0x10]);
+    EXPECT_EQ('5', r.frames[0][0x11]); /* a byte store writes one byte */
+    memcpy(&ret_slot, &r.frames[2][4096 - 8], 8);
+    EXPECT_EQ(RX_CODE + 21, ret_slot);
+    if (mode) {
+      EXPECT_EQ(3u, r.log_used); /* the byte store, the push, the call */
+    }
+  }
+}
+
+TEST(FbxRegionExec, UnaryFlagsMatchBlinkAtEveryWidth) {
+  /* inc/dec/neg/not on r8 at widths 8,4,2,1, against blink/alu.c.  The
+   * values cross the carry, sign, overflow and nibble edges. */
+  static const u64 vals[] = {0, 1, 0x7f, 0x80, 0xff, 0x7fff, 0x8000, 0xffff,
+                             0x7fffffff, 0x80000000, 0xffffffff, 0xf,
+                             0x7fffffffffffffffull, 0x8000000000000000ull,
+                             0xffffffffffffffffull, 0x123456789abcdef0ull};
+  static const u8 pre[4][2] = {{0x49, 0}, {0x41, 0}, {0x66, 0x41}, {0x41, 0}};
+  static const unsigned widths[4] = {8, 4, 2, 1};
+  unsigned v, wi, op;
+  for (wi = 0; wi < 4; ++wi) {
+    for (op = 0; op < 4; ++op) { /* inc, dec, neg, not */
+      for (v = 0; v < sizeof vals / sizeof vals[0]; ++v) {
+        struct RgInsn b[2];
+        const struct RgInsn *blocks[1] = {b};
+        unsigned lens[1] = {2}, n = 0, w = widths[wi];
+        struct Machine m0, om;
+        struct RxRun r;
+        u64 x = vals[v], want, mask = w == 8 ? ~0ull : (1ull << (w * 8)) - 1;
+        memset(b, 0, sizeof b);
+        b[0].ip = RX_CODE;
+        b[0].bytes[n++] = pre[wi][0];
+        if (pre[wi][1]) b[0].bytes[n++] = pre[wi][1];
+        b[0].bytes[n++] = w == 1 ? 0xfe : (op < 2 ? 0xff : 0xf7);
+        if (w == 1 && op >= 2) b[0].bytes[n - 1] = 0xf6;
+        b[0].bytes[n++] = (u8)(0xc0 | (op == 0 ? 0 : op == 1 ? 1 : op == 2 ? 3 : 2) << 3);
+        b[0].len = (u8)n;
+        b[1].ip = RX_CODE + n;
+        b[1].len = 2;
+        b[1].bytes[0] = 0xeb; /* jmp . (an exit: not a member) */
+        b[1].bytes[1] = 0xfe;
+        lens[0] = 2;
+        RxMachine(&m0);
+        m0.flags |= 1; /* CF set: INC/DEC must keep it */
+        RxSetG(&m0, 8, x);
+        om = m0;
+        switch (op) {
+          case 0: want = (u64)(w == 8 ? Inc64(&om, x, 0) : w == 4 ? Inc32(&om, x, 0) : w == 2 ? Inc16(&om, x, 0) : Inc8(&om, x, 0)); break;
+          case 1: want = (u64)(w == 8 ? Dec64(&om, x, 0) : w == 4 ? Dec32(&om, x, 0) : w == 2 ? Dec16(&om, x, 0) : Dec8(&om, x, 0)); break;
+          case 2: want = (u64)(w == 8 ? Neg64(&om, x, 0) : w == 4 ? Neg32(&om, x, 0) : w == 2 ? Neg16(&om, x, 0) : Neg8(&om, x, 0)); break;
+          default: want = ~x; break;
+        }
+        want &= mask;
+        want = w == 4 ? want : (w == 8 ? want : (x & ~mask) | want);
+        RxExec(blocks, lens, 1, &m0, 0, &r);
+        ASSERT_EQ(0, r.err);
+        EXPECT_EQ(want, RxG(&r.m, 8));
+        EXPECT_EQ(om.flags, r.m.flags);
+        EXPECT_EQ(RX_CODE + n, r.m.ip);
+      }
+    }
+  }
+}
+
+TEST(FbxRegionExec, UntranslatableAccessLeavesWithNothingCommitted) {
+  /* The store of member 0 cannot be made: the page is read-only, or not
+   * mapped.  The region returns 1 with m->ip AT the store, the instructions
+   * before it committed, the store's memory and everything after untouched. */
+  const struct RgInsn *blocks[2] = {kRxMain, kRxFn};
+  unsigned lens[2] = {8, 2};
+  static const u64 bad[2] = {RX_RO_VA, 0x0000000000900000ull};
+  struct Machine m0, om;
+  struct RxRun r;
+  unsigned k;
+  for (k = 0; k < 2; ++k) {
+    u64 rax, rcx;
+    RxMachine(&m0);
+    RxSetG(&m0, 6, bad[k]);
+    om = m0;
+    rax = (u64)Inc64(&om, RxG(&m0, 0), 0);
+    rcx = (u64)Neg64(&om, RxG(&m0, 1), 0);
+    (void)Dec8(&om, RxG(&m0, 2) & 0xff, 0);
+    RxExec(blocks, lens, 2, &m0, 0, &r);
+    ASSERT_EQ(0, r.err);
+    EXPECT_EQ(1u, r.rc);
+    EXPECT_EQ(RX_CODE + 8, r.m.ip);
+    EXPECT_EQ(rax, RxG(&r.m, 0));
+    EXPECT_EQ(rcx, RxG(&r.m, 1));
+    EXPECT_EQ((RxG(&m0, 2) & ~0xffull) | 0xff, RxG(&r.m, 2));
+    EXPECT_EQ(RxG(&m0, 3), RxG(&r.m, 3));
+    EXPECT_EQ(RX_STACK_VA, RxG(&r.m, 4));
+    EXPECT_EQ(om.flags, r.m.flags);
+    EXPECT_EQ(0, r.frames[1][0x10]);
+  }
+}
