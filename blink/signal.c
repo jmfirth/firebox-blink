@@ -27,6 +27,7 @@
 #include "blink/atomic.h"
 #include "blink/bitscan.h"
 #include "blink/endian.h"
+#include "blink/flags.h"
 #include "blink/ldbl.h"
 #include "blink/linux.h"
 #include "blink/log.h"
@@ -101,7 +102,10 @@ void DeliverSignal(struct Machine *m, int sig, int code) {
   memcpy(sf.uc.rcx, m->cx, 8);
   memcpy(sf.uc.rsp, m->sp, 8);
   Write64(sf.uc.rip, m->ip);
-  Write64(sf.uc.eflags, m->flags);
+  /* firebox#KPA (found by its signal-frame differential): the frame holds
+   * the architectural EFLAGS, as PUSHF builds them, not blink's internal
+   * word, whose PF bit is stale (parity lives lazily in bits 24..31). */
+  Write64(sf.uc.eflags, ExportFlags(m->flags) & 0xFCFFFF);
   Write16(sf.fp.cwd, m->fpu.cw);
 #ifndef DISABLE_X87
   Write16(sf.fp.swd, m->fpu.sw);
@@ -180,7 +184,7 @@ void SigRestore(struct Machine *m) {
   SYS_LOGF("rt_sigreturn(%#" PRIx64 ")", Read64(m->sp) - 8);
   unassert(!CopyFromUserRead(m, &sf, Read64(m->sp) - 8, sizeof(sf)));
   m->ip = Read64(sf.uc.rip);
-  m->flags = Read64(sf.uc.eflags);
+  ImportFlags(m, Read64(sf.uc.eflags)); /* firebox#KPA: the inverse */
   m->sigmask = Read64(sf.uc.sigmask);
   SIG_LOGF("sigmask restore %" PRIx64, m->sigmask);
   memcpy(m->r8, sf.uc.r8, 8);
