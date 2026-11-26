@@ -254,6 +254,12 @@ int fbx_ir_region_member_ok(const struct FbxIrBlock *ir,
                             enum FbxIrEmitFailReason *out_reason,
                             u8 *out_opcode);
 
+/* firebox#T3R2: 1 when the per-block path's coverage gate admits this
+ * (per-block) lift; fbx_t2_glue.c uses it to decide when a one-member region
+ * is worth building. */
+int fbx_ir_per_block_gate_ok(const struct FbxIrBlock *ir,
+                             const struct FbxTcBlock *tc);
+
 /* The member's static successors, fall-through first.  Returns the count. */
 u32 fbx_ir_region_successors(const struct FbxIrBlock *ir,
                              const struct FbxTcBlock *tc, u64 out[2]);

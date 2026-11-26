@@ -781,6 +781,14 @@ static int CoverageGateMode(const struct FbxIrBlock *ir,
     const struct FbxTcEntry *e = &tc->entries[tc_idx];
     u64 rde;
     u64 mop;
+    /* firebox#T3R2: a region member that BAILs leaves the region at the
+     * bailout PC; the entries from there on are Tier 1's, and only the
+     * lifted prefix before it is gated. */
+    if (region && ir->ninsts &&
+        ir->insts[ir->ninsts - 1].opcode == FBX_IR_OP_BAILOUT &&
+        e->ip == ir->insts[ir->ninsts - 1].imm) {
+      break;
+    }
     if (e->kind != FBX_TC_KIND_NORMAL) {
       SetFail(fail, FBX_IR_EMIT_TC_KIND_NON_NORMAL, 0);
       return 0;
@@ -4181,6 +4189,7 @@ static int RegionScaleOk(u32 s) { return s == 1 || s == 2 || s == 4 || s == 8; }
  * its target (a member, or an exit); the others exit, but for the branches. */
 static int RegionIsTerminator(u8 op) {
   switch (op) {
+    case FBX_IR_OP_BAILOUT: /* leaves at its PC; Tier 1 runs the rest */
     case FBX_IR_OP_BRANCH_COND:
     case FBX_IR_OP_BRANCH_TAKEN:
     case FBX_IR_OP_CALL_DIRECT:
@@ -4286,6 +4295,19 @@ int fbx_ir_region_member_ok(const struct FbxIrBlock *ir,
         break;
       case FBX_IR_OP_RET:
         break;
+      case FBX_IR_OP_BAILOUT: {
+        /* firebox#T3R2: at an instruction boundary inside this block, after
+         * at least one lifted instruction (a bare BAILOUT is no member). */
+        u32 k, ops = 0;
+        for (k = 0; k < i; ++k) {
+          u8 o = ir->insts[k].opcode;
+          if (o != FBX_IR_OP_PC_MARK) ++ops;
+        }
+        ok &= ops > 0 && p->imm > tc->start_pc && p->imm < tc->end_pc &&
+              i > 0 && ir->insts[i - 1].opcode == FBX_IR_OP_PC_MARK &&
+              ir->insts[i - 1].imm == p->imm;
+        break;
+      }
       case FBX_IR_OP_ADD:
       case FBX_IR_OP_SUB:
       case FBX_IR_OP_AND:
@@ -4334,6 +4356,14 @@ refuse:
   if (out_reason) *out_reason = fail.reason;
   if (out_opcode) *out_opcode = fail.opcode;
   return 0;
+}
+
+int fbx_ir_per_block_gate_ok(const struct FbxIrBlock *ir,
+                             const struct FbxTcBlock *tc) {
+  struct FbxEmitFailCtx fail;
+  fail.reason = FBX_IR_EMIT_OK;
+  fail.opcode = 0;
+  return CoverageGate(ir, tc, &fail);
 }
 
 u32 fbx_ir_region_successors(const struct FbxIrBlock *ir,
@@ -4970,6 +5000,14 @@ static int RegionEmitMember(struct RegionEmit *r, u32 i) {
       case FBX_IR_OP_RET:
         RegionPopTmp(r, i, cur_pc);
         RegionExitTo(r, i, r->l_tmp);
+        return 1;
+      case FBX_IR_OP_BAILOUT:
+        /* firebox#T3R2: Tier 1 runs this block from p->imm on.  Its PC_MARK
+         * counted an instruction that did not run.  In the entry member that
+         * is a PC inside the dispatched block (return 1, as for a refused
+         * translation); elsewhere Tier 1 dispatches it as a block of its
+         * own. */
+        RegionExit(r, p->imm, r->n - i, /*uncount=*/1, i == 0 ? 1 : 0);
         return 1;
       case FBX_IR_OP_SET_FLAGS_RAW:
         if (!RegionFlagsLive(ir, j)) break;

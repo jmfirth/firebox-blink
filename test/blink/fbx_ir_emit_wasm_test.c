@@ -3528,3 +3528,34 @@ TEST(FbxRegionExec, UntranslatableAccessLeavesWithNothingCommitted) {
     EXPECT_EQ(0, r.frames[1][0x10]);
   }
 }
+
+TEST(FbxRegionExec, ABailoutLeavesAtItsInstruction) {
+  /* inc rax; jmp B   (member 0)
+   * B: inc rbx; shl $3, rax; jmp .   (member 1: the shift is Tier 1's)
+   * Leaving at the shift from member 1 returns 0 (Tier 1 dispatches that PC);
+   * a member-0 bailout returns 1 (a PC inside the dispatched block). */
+  static const struct RgInsn a[] = {{RX_CODE, 3, {0x48, 0xff, 0xc0}},
+                                    {RX_CODE + 3, 2, {0xeb, 0x7b}}};
+  static const struct RgInsn bb[] = {{RX_CODE + 0x80, 3, {0x48, 0xff, 0xc3}},
+                                     {RX_CODE + 0x83, 4, {0x48, 0xc1, 0xe0, 0x03}},
+                                     {RX_CODE + 0x87, 2, {0xeb, 0xfe}}};
+  const struct RgInsn *two[2] = {a, bb}, *one[1] = {bb};
+  unsigned l2[2] = {2, 3}, l1[1] = {3};
+  struct Machine m0;
+  struct RxRun r;
+  RxMachine(&m0);
+  EXPECT_EQ(1, RegionMemberOkBytes(bb, 3));
+  RxExec(two, l2, 2, &m0, 0, &r);
+  ASSERT_EQ(0, r.err);
+  EXPECT_EQ(0u, r.rc);
+  EXPECT_EQ(RX_CODE + 0x83, r.m.ip);
+  EXPECT_EQ(RxG(&m0, 0) + 1, RxG(&r.m, 0));
+  EXPECT_EQ(RxG(&m0, 3) + 1, RxG(&r.m, 3));
+  m0.ip = RX_CODE + 0x80;
+  RxExec(one, l1, 1, &m0, 0, &r);
+  ASSERT_EQ(0, r.err);
+  EXPECT_EQ(1u, r.rc);
+  EXPECT_EQ(RX_CODE + 0x83, r.m.ip);
+  EXPECT_EQ(RxG(&m0, 0), RxG(&r.m, 0));
+  EXPECT_EQ(RxG(&m0, 3) + 1, RxG(&r.m, 3));
+}

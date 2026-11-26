@@ -470,7 +470,16 @@ void Fbxt2RegionReport(void) {
 /* Returns 1 when the escalation was handled here (a region was installed, or
  * its compile is pending and the latch was reopened), 0 to take the
  * per-block path. */
+/* How far a lift covers its block: the BAILOUT's PC, or the block's end. */
+static u64 Fbxt2LiftCover(const struct FbxIrBlock *ir, const struct FbxTcBlock *b) {
+  if (ir->ninsts && ir->insts[ir->ninsts - 1].opcode == FBX_IR_OP_BAILOUT) {
+    return ir->insts[ir->ninsts - 1].imm;
+  }
+  return b->end_pc;
+}
+
 static int Fbxt2TryRegion(struct Machine *m, struct FbxTcBlock *b,
+                          const struct FbxIrBlock *pb_ir,
                           struct FbxT2BlockState *st) {
   /* firebox#T3R2: members are lifted for a region (fbx_ir_lift_region), the
    * entry included; the per-block lift the caller holds is not a member's. */
@@ -527,7 +536,11 @@ static int Fbxt2TryRegion(struct Machine *m, struct FbxTcBlock *b,
       if (sp < sizeof(stack) / sizeof(stack[0])) stack[sp++] = succ[k];
     }
   }
-  if (n < 2) {
+  /* firebox#T3R2: a block no other member joins is still a region when the
+   * per-block path cannot take it, or would cover less of it (its lift
+   * BAILs earlier: a form only regions lower). */
+  if (n < 2 && fbx_ir_per_block_gate_ok(pb_ir, b) &&
+      Fbxt2LiftCover(pb_ir, b) >= Fbxt2LiftCover(entry_ir, b)) {
     T2TraceLine(g_t2_trace_verbose, "[t2 region] pc=%#llx alone\n",
                 (unsigned long long)b->start_pc);
     goto done;
@@ -809,7 +822,7 @@ void Fbxt2TryEscalate(struct Machine *m, struct FbxTcBlock *b,
   /* firebox#JJJ — a region headed by this block, when enabled. */
   Fbxt2RegionEnv();
   if (g_t2_region && st->region != FBX_T2_REGION_ABANDONED &&
-      Fbxt2TryRegion(m, b, st)) {
+      Fbxt2TryRegion(m, b, ir, st)) {
     fbx_ir_free(ir);
     return;
   }
