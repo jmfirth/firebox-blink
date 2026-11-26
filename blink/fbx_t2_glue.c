@@ -175,7 +175,6 @@ static bool g_t2_region_count = false;
 static u32 g_t2_region_verify_every = 0;
 
 static void Fbxt2RegionEnv(void);
-static bool g_t2_region;
 
 /* firebox#T3R2: with regions on, a block escalates (and a region takes a
  * member) only once it is this hot.  At the per-block default of 100, the
@@ -384,8 +383,9 @@ void Fbxt2ResetEnvCacheForTest(void) {
 /* the layout follows the fall-through chain) into one region module         */
 /* (fbx_ir_emit_region_wasm).  The region is attached to the escalating      */
 /* block only; it is entered there and exits to Tier 1 everywhere else.  A   */
-/* block that cannot head a region of at least two members takes the         */
-/* per-block path unchanged.                                                  */
+/* block no other member joins is a one-member region only when the          */
+/* per-block path cannot take it or would cover less of it (Fbxt2TryRegion); */
+/* otherwise it takes the per-block path unchanged.                           */
 /*                                                                            */
 /*   FBX_T2_REGION=1          enable (default off while this is measured)    */
 /*   FBX_T2_REGION_VERIFY=N   replay every Nth region dispatch through        */

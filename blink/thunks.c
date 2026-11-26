@@ -67,17 +67,21 @@
 /* the function's entry, and no thunk changes a register until its work is    */
 /* done (only %rax, before the `ret` it emulates reads the stack): the frame  */
 /* shows the call as made, and a handler that fixes the mapping and returns   */
-/* re-runs the call. Re-running must compute what the uninterrupted call      */
-/* would have, so a thunk whose partial writes would change its own re-run    */
-/* (memmove/memcpy over an overlap, strtok_r) checks every page it will       */
+/* re-runs the call. What the handler observes in memory depends on the       */
+/* thunk. A thunk whose partial writes would change its own re-run            */
+/* (memcpy/memmove over an overlap, strtok_r) checks every page it will       */
 /* touch, in the order it will touch them, and then the return address its    */
-/* `ret` will read, before its first store. Where a partial write is harmless */
-/* to the re-run (disjoint copies, memset, a disjoint strcpy), the store that */
-/* faults is the first one on the bad page in the thunk's forward order. A    */
-/* libc may store in another order (musl's memset writes the head and tail    */
-/* first), so si_addr and the bytes written before a fault can differ from    */
-/* musl's within what the function leaves unspecified; the signal and its    */
-/* code cannot.                                                               */
+/* `ret` will read, before its first store: when such a fault hits, nothing   */
+/* has been written (an overlapping memmove has moved nothing). A disjoint    */
+/* copy, memset or a disjoint strcpy stores as it goes, so the handler sees   */
+/* every byte before the faulting page already written and none from that     */
+/* page on; the re-run writes the same bytes again. musl may store in another */
+/* order (its memset writes the head and tail first), so si_addr and the      */
+/* bytes already written can differ from musl's within what the function      */
+/* leaves unspecified; the signal and its code cannot. A read-only thunk      */
+/* writes nothing and faults at the first byte it reads on a bad page, and    */
+/* reads no page past the last byte its answer needs (strstr stops at its     */
+/* first match).                                                              */
 /* ────────────────────────────────────────────────────────────────────────── */
 
 static u8 *ThunkRead(struct Machine *m, i64 v) {
@@ -249,6 +253,12 @@ static i64 GuestStrnlen(struct Machine *m, i64 s, u64 n) {
     s += (i64)limit;
   }
   return (i64)walked;
+}
+
+/* strlen on a guest pointer: no cap.  A string that never terminates runs
+ * into an unmapped page and faults, as musl's strlen does. */
+static i64 GuestStrlen(struct Machine *m, i64 s) {
+  return GuestStrnlen(m, s, ~(u64)0);
 }
 
 /* Compare two guest memory ranges of length n, byte-by-byte.  Returns the
@@ -524,11 +534,7 @@ static void ThunkMemset(struct Machine *m) {
 
 static void ThunkStrlen(struct Machine *m) {
   i64 s = (i64)Get64(m->di);
-  /* No length argument — walk page-bounded.  Cap at 1 GiB as a safety net;
-   * any real strlen call exceeding that would have faulted anyway, and the
-   * cap prevents an infinite loop on a guest where the entire address space
-   * is non-NUL (e.g. a buggy caller passing a non-string). */
-  i64 len = GuestStrnlen(m, s, (u64)1 << 30);
+  i64 len = GuestStrlen(m, s);
   if (g_thunk_trace) {
     LOGF("thunk strlen(s=%#llx) = %lld", (long long)s, (long long)len);
   }
@@ -766,127 +772,69 @@ static void ThunkStrncasecmp(struct Machine *m) {
   ThunkRet(m);
 }
 
-/* GuestStrstr — locate the first occurrence of guest C-string `needle` inside
- * guest C-string `haystack`.  Returns:
- *   - the guest address of the match (haystack-relative pointer), or
- *   - the haystack address itself if needle is empty (POSIX), or
- *   - 0 if no match.
+/* GuestStrstr — the first occurrence of guest C-string `needle` in guest
+ * C-string `haystack`: its guest address, `haystack` for an empty needle, or
+ * 0 for none.
  *
- * Implementation strategy: stage both strings into bounded host buffers via
- * GuestStrnlen-bounded reads, then use the host libc strstr().  We cap the
- * staged copies at a generous-but-bounded size (256 KiB haystack, 4 KiB
- * needle) — enough for every grep / awk / sed substring lookup in the bench
- * corpus, and a small enough stack/heap footprint to avoid surprise.  Inputs
- * exceeding either cap fall through to a byte-wise scan that hits the guest
- * memory directly (slow but correct).
- *
- * The cap is the only place where this thunk meaningfully diverges from
- * musl's two-way-search shape: musl walks the haystack in-place and exits
- * early on miss, where we either stage upfront (host-libc fast path) or
- * walk page-by-page.  For typical grep workloads (short needle inside a
- * line buffer < 4 KiB), the stage path dominates and amortises the copy
- * against the host's vectorised strstr. */
+ * The haystack is read a page at a time and searched as it is read, so the
+ * search stops at the first match, as musl's does, and reads no page past
+ * it: a match before an unmapped page is found, not faulted on.  There is no
+ * length cap and no heap: a needle of up to 4 KiB is staged on the stack and
+ * searched with the host's memmem over a window of (the last nlen-1 bytes
+ * already read) + (the next page's bytes up to the NUL), so a match that
+ * straddles a page is still seen.  A longer needle is compared in guest
+ * memory at each candidate position (quadratic in the worst case; such
+ * needles are rare). */
+#define FBX_STRSTR_STAGE 4096u
 static i64 GuestStrstr(struct Machine *m, i64 haystack, i64 needle) {
-  /* Read needle first (bounded at NUL within a single page).  An empty
-   * needle returns the haystack pointer per POSIX. */
-  u64 npage_off = (u64)needle & 4095;
-  u64 nchunk = 4096 - npage_off;
-  u8 *hneedle = ThunkRead(m, needle);
-  /* Find NUL in needle's current page.  If the needle spans pages we still
-   * cap at the first 4 KiB — covers every grep/awk pattern we'd realistically
-   * see; oversized needles fall back to the slow path below. */
-  void *nnul = memchr(hneedle, 0, (size_t)nchunk);
-  if (!nnul) {
-    /* Needle doesn't terminate in this page → fall back to byte-walking
-     * the haystack directly.  Bounded to a sane outer cap to avoid runaway
-     * scans against a degenerate guest. */
-    i64 hcur = haystack;
-    u64 walked = 0;
-    const u64 kMaxScan = (u64)64 << 20;  /* 64 MiB outer cap */
-    while (walked < kMaxScan) {
-      u64 hoff = (u64)hcur & 4095;
-      u64 hchunk = 4096 - hoff;
-      u8 *hh = ThunkRead(m, hcur);
-      void *hnul = memchr(hh, 0, (size_t)hchunk);
-      u64 hwindow = hnul ? (u64)((const u8 *)hnul - hh) : hchunk;
-      u64 j;
-      for (j = 0; j < hwindow; ++j) {
-        /* Tail-match against the needle byte-by-byte via a recursive page
-         * walk.  This is the cold path — keep it correct, not fast. */
-        i64 nc = needle;
-        i64 hc = hcur + (i64)j;
-        bool matched = true;
-        for (;;) {
-          u8 *pn = ThunkRead(m, nc);
-          u8 *ph = ThunkRead(m, hc);
-          if (!*pn) break;                 /* needle exhausted → match */
-          if (!*ph) { matched = false; break; }  /* haystack exhausted */
-          if (*pn != *ph) { matched = false; break; }
-          ++nc; ++hc;
-        }
-        if (matched) return hcur + (i64)j;
-      }
-      if (hnul) return 0;  /* haystack exhausted without match */
-      hcur += (i64)hwindow;
-      walked += hwindow;
-    }
-    return 0;
-  }
-  size_t nlen = (size_t)((const u8 *)nnul - hneedle);
+  u8 nst[FBX_STRSTR_STAGE];
+  u8 win[2 * FBX_STRSTR_STAGE];
+  u64 nlen = (u64)GuestStrlen(m, needle);
+  u64 wlen = 0;
+  i64 base = haystack; /* guest address of win[0] */
+  i64 cur = haystack;
+  u8 first;
   if (nlen == 0) return haystack;
-  /* Stage needle to a small host buffer (we already know it's <= 4 KiB and
-   * lives in a single guest page, so the ThunkRead pointer is valid for
-   * the whole nlen+1 read).  Use a stack buffer. */
-  if (nlen >= 4096) {
-    /* Won't fit in 4 KiB stage; fall to byte-wise scan above by recursive
-     * call against a needle that exceeds the page boundary.  Cheap defence;
-     * realistic needles are well under this. */
-    return 0;
-  }
-  u8 needle_stage[4097];
-  memcpy(needle_stage, hneedle, nlen);
-  needle_stage[nlen] = 0;
-  /* Stage haystack page-by-page into a heap buffer (capped at 256 KiB).
-   * If haystack exceeds the cap, fall through to a slow page-by-page scan
-   * (which still benefits from the host's memchr inside Guest* helpers). */
-  const size_t kHaystackStageCap = 256u << 10;
-  /* One stage per thread, kept: a fault below longjmps out of this function,
-   * so a buffer malloc'd per call would leak on every fault. */
-  static _Thread_local u8 *hbuf;
-  if (!hbuf && !(hbuf = (u8 *)malloc(kHaystackStageCap + 1))) return 0;
-  size_t hbuf_len = 0;
-  bool terminated = false;
-  i64 hcur = haystack;
-  while (hbuf_len < kHaystackStageCap) {
-    u64 hoff = (u64)hcur & 4095;
-    u64 hchunk = 4096 - hoff;
-    if (hchunk > kHaystackStageCap - hbuf_len) {
-      hchunk = kHaystackStageCap - hbuf_len;
+  if (nlen > FBX_STRSTR_STAGE) {
+    ThunkCopyIn(m, &first, needle, 1);
+    for (;;) {
+      u64 chunk = 4096 - ((u64)cur & 4095);
+      u8 *h = ThunkRead(m, cur);
+      u8 *nul = (u8 *)memchr(h, 0, (size_t)chunk);
+      u64 take = nul ? (u64)(nul - h) : chunk;
+      u64 j;
+      for (j = 0; j < take; ++j) {
+        /* The haystack's NUL differs from every needle byte, so the compare
+         * stops there and reads nothing of the haystack past it. */
+        if (h[j] == first &&
+            !GuestMemcmp(m, cur + (i64)j, needle, nlen)) {
+          return cur + (i64)j;
+        }
+      }
+      if (nul) return 0;
+      cur += (i64)take;
     }
-    u8 *hh = ThunkRead(m, hcur);
-    void *hnul = memchr(hh, 0, (size_t)hchunk);
-    u64 take = hnul ? (u64)((const u8 *)hnul - hh) : hchunk;
-    memcpy(hbuf + hbuf_len, hh, (size_t)take);
-    hbuf_len += (size_t)take;
-    hcur += (i64)take;
-    if (hnul) { terminated = true; break; }
-    /* If we hit the cap and the string isn't NUL-terminated yet, we can
-     * still answer correctly IFF the needle occurs in what we staged.  If
-     * not, our answer is "no match in the staged window" which could be
-     * wrong for haystacks > 256 KiB containing the needle past the cap.
-     * Probability is negligible for grep workloads (line-buffered ≤ 8 KiB);
-     * documented as a bounded approximation. */
   }
-  hbuf[hbuf_len] = 0;
-  (void)terminated;
-  char *hit = strstr((const char *)hbuf, (const char *)needle_stage);
-  i64 result;
-  if (hit) {
-    result = haystack + (i64)((const u8 *)hit - hbuf);
-  } else {
-    result = 0;
+  ThunkCopyIn(m, nst, needle, nlen);
+  for (;;) {
+    u64 chunk = 4096 - ((u64)cur & 4095);
+    u8 *h = ThunkRead(m, cur);
+    u8 *nul = (u8 *)memchr(h, 0, (size_t)chunk);
+    u64 take = nul ? (u64)(nul - h) : chunk;
+    u8 *hit;
+    memcpy(win + wlen, h, (size_t)take);
+    wlen += take;
+    hit = (u8 *)memmem(win, (size_t)wlen, nst, (size_t)nlen);
+    if (hit) return base + (i64)(hit - win);
+    if (nul) return 0;
+    cur += (i64)take;
+    if (wlen > nlen - 1) {
+      u64 keep = nlen - 1;
+      memmove(win, win + (wlen - keep), (size_t)keep);
+      base += (i64)(wlen - keep);
+      wlen = keep;
+    }
   }
-  return result;
 }
 
 static void ThunkStrstr(struct Machine *m) {
@@ -1005,8 +953,7 @@ static void ThunkMemrchr(struct Machine *m) {
 static void ThunkStrrchr(struct Machine *m) {
   i64 s = (i64)Get64(m->di);
   u8 c = (u8)(Get64(m->si) & 0xff);
-  /* Bounded strlen — same 1 GiB safety cap as ThunkStrlen. */
-  i64 len = GuestStrnlen(m, s, (u64)1 << 30);
+  i64 len = GuestStrlen(m, s);
   i64 hit = GuestMemrchr(m, s, c, (u64)len + 1);
   if (g_thunk_trace) {
     LOGF("thunk strrchr(s=%#llx, c=%#x) = %#llx",
@@ -1175,11 +1122,13 @@ static void ThunkStrtokR(struct Machine *m) {
   /* Find end of token. */
   cspn = GuestSpanOut(m, s, bits);
   end = s + cspn;
-  /* Terminate in place if not already at NUL, then advance state.  Both
-   * stores are checked before either is made, in musl's order (the
-   * terminator, then *state): a re-run after a fault on the second would
-   * otherwise find the terminator already written and return a different
-   * state (see the fault note at the top). */
+  /* Terminate in place if not already at NUL, then advance state.  musl
+   * stores *state first and the terminator second; on hardware a fault on
+   * the terminator re-runs only that store.  A thunk's fault re-runs the
+   * whole call, and a resumed call (s == NULL) re-reads *state, so both
+   * stores are checked before either is made: a handler sees neither
+   * (musl's would see *state already set), and the re-run computes what the
+   * uninterrupted call would have (see the fault note at the top). */
   {
     u8 next_state_buf[8] = {0};
     bool cut = *ThunkRead(m, end) != 0;
@@ -1191,9 +1140,8 @@ static void ThunkStrtokR(struct Machine *m) {
       u8 zero = 0;
       ThunkCopyOut(m, end, &zero, 1);
       Put64(next_state_buf, (u64)(end + 1));
-    } else {
-      Put64(next_state_buf, (u64)end);
     }
+    /* else *state = NULL, as musl's `else *p = 0` */
     ThunkCopyOut(m, statep, next_state_buf, 8);
   }
   result = s;

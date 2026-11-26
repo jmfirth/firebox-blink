@@ -3967,10 +3967,13 @@ static int EmitCodeSection(struct FbxWasmBuffer *out,
 /* `loop`+`br_table` dispatcher for any other member).                       */
 /*                                                                            */
 /* Correct-or-refuse, narrower than the per-block path:                       */
-/*   - A member passes CoverageGate AND uses only register ops, LOAD, flag-   */
-/*     defining ALU ops, LEA, and a BRANCH_COND/BRANCH_TAKEN terminator.     */
-/*     No STORE, stack op, call, ret, IMUL or BAILOUT: a region never writes  */
-/*     guest memory, and never contains an instruction it cannot run.         */
+/*   - A member passes CoverageGate AND fbx_ir_region_member_ok, whose       */
+/*     switch is the list of what a member may hold: register ops, LOAD,      */
+/*     STORE, PUSH/POP, the flag-defining ALU ops, shifts, IMUL, CMOV, SEXT,  */
+/*     LEA, and one terminator (a conditional or taken branch, a direct or    */
+/*     indirect call or jump, RET, or a BAILOUT at an instruction boundary,  */
+/*     where Tier 1 runs the rest).  A region never contains an instruction  */
+/*     it cannot run.                                                         */
 /*   - Regions EXIT; they never call into a Tier-1 handler.  Every exit       */
 /*     (a branch to a non-member, a TLB miss, the back-edge budget) spills    */
 /*     the registers the region wrote and stores `m->ip`.  The exit PC is a   */
