@@ -897,6 +897,22 @@ static int CoverageGate(const struct FbxIrBlock *ir,
   /* Walk the IR once more for LEA SIB rejection. */
   for (i = 0; i < ir->ninsts; ++i) {
     const struct FbxIrInst *p = &ir->insts[i];
+    /* firebox#5BW: BRANCH_COND's fall-through and CALL_DIRECT's return PC
+     * are taken from ir->end_pc at full width (the IR's src2 holds only the
+     * low 32 bits).  That is only the right PC when the op ends the block and
+     * src2 agrees with it; anything else is refused. */
+    if (p->opcode == FBX_IR_OP_BRANCH_COND ||
+        p->opcode == FBX_IR_OP_CALL_DIRECT) {
+      u32 j;
+      int last = 1;
+      for (j = i + 1u; j < ir->ninsts; ++j) {
+        if (ir->insts[j].opcode != FBX_IR_OP_PC_MARK) last = 0;
+      }
+      if (!last || p->src2 != (u32)ir->end_pc) {
+        SetFail(fail, FBX_IR_EMIT_KIND_MISMATCH, p->opcode);
+        return 0;
+      }
+    }
     if (p->opcode == FBX_IR_OP_LEA) {
       /* #778: accept BOTH the disp-only form (src1=GREG base, src2=NONE/IMM,
        * scale=0) AND the SIB-INDEX form (src1=GREG base, src2=GREG index,
@@ -1125,6 +1141,10 @@ struct BlockCtxBuilder {
 * assigned slot.  When NULL (emit-time re-walk), it just allocates.        │
 */
   u64 *consts;
+  /* firebox#5BW: the block's end PC.  BRANCH_COND's fall-through and
+   * CALL_DIRECT's return PC are the PC after the block's last instruction;
+   * the IR's u32 src2 carries only their low 32 bits. */
+  u64 end_pc;
   u32 consts_cap;
   /* firebox#735 — the guest PC of the x86 instruction currently being
    * allocated for.  Updated by every PC_MARK in AllocSlotsForInst (which
@@ -1307,7 +1327,7 @@ static int AllocBranchCondSlots(struct BlockCtxBuilder *b,
                                 const struct FbxIrInst *p,
                                 struct BranchCondSlots *out) {
   out->taken_pc_slot = BcAllocPc(b, p->imm);
-  out->fallthrough_pc_slot = BcAllocPc(b, (u64)(u32)p->src2);
+  out->fallthrough_pc_slot = BcAllocPc(b, b->end_pc);
   return !b->overflow;
 }
 
@@ -1323,7 +1343,7 @@ static int AllocCallDirectSlots(struct BlockCtxBuilder *b,
                                 const struct FbxIrInst *p,
                                 struct CallDirectSlots *out) {
   out->rsp_slot = BcAllocGreg(b, FBX_GREG_RSP);
-  out->return_pc_slot = BcAllocPc(b, (u64)(u32)p->src2);
+  out->return_pc_slot = BcAllocPc(b, b->end_pc);
   out->target_pc_slot = BcAllocPc(b, p->imm);
   return !b->overflow;
 }
@@ -1507,6 +1527,7 @@ int fbx_ir_build_block_ctx_consts(const struct FbxIrBlock *ir,
   if (out_consts_cap < FBX_T2_BLOCK_CTX_MAX_CONSTS) return 0;
   for (i = 0; i < out_consts_cap; ++i) out_consts[i] = 0;
   BcInit(&b, out_consts, out_consts_cap);
+  b.end_pc = ir->end_pc;
   WalkAllocateAllSlots(ir, &b);
   if (b.overflow) return 0;
   *out_nconsts = b.high_water;
@@ -3195,14 +3216,44 @@ static int BlockIsSelfLoopCandidate(const struct FbxIrBlock *ir) {
  * DEAD.  Eliding a DEAD one is unobservable both in-block (a later SFR rewrites
  * m->flags before any read) AND cross-block (the surviving set includes the
  * LAST SFR — what a next block would read). */
-static int SetFlagsRawIsLive(const struct FbxIrBlock *ir, u32 idx) {
+/*
+ * firebox#NDG: "overwritten before a read" was not enough.  Between the two
+ * definitions the block can EXIT: a LOAD or STORE whose inline translation
+ * misses returns 1 with m->ip at that instruction, and Tier 1 resumes there
+ * with m->flags as the block left them.  If that instruction then faults, the
+ * signal frame carries the flags; a skipped definition made them stale.  So a
+ * definition is dead only when the next one follows with nothing in between
+ * that can read the flags OR leave the block: the ops whitelisted below
+ * neither read m->flags nor exit.  Everything else (LOAD, STORE, stack ops,
+ * calls, branches, BAILOUT, anything new) keeps the definition. */
+static int FlagsDefIsLive(const struct FbxIrBlock *ir, u32 idx) {
   u32 j;
   for (j = idx + 1u; j < ir->ninsts; ++j) {
-    u8 op = ir->insts[j].opcode;
-    if (op == FBX_IR_OP_SET_FLAGS_RAW) return 0; /* overwritten before a read */
-    if (op == FBX_IR_OP_BRANCH_COND || op == FBX_IR_OP_GET_FLAG) return 1;
+    switch (ir->insts[j].opcode) {
+      case FBX_IR_OP_SET_FLAGS_RAW:
+        return 0; /* overwritten, with no read or exit in between */
+      case FBX_IR_OP_PC_MARK:
+      case FBX_IR_OP_REG_GET:
+      case FBX_IR_OP_REG_SET:
+      case FBX_IR_OP_ADD:
+      case FBX_IR_OP_SUB:
+      case FBX_IR_OP_AND:
+      case FBX_IR_OP_OR:
+      case FBX_IR_OP_XOR:
+      case FBX_IR_OP_CMP:
+      case FBX_IR_OP_TEST:
+      case FBX_IR_OP_LEA:
+      case FBX_IR_OP_IMUL:
+        continue; /* cannot read flags, cannot exit */
+      default:
+        return 1;
+    }
   }
-  return 1; /* no later flag op in-block → keep (a next block may read it) */
+  return 1; /* the last definition: the next block may read it */
+}
+
+static int SetFlagsRawIsLive(const struct FbxIrBlock *ir, u32 idx) {
+  return FlagsDefIsLive(ir, idx);
 }
 
 /* Emit the function body for one IR block.  Returns 1 on success, 0 on
@@ -4179,28 +4230,7 @@ u32 fbx_ir_region_successors(const struct FbxIrBlock *ir,
  * the flags before anything reads them AND before any point the region can
  * exit (a LOAD's translation miss), so `m->flags` is exact at every exit. */
 static int RegionFlagsLive(const struct FbxIrBlock *ir, u32 idx) {
-  u32 j;
-  for (j = idx + 1u; j < ir->ninsts; ++j) {
-    switch (ir->insts[j].opcode) {
-      case FBX_IR_OP_SET_FLAGS_RAW:
-        return 0;
-      case FBX_IR_OP_PC_MARK:
-      case FBX_IR_OP_REG_GET:
-      case FBX_IR_OP_REG_SET:
-      case FBX_IR_OP_ADD:
-      case FBX_IR_OP_SUB:
-      case FBX_IR_OP_AND:
-      case FBX_IR_OP_OR:
-      case FBX_IR_OP_XOR:
-      case FBX_IR_OP_CMP:
-      case FBX_IR_OP_TEST:
-      case FBX_IR_OP_LEA:
-        continue; /* cannot read flags, cannot exit */
-      default:
-        return 1; /* LOAD (may exit), a branch, anything else */
-    }
-  }
-  return 1;
+  return FlagsDefIsLive(ir, idx); /* firebox#NDG: one rule for both paths */
 }
 
 static int RegionMemberIndex(const struct RegionEmit *r, u64 pc) {
