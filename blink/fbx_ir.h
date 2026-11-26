@@ -215,7 +215,8 @@ extern "C" {
  *     `seg` (the former _pad0); an absolute LOAD/STORE address (src1_kind
  *     IMM) may take an index (src2 / dst GREG + scale) and is also the
  *     no-base SIB form `[index*scale + disp32]`; LEA may have no base
- *     (src1_kind NONE, index in src2). */
+ *     (src1_kind NONE, index in src2).  SHL/SHR/SAR (group 2 /4 /5 /7 by
+ *     1, imm8 or CL, widths 4 and 8) with the FBX_IR_FLAGS_SH* kinds. */
 #define FBX_IR_VERSION 12u
 
 /* ────────────────────────────────────────────────────────────────────────── */
@@ -351,6 +352,15 @@ enum FbxIrOpcode {
    * target.  Block terminator.  Lowered by regions only. */
   FBX_IR_OP_JMP_INDIRECT = 25,
 
+  /* firebox#T3R3 — shifts (x86 group 2 /4 SHL, /5 SHR, /7 SAR, widths 4 and
+   * 8): dst(vreg) = src1(vreg) shifted by (src2(vreg) & (8 * width - 1)),
+   * the result at `width`.  Their flags are a SET_FLAGS_RAW of kind
+   * FBX_IR_FLAGS_SHL/SHR/SAR, which writes nothing when the masked count is
+   * 0 (so it READS the previous flags).  Lowered by regions only. */
+  FBX_IR_OP_SHL = 26,
+  FBX_IR_OP_SHR = 27,
+  FBX_IR_OP_SAR = 28,
+
   /* Sentinel — count of defined opcodes.  Used by validation; not emitted. */
   FBX_IR_OP_LAST_,
 };
@@ -370,6 +380,11 @@ enum FbxIrOpcode {
 #define FBX_IR_FLAGS_INC 0x40u
 #define FBX_IR_FLAGS_DEC 0x41u
 #define FBX_IR_FLAGS_NEG 0x42u
+/* firebox#T3R3: blink/alu.c's ShlN / ShrN / SarN, src1 = the operand, src2 =
+ * the count (unmasked); no flag changes when the masked count is 0. */
+#define FBX_IR_FLAGS_SHL 0x43u
+#define FBX_IR_FLAGS_SHR 0x44u
+#define FBX_IR_FLAGS_SAR 0x45u
 
 #define FBX_IR_KIND_NONE 0   /* operand not used */
 #define FBX_IR_KIND_VREG 1   /* virtual register; index in .src/.dst */

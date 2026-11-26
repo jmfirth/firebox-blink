@@ -241,6 +241,9 @@ static const char *const kOpcodeNames[FBX_IR_OP_LAST_] = {
     [FBX_IR_OP_PUSH] = "PUSH",
     [FBX_IR_OP_POP] = "POP",
     [FBX_IR_OP_JMP_INDIRECT] = "JMP_INDIRECT",
+    [FBX_IR_OP_SHL] = "SHL",
+    [FBX_IR_OP_SHR] = "SHR",
+    [FBX_IR_OP_SAR] = "SAR",
 };
 
 const char *fbx_ir_opcode_name(u8 opcode) {
@@ -505,6 +508,7 @@ static int LiftOperandRoles(u64 mop) {
     case 0x085: case 0x1B7: case 0x081: case 0x083:
     case 0x069: case 0x06B: case 0x1AF:
     case 0x0F7: case 0x0FF: /* firebox#T3R2: groups 3 and 5 */
+    case 0x0C1: case 0x0D1: case 0x0D3: /* firebox#T3R3: group 2 */
       return FBX_LIFT_HAS_MODRM;
     case 0x08D:
       return FBX_LIFT_HAS_MODRM | FBX_LIFT_NO_SEG;
@@ -598,6 +602,13 @@ static int LiftOperandShapeUnmodelled(u64 rde, u64 mop, int region) {
     return 1;
   }
   if (mop == 0x0FE && ModrmReg(rde) > 1) return 1;
+  /* firebox#T3R3: group 2 as SHL /4, SHR /5, SAR /7 only (no rotates, no
+   * /6 alias), and not at operand size 2. */
+  if ((mop == 0x0C1 || mop == 0x0D1 || mop == 0x0D3) &&
+      (Osz(rde) ||
+       !(ModrmReg(rde) == 4 || ModrmReg(rde) == 5 || ModrmReg(rde) == 7))) {
+    return 1;
+  }
   if (mop == 0x0FF && !(ModrmReg(rde) <= 2 || ModrmReg(rde) == 4)) return 1;
   /* firebox#T3R2: an operand-size prefix makes PUSH/POP/RET move 2 bytes
    * (blink/stack.c kStackOsz) and changes CALL/JMP; the IR models only the
@@ -1274,6 +1285,61 @@ static int LiftUnaryRegion(struct LiftCtx *ctx, u64 rde, i64 disp, u64 uimm0,
                      x, k);
 }
 
+/* firebox#T3R3 — group 2 SHL/SHR/SAR r, 1 (D1) / imm8 (C1) / CL (D3), at
+ * widths 4 and 8, register destination.  Region lifts only.  The flags are
+ * blink/alu.c's ShlN / ShrN / SarN (kBsu), via SET_FLAGS_RAW over the operand
+ * and the unmasked count. */
+static int LiftShiftRegion(struct LiftCtx *ctx, u64 rde, u64 uimm0, u64 mop) {
+  u8 width = WidthFromRde(rde, 0);
+  u32 greg = (u32)RexbRm(rde);
+  u32 x, c, z;
+  u8 op, kind;
+  struct FbxIrInst *sh, *set, *fl;
+  if (!ctx->region || !IsModrmRegister(rde)) return -1;
+  if (width != 4 && width != 8) return -1;
+  switch (ModrmReg(rde)) {
+    case 4: op = FBX_IR_OP_SHL; kind = FBX_IR_FLAGS_SHL; break;
+    case 5: op = FBX_IR_OP_SHR; kind = FBX_IR_FLAGS_SHR; break;
+    case 7: op = FBX_IR_OP_SAR; kind = FBX_IR_FLAGS_SAR; break;
+    default: return -1;
+  }
+  if (!LiftGetReg(ctx, width, greg, &x)) return 0;
+  if (mop == 0x0D3) {
+    if (!LiftGetReg(ctx, 1, 1u /* CL */, &c)) return 0;
+  } else {
+    if (!LiftGetImm(ctx, 1, mop == 0x0D1 ? 1u : (uimm0 & 0xFFu), &c)) return 0;
+  }
+  sh = CtxEmit(ctx);
+  if (!sh) return 0;
+  z = CtxAllocVreg(ctx);
+  sh->opcode = op;
+  sh->width = width;
+  sh->dst_kind = FBX_IR_KIND_VREG;
+  sh->dst = z;
+  sh->src1_kind = FBX_IR_KIND_VREG;
+  sh->src1 = x;
+  sh->src2_kind = FBX_IR_KIND_VREG;
+  sh->src2 = c;
+  set = CtxEmit(ctx);
+  if (!set) return 0;
+  set->opcode = FBX_IR_OP_REG_SET;
+  set->width = width;
+  set->dst_kind = FBX_IR_KIND_GREG;
+  set->dst = greg;
+  set->src1_kind = FBX_IR_KIND_VREG;
+  set->src1 = z;
+  fl = CtxEmit(ctx);
+  if (!fl) return 0;
+  fl->opcode = FBX_IR_OP_SET_FLAGS_RAW;
+  fl->width = width;
+  fl->imm = kind;
+  fl->src1_kind = FBX_IR_KIND_VREG;
+  fl->src1 = x;
+  fl->src2_kind = FBX_IR_KIND_VREG;
+  fl->src2 = c;
+  return 1;
+}
+
 /* Common body for the immediate-form ALU lift: `greg` = OP(greg, imm) with
  * the eager SET_FLAGS_RAW.  `greg` is the destination/lhs guest register id;
  * `op` must be a non-zero FBX_IR_OP_* (the caller resolves ADC/SBB to a
@@ -1845,6 +1911,8 @@ static int LiftOneOp(struct LiftCtx *ctx, const struct FbxTcEntry *e,
     /* firebox#T3R2 — region lifts only (each returns -1 outside a region). */
     case 0x0F6: case 0x0F7: case 0x0FE: case 0x0FF:
       return LiftUnaryRegion(ctx, rde, e->disp, e->uimm0, mop);
+    case 0x0C1: case 0x0D1: case 0x0D3: /* firebox#T3R3 */
+      return LiftShiftRegion(ctx, rde, e->uimm0, mop);
     case 0x0A8: case 0x0A9: {
       u32 x, k;
       u8 w = WidthFromRde(rde, mop == 0x0A8);

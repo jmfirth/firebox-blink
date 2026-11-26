@@ -3505,6 +3505,61 @@ TEST(FbxRegionExec, UnaryFlagsMatchBlinkAtEveryWidth) {
   }
 }
 
+TEST(FbxRegionExec, ShiftsMatchBlinkAtWidthsFourAndEight) {
+  /* firebox#T3R3: shl/shr/sar r8 by CL (D3), by imm8 (C1) and by 1 (D1), at
+   * widths 8 and 4, against blink/alu.c's ShlN/ShrN/SarN (kBsu), flags
+   * included; a masked count of 0 must leave the flags alone. */
+  static const u64 vals[] = {0, 1, 0x80000000ull, 0xffffffffull,
+                             0x8000000000000000ull, 0xfedcba9876543210ull,
+                             0x7fffffffffffffffull, 0x00000000c0000001ull};
+  static const u64 counts[] = {0, 1, 2, 7, 31, 32, 33, 63, 64, 0x41, 0xff};
+  static const unsigned subs[3] = {4, 5, 7};
+  unsigned v, c, si, wi, form;
+  for (wi = 0; wi < 2; ++wi) {
+    unsigned w = wi ? 4 : 8;
+    for (si = 0; si < 3; ++si) {
+      for (form = 0; form < 3; ++form) {
+        for (v = 0; v < sizeof vals / sizeof vals[0]; ++v) {
+          for (c = 0; c < sizeof counts / sizeof counts[0]; ++c) {
+            struct RgInsn b[2];
+            const struct RgInsn *blocks[1] = {b};
+            unsigned lens[1] = {2}, n = 0;
+            struct Machine m0, om;
+            struct RxRun r;
+            u64 x = vals[v], cnt = form == 2 ? 1 : counts[c], want;
+            aluop_f f;
+            if (form == 2 && c) continue; /* D1: one count */
+            memset(b, 0, sizeof b);
+            b[0].ip = RX_CODE;
+            b[0].bytes[n++] = w == 8 ? 0x49 : 0x41;
+            b[0].bytes[n++] = form == 0 ? 0xd3 : form == 1 ? 0xc1 : 0xd1;
+            b[0].bytes[n++] = (u8)(0xc0 | subs[si] << 3); /* r8 */
+            if (form == 1) b[0].bytes[n++] = (u8)cnt;
+            b[0].len = (u8)n;
+            b[1].ip = RX_CODE + n;
+            b[1].len = 2;
+            b[1].bytes[0] = 0xeb;
+            b[1].bytes[1] = 0xfe;
+            RxMachine(&m0);
+            m0.flags = 0x202 | 0x8d5 | (0x33u << 24); /* flags a 0 count keeps */
+            RxSetG(&m0, 8, x);
+            RxSetG(&m0, 1, 0x1200 | (cnt & 0xff)); /* cl */
+            om = m0;
+            f = kBsu[subs[si]][w == 8 ? 3 : 2];
+            want = (u64)f(&om, w == 8 ? x : (u32)x, cnt & 0xff);
+            want = w == 8 ? want : (u32)want;
+            RxExec(blocks, lens, 1, &m0, 0, &r);
+            ASSERT_EQ(0, r.err);
+            EXPECT_EQ(want, RxG(&r.m, 8));
+            EXPECT_EQ(om.flags, r.m.flags);
+            EXPECT_EQ(RX_CODE + n, r.m.ip);
+          }
+        }
+      }
+    }
+  }
+}
+
 TEST(FbxRegionExec, SegmentBasesAndBaselessAddresses) {
   /* firebox#T3R3: mov %fs:0x28,%rax; mov 0x601010,%rcx (no base, no index);
    * lea 0x8(,%rdi,4),%rdx (no base); mov %rbx,%gs:0x8(%rdi); mov
@@ -3613,13 +3668,13 @@ TEST(FbxRegionExec, UntranslatableAccessLeavesWithNothingCommitted) {
 
 TEST(FbxRegionExec, ABailoutLeavesAtItsInstruction) {
   /* inc rax; jmp B   (member 0)
-   * B: inc rbx; shl $3, rax; jmp .   (member 1: the shift is Tier 1's)
-   * Leaving at the shift from member 1 returns 0 (Tier 1 dispatches that PC);
+   * B: inc rbx; rol $3, rax; jmp .   (member 1: the rotate is Tier 1's)
+   * Leaving at the rotate from member 1 returns 0 (Tier 1 dispatches that PC);
    * a member-0 bailout returns 1 (a PC inside the dispatched block). */
   static const struct RgInsn a[] = {{RX_CODE, 3, {0x48, 0xff, 0xc0}},
                                     {RX_CODE + 3, 2, {0xeb, 0x7b}}};
   static const struct RgInsn bb[] = {{RX_CODE + 0x80, 3, {0x48, 0xff, 0xc3}},
-                                     {RX_CODE + 0x83, 4, {0x48, 0xc1, 0xe0, 0x03}},
+                                     {RX_CODE + 0x83, 4, {0x48, 0xc1, 0xc0, 0x03}},
                                      {RX_CODE + 0x87, 2, {0xeb, 0xfe}}};
   const struct RgInsn *two[2] = {a, bb}, *one[1] = {bb};
   unsigned l2[2] = {2, 3}, l1[1] = {3};
