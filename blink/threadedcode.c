@@ -734,6 +734,8 @@ static void ExecuteBlock(struct Machine *m, struct FbxTcBlock *b) {
        * call m->ip points to the return PC; control returns to Actor's
        * main loop.  Thunks are accounted at a synthetic mop (0xFFF) so
        * they don't pollute the §Q7 ranking with libc-internal weight. */
+      /* A thunk's fault reports ip as the function's entry (thunks.c). */
+      m->oplen = 0;
       if (g_tc_trace == 2) {
         u64 t0 = FbxNowNs();
         ((void (*)(struct Machine *))e->fn)(m);
