@@ -3567,3 +3567,43 @@ TEST(FbxRegionExec, ABailoutLeavesAtItsInstruction) {
   EXPECT_EQ(RxG(&m0, 0), RxG(&r.m, 0));
   EXPECT_EQ(RxG(&m0, 3) + 1, RxG(&r.m, 3));
 }
+
+/* firebox#T3R2 (#NDG class, reviewer finding): an exit point is a reader of
+ * the imul shadow.  The load can miss its translation and leave at itself;
+ * Tier 1's fault frame must then carry imul's CF/OF, which the per-block path
+ * never computes. */
+static int PerBlockEmitsBytes(const struct RgInsn *ins, unsigned n) {
+  struct FbxTcBlock *tc = DecodeTc(ins, n);
+  struct FbxIrBlock *ir;
+  struct FbxWasmBuffer out;
+  int ok;
+  if (!tc) return -1;
+  ir = fbx_ir_lift(tc);
+  if (!ir) {
+    FreeTc(tc);
+    return -1;
+  }
+  fbx_wasm_buffer_init(&out);
+  ok = fbx_ir_emit_wasm(ir, tc, &out);
+  fbx_wasm_buffer_free(&out);
+  fbx_ir_free(ir);
+  FreeTc(tc);
+  return ok;
+}
+
+TEST(FbxNdg, ImulShadowRefusesAtALoadThatCanExit) {
+  /* imul rax,rbx ; mov rcx,[rdx+8] ; add rsi,rdi ; jmp */
+  static const struct RgInsn exits[] = {
+      {0x1000, 4, {0x48, 0x0f, 0xaf, 0xc3}},
+      {0x1004, 4, {0x48, 0x8b, 0x4a, 0x08}},
+      {0x1008, 3, {0x48, 0x01, 0xfe}},
+      {0x100b, 2, {0xeb, 0xf3}}};
+  /* control: imul rax,rbx ; mov rcx,rdx ; add rsi,rdi ; jmp — no exit point */
+  static const struct RgInsn noexit[] = {
+      {0x1000, 4, {0x48, 0x0f, 0xaf, 0xc3}},
+      {0x1004, 3, {0x48, 0x89, 0xd1}},
+      {0x1007, 3, {0x48, 0x01, 0xfe}},
+      {0x100a, 2, {0xeb, 0xf4}}};
+  EXPECT_EQ(1, PerBlockEmitsBytes(noexit, 4));
+  EXPECT_EQ(0, PerBlockEmitsBytes(exits, 4));
+}

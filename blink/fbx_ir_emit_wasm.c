@@ -49,6 +49,7 @@
 ╚─────────────────────────────────────────────────────────────────────────────*/
 
 #include "blink/fbx_wasm_emit.h"
+#include "blink/flags.h"
 
 #include <stddef.h>
 #include <stdlib.h>
@@ -371,6 +372,30 @@ static int Mod3(u64 rde) {
  * also take the forms listed under `region` below; fbx_ir_region_member_ok
  * then checks every IR operand.  The per-block gate (region == 0) is
  * unchanged, except that it also refuses those region-only IR shapes. */
+/* firebox#NDG: the IR ops that neither read the flag shadow nor can leave
+ * the block.  A flag definition followed only by these up to the next
+ * definition is dead; anything else (a Jcc, GET_FLAG, a LOAD/STORE that can
+ * miss, a call, a terminator) reads or may expose it. */
+static int IrOpCannotReadFlagsOrExit(u8 op) {
+  switch (op) {
+    case FBX_IR_OP_PC_MARK:
+    case FBX_IR_OP_REG_GET:
+    case FBX_IR_OP_REG_SET:
+    case FBX_IR_OP_ADD:
+    case FBX_IR_OP_SUB:
+    case FBX_IR_OP_AND:
+    case FBX_IR_OP_OR:
+    case FBX_IR_OP_XOR:
+    case FBX_IR_OP_CMP:
+    case FBX_IR_OP_TEST:
+    case FBX_IR_OP_LEA:
+    case FBX_IR_OP_IMUL:
+      return 1;
+    default:
+      return 0;
+  }
+}
+
 static int CoverageGateMode(const struct FbxIrBlock *ir,
                             const struct FbxTcBlock *tc,
                             struct FbxEmitFailCtx *fail, int region);
@@ -555,6 +580,11 @@ static int CoverageGateMode(const struct FbxIrBlock *ir,
    * larger increment than this refuse. */
   {
     int imul_flags_pending = 0;
+    /* firebox#T3R2 (#NDG class): an exit point is a reader too.  A LOAD or
+     * STORE that misses its translation leaves at that instruction, and a
+     * fault Tier 1 then raises carries the predecessor's flags where Tier 1
+     * would have carried imul's, so any op that can exit refuses while the
+     * shadow is pending. */
     for (i = 0; i < ir->ninsts; ++i) {
       u8 op = ir->insts[i].opcode;
       if (op == FBX_IR_OP_IMUL) {
@@ -564,11 +594,10 @@ static int CoverageGateMode(const struct FbxIrBlock *ir,
                  (u8)ir->insts[i].imm != FBX_IR_FLAGS_DEC) {
         /* a real flag-def overwrites the shadow (INC/DEC keep CF) */
         imul_flags_pending = 0;
-      } else if (op == FBX_IR_OP_BRANCH_COND || op == FBX_IR_OP_GET_FLAG) {
-        if (imul_flags_pending) {
-          SetFail(fail, FBX_IR_EMIT_IMUL_FLAGS_LIVE, op);
-          return 0;
-        }
+      } else if (imul_flags_pending && op != FBX_IR_OP_SET_FLAGS_RAW &&
+                 !IrOpCannotReadFlagsOrExit(op)) {
+        SetFail(fail, FBX_IR_EMIT_IMUL_FLAGS_LIVE, op);
+        return 0;
       }
     }
     /* firebox#3XY — block end is a reader. */
@@ -1151,6 +1180,11 @@ _Static_assert(sizeof(((struct Machine *)0)->invalidated) == 1,
  *   = 0x00FFF72Eu
  */
 #define EMIT_FLAGS_CLEAR_MASK 0x00FFF72Eu
+/* firebox#T3R2: RegionUnaryFlags writes these bits; they are blink's. */
+_Static_assert(EMIT_FLAGS_CF == FLAGS_CF && EMIT_FLAGS_PF == FLAGS_PF &&
+                   EMIT_FLAGS_AF == FLAGS_AF && EMIT_FLAGS_ZF == FLAGS_ZF &&
+                   EMIT_FLAGS_SF == FLAGS_SF && EMIT_FLAGS_OF == FLAGS_OF,
+               "emitter flag bits match blink/flags.h");
 
 /* Scratch local indices (after m_ptr local 0 + nvregs i64 locals).
  *
@@ -3306,30 +3340,16 @@ static int BlockIsSelfLoopCandidate(const struct FbxIrBlock *ir) {
 static int FlagsDefIsLive(const struct FbxIrBlock *ir, u32 idx) {
   u32 j;
   for (j = idx + 1u; j < ir->ninsts; ++j) {
-    switch (ir->insts[j].opcode) {
-      case FBX_IR_OP_SET_FLAGS_RAW:
-        /* firebox#T3R2: INC/DEC keep CF, so they READ this definition. */
-        if ((u8)ir->insts[j].imm == FBX_IR_FLAGS_INC ||
-            (u8)ir->insts[j].imm == FBX_IR_FLAGS_DEC) {
-          return 1;
-        }
-        return 0; /* overwritten, with no read or exit in between */
-      case FBX_IR_OP_PC_MARK:
-      case FBX_IR_OP_REG_GET:
-      case FBX_IR_OP_REG_SET:
-      case FBX_IR_OP_ADD:
-      case FBX_IR_OP_SUB:
-      case FBX_IR_OP_AND:
-      case FBX_IR_OP_OR:
-      case FBX_IR_OP_XOR:
-      case FBX_IR_OP_CMP:
-      case FBX_IR_OP_TEST:
-      case FBX_IR_OP_LEA:
-      case FBX_IR_OP_IMUL:
-        continue; /* cannot read flags, cannot exit */
-      default:
+    u8 op = ir->insts[j].opcode;
+    if (op == FBX_IR_OP_SET_FLAGS_RAW) {
+      /* firebox#T3R2: INC/DEC keep CF, so they READ this definition. */
+      if ((u8)ir->insts[j].imm == FBX_IR_FLAGS_INC ||
+          (u8)ir->insts[j].imm == FBX_IR_FLAGS_DEC) {
         return 1;
+      }
+      return 0; /* overwritten, with no read or exit in between */
     }
+    if (!IrOpCannotReadFlagsOrExit(op)) return 1;
   }
   return 1; /* the last definition: the next block may read it */
 }
@@ -4596,10 +4616,7 @@ static void RegionTranslate(struct RegionEmit *r, u32 i, u64 cur_pc,
  * store's width where 8 would leave the page: RegionLogStore).
  * fbx_t2_glue.c's verifier undoes the stores with it and compares the
  * windows Tier 1 leaves. */
-#define FBX_REGION_LOG_BASE 1u
-#define FBX_REGION_LOG_USED 2u
-#define FBX_REGION_LOG_CAP 3u
-#define FBX_REGION_LOG_ENTRY 16u
+_Static_assert(FBX_REGION_LOG_ENTRY == 1u << 4, "RegionLogStore shifts by 4");
 _Static_assert(FBX_REGION_LOG_CAP < FBX_T2_BLOCK_CTX_MAX_CONSTS,
                "region store-log slots fit the block ctx");
 
@@ -5217,7 +5234,7 @@ int fbx_ir_emit_region_wasm(const struct FbxIrBlock *const *irs,
   fbx_wasm_buffer_u8(&fn, WASM_OP_I64_STORE);
   fbx_wasm_buffer_uleb(&fn, 3);
   fbx_wasm_buffer_uleb(&fn, M_OFF_IP);
-  if (count_insns) {
+  if (r.count) {
     /* The instruction count goes to ctx->consts[0] (verification only). */
     fbx_wasm_buffer_u8(&fn, WASM_OP_LOCAL_GET);
     fbx_wasm_buffer_uleb(&fn, EMIT_LOCAL_BLOCK_CTX);
