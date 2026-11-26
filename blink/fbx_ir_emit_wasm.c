@@ -409,6 +409,7 @@ static int IrOpCannotReadFlagsOrExit(u8 op) {
     case FBX_IR_OP_SHL: /* firebox#T3R3: values; flags via SET_FLAGS_RAW */
     case FBX_IR_OP_SHR:
     case FBX_IR_OP_SAR:
+    case FBX_IR_OP_SEXT:
       return 1;
     default:
       return 0;
@@ -812,6 +813,7 @@ static int CoverageGateMode(const struct FbxIrBlock *ir,
       case FBX_IR_OP_SHL: /* firebox#T3R3: regions only */
       case FBX_IR_OP_SHR:
       case FBX_IR_OP_SAR:
+      case FBX_IR_OP_SEXT:
         if (region) continue;
         SetFail(fail, FBX_IR_EMIT_UNSUPPORTED_OPCODE, op);
         return 0;
@@ -867,6 +869,7 @@ static int CoverageGateMode(const struct FbxIrBlock *ir,
         case 0x0F6: case 0x0F7: case 0x0FE: case 0x0FF:
         case 0x0A8: case 0x0A9:
         case 0x0C1: case 0x0D1: case 0x0D3: /* firebox#T3R3 */
+        case 0x063: case 0x098: case 0x1BE: case 0x1BF:
           ok = 1;
           break;
         case 0x0C6: case 0x0C7:
@@ -4391,6 +4394,13 @@ int fbx_ir_region_member_ok(const struct FbxIrBlock *ir,
               p->src2_kind == FBX_IR_KIND_VREG && p->src2 < ir->nvregs &&
               (p->width == 4 || p->width == 8);
         break;
+      case FBX_IR_OP_SEXT: /* firebox#T3R3 */
+        ok &= p->dst_kind == FBX_IR_KIND_VREG && p->dst < ir->nvregs &&
+              p->src1_kind == FBX_IR_KIND_VREG && p->src1 < ir->nvregs &&
+              (p->width == 4 || p->width == 8) &&
+              (p->imm == 1 || p->imm == 2 || p->imm == 4) &&
+              p->imm < p->width;
+        break;
       case FBX_IR_OP_LEA:
         ok &= p->dst_kind == FBX_IR_KIND_GREG && p->dst < 16u &&
               (p->width == 2 || p->width == 4 || p->width == 8) &&
@@ -5258,6 +5268,15 @@ static int RegionEmitMember(struct RegionEmit *r, u32 i) {
       case FBX_IR_OP_SAR:
         RegionShiftValue(r, p->opcode, VregLocal(p->src1), VregLocal(p->src2),
                          p->width);
+        fbx_wasm_buffer_u8(b, WASM_OP_LOCAL_SET);
+        fbx_wasm_buffer_uleb(b, VregLocal(p->dst));
+        break;
+      case FBX_IR_OP_SEXT: /* firebox#T3R3 */
+        RegionSext(b, VregLocal(p->src1), (u8)p->imm);
+        if (p->width != 8) {
+          RegionI64Const(b, WidthMask(p->width));
+          fbx_wasm_buffer_u8(b, WASM_OP_I64_AND);
+        }
         fbx_wasm_buffer_u8(b, WASM_OP_LOCAL_SET);
         fbx_wasm_buffer_uleb(b, VregLocal(p->dst));
         break;

@@ -216,7 +216,9 @@ extern "C" {
  *     IMM) may take an index (src2 / dst GREG + scale) and is also the
  *     no-base SIB form `[index*scale + disp32]`; LEA may have no base
  *     (src1_kind NONE, index in src2).  SHL/SHR/SAR (group 2 /4 /5 /7 by
- *     1, imm8 or CL, widths 4 and 8) with the FBX_IR_FLAGS_SH* kinds. */
+ *     1, imm8 or CL, widths 4 and 8) with the FBX_IR_FLAGS_SH* kinds.
+ *     SEXT (MOVSXD, MOVSX, CWDE/CDQE); MOVZX from AH/CH/DH/BH as REG_GET
+ *     at width 2 and SHR by 8. */
 #define FBX_IR_VERSION 12u
 
 /* ────────────────────────────────────────────────────────────────────────── */
@@ -360,6 +362,12 @@ enum FbxIrOpcode {
   FBX_IR_OP_SHL = 26,
   FBX_IR_OP_SHR = 27,
   FBX_IR_OP_SAR = 28,
+
+  /* firebox#T3R3 — sign extension (MOVSXD, MOVSX, CWDE/CDQE):
+   * dst(vreg) = src1(vreg) sign-extended from `imm` bytes (1, 2 or 4) to
+   * `width` (4 or 8), the result zero-extended at `width`.  No flags.
+   * Lowered by regions only. */
+  FBX_IR_OP_SEXT = 29,
 
   /* Sentinel — count of defined opcodes.  Used by validation; not emitted. */
   FBX_IR_OP_LAST_,

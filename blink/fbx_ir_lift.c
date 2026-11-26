@@ -244,6 +244,7 @@ static const char *const kOpcodeNames[FBX_IR_OP_LAST_] = {
     [FBX_IR_OP_SHL] = "SHL",
     [FBX_IR_OP_SHR] = "SHR",
     [FBX_IR_OP_SAR] = "SAR",
+    [FBX_IR_OP_SEXT] = "SEXT",
 };
 
 const char *fbx_ir_opcode_name(u8 opcode) {
@@ -500,6 +501,7 @@ static int LiftOperandRoles(u64 mop) {
      * (MOVZX r, r/m8); only r/m is a byte. */
     case 0x080: case 0x0C6: case 0x1B6:
     case 0x0F6: case 0x0FE: /* firebox#T3R2: TEST/NOT/NEG, INC/DEC r/m8 */
+    case 0x1BE: /* firebox#T3R3: MOVSX r, r/m8 */
       return FBX_LIFT_HAS_MODRM | FBX_LIFT_RM_BYTE;
     /* Word/dword/qword ModRM ops — no byte register in either field. */
     case 0x089: case 0x08B: case 0x0C7:
@@ -509,6 +511,7 @@ static int LiftOperandRoles(u64 mop) {
     case 0x069: case 0x06B: case 0x1AF:
     case 0x0F7: case 0x0FF: /* firebox#T3R2: groups 3 and 5 */
     case 0x0C1: case 0x0D1: case 0x0D3: /* firebox#T3R3: group 2 */
+    case 0x063: case 0x1BF: /* firebox#T3R3: MOVSXD, MOVSX r, r/m16 */
       return FBX_LIFT_HAS_MODRM;
     case 0x08D:
       return FBX_LIFT_HAS_MODRM | FBX_LIFT_NO_SEG;
@@ -529,6 +532,7 @@ static int LiftOperandRoles(u64 mop) {
     case 0x18C: case 0x18D: case 0x18E: case 0x18F:
     case 0x0E8: case 0x0E9: case 0x0EB: case 0x0C3:
     case 0x0A8: case 0x0A9: /* firebox#T3R2: TEST AL/rAX, imm */
+    case 0x098: /* firebox#T3R3: CWDE/CDQE */
     case 0x050: case 0x051: case 0x052: case 0x053:
     case 0x054: case 0x055: case 0x056: case 0x057:
     case 0x058: case 0x059: case 0x05A: case 0x05B:
@@ -610,6 +614,13 @@ static int LiftOperandShapeUnmodelled(u64 rde, u64 mop, int region) {
     return 1;
   }
   if (mop == 0x0FF && !(ModrmReg(rde) <= 2 || ModrmReg(rde) == 4)) return 1;
+  /* firebox#T3R3: sign extension into 4 or 8 bytes only (no operand-size
+   * prefix: CBW, MOVSX r16), and MOVSXD only with REX.W. */
+  if ((mop == 0x063 || mop == 0x098 || mop == 0x1BE || mop == 0x1BF) &&
+      Osz(rde)) {
+    return 1;
+  }
+  if (mop == 0x063 && !Rexw(rde)) return 1;
   /* firebox#T3R2: an operand-size prefix makes PUSH/POP/RET move 2 bytes
    * (blink/stack.c kStackOsz) and changes CALL/JMP; the IR models only the
    * 8-byte forms.  (These used to lift at 8 bytes regardless.) */
@@ -624,6 +635,9 @@ static int LiftOperandShapeUnmodelled(u64 rde, u64 mop, int region) {
     return 1;
   }
   if (IsModrmRegister(rde)) {
+    /* firebox#T3R3: a region lifts MOVZX/MOVSX from AH/CH/DH/BH
+     * (LiftByteSourceRegion). */
+    if (region && (mop == 0x1B6 || mop == 0x1BE)) return 0;
     return (roles & FBX_LIFT_RM_BYTE) &&
            LiftIsHighByteReg(rde, (u32)ModrmRm(rde));
   }
@@ -1635,6 +1649,90 @@ static int LiftAluRR(struct LiftCtx *ctx, u64 rde, i64 disp, u8 op,
  * `src_width` is 1 or 2 (byte vs word source).  Destination width comes
  * from REX.W / operand-size prefix per the wider operand (Word vs Dword vs
  * Qword), determined by WidthFromRde(byte_op=0). */
+/* firebox#T3R3 — the r/m8 register source of MOVZX/MOVSX into a vreg,
+ * zero-extended.  AH/CH/DH/BH (no REX, rm 4..7) is bits 8..15 of register
+ * rm & 3: a REG_GET at width 2 and an SHR by 8 (regions only; the operand
+ * shape check refuses a high-byte source anywhere else). */
+static int LiftByteSourceRegion(struct LiftCtx *ctx, u64 rde, u32 *out) {
+  u32 w, c, z;
+  struct FbxIrInst *sh;
+  if (!LiftIsHighByteReg(rde, (u32)ModrmRm(rde))) {
+    return LiftGetReg(ctx, 1, (u32)RexbRm(rde), out) ? 1 : 0;
+  }
+  if (!ctx->region) return -1;
+  if (!LiftGetReg(ctx, 2, (u32)ModrmRm(rde) & 3u, &w)) return 0;
+  if (!LiftGetImm(ctx, 1, 8, &c)) return 0;
+  sh = CtxEmit(ctx);
+  if (!sh) return 0;
+  z = CtxAllocVreg(ctx);
+  sh->opcode = FBX_IR_OP_SHR;
+  sh->width = 4;
+  sh->dst_kind = FBX_IR_KIND_VREG;
+  sh->dst = z;
+  sh->src1_kind = FBX_IR_KIND_VREG;
+  sh->src1 = w;
+  sh->src2_kind = FBX_IR_KIND_VREG;
+  sh->src2 = c;
+  *out = z;
+  return 1;
+}
+
+/* firebox#T3R3 — sign extension, regions only:
+ *   0x063 MOVSXD r64, r/m32 (REX.W)      0x1BE MOVSX r, r/m8
+ *   0x1BF MOVSX r, r/m16                 0x098 CWDE (EAX = sext AX) and
+ *                                              CDQE (RAX = sext EAX)
+ * The source (REG_GET, a narrow LOAD, or a high-byte extract), a SEXT to
+ * the destination width, a REG_SET. */
+static int LiftSextRegion(struct LiftCtx *ctx, u64 rde, i64 disp, u64 mop) {
+  u8 dw = WidthFromRde(rde, 0), sw;
+  u32 dst, v, z;
+  int rc;
+  struct FbxIrInst *sx, *set;
+  if (!ctx->region || (dw != 4 && dw != 8)) return -1;
+  switch (mop) {
+    case 0x063: sw = 4; break;
+    case 0x1BE: sw = 1; break;
+    case 0x1BF: sw = 2; break;
+    case 0x098: sw = dw / 2u; break;
+    default: return -1;
+  }
+  if (mop == 0x063 && dw != 8) return -1;
+  if (mop == 0x098) {
+    dst = 0; /* rAX */
+    if (!LiftGetReg(ctx, sw, 0, &v)) return 0;
+  } else {
+    dst = (u32)RexrReg(rde);
+    if (!IsModrmRegister(rde)) {
+      rc = LiftLoadOperand(ctx, rde, disp, sw, &v);
+      if (rc <= 0) return rc;
+    } else if (sw == 1) {
+      rc = LiftByteSourceRegion(ctx, rde, &v);
+      if (rc <= 0) return rc;
+    } else if (!LiftGetReg(ctx, sw, (u32)RexbRm(rde), &v)) {
+      return 0;
+    }
+  }
+  sx = CtxEmit(ctx);
+  if (!sx) return 0;
+  z = CtxAllocVreg(ctx);
+  sx->opcode = FBX_IR_OP_SEXT;
+  sx->width = dw;
+  sx->dst_kind = FBX_IR_KIND_VREG;
+  sx->dst = z;
+  sx->src1_kind = FBX_IR_KIND_VREG;
+  sx->src1 = v;
+  sx->imm = sw;
+  set = CtxEmit(ctx);
+  if (!set) return 0;
+  set->opcode = FBX_IR_OP_REG_SET;
+  set->width = dw;
+  set->dst_kind = FBX_IR_KIND_GREG;
+  set->dst = dst;
+  set->src1_kind = FBX_IR_KIND_VREG;
+  set->src1 = z;
+  return 1;
+}
+
 static int LiftMovzx(struct LiftCtx *ctx, u64 rde, i64 disp, u8 src_width) {
   u8 dst_width = WidthFromRde(rde, 0);
   u32 src_vreg;
@@ -1653,6 +1751,20 @@ static int LiftMovzx(struct LiftCtx *ctx, u64 rde, i64 disp, u8 src_width) {
    * it).  `disp` is the decoded displacement. */
   if (!IsModrmRegister(rde)) {
     return LiftLoadToReg(ctx, rde, disp, src_width, dst_width);
+  }
+  if (src_width == 1 && LiftIsHighByteReg(rde, (u32)ModrmRm(rde))) {
+    /* firebox#T3R3: MOVZX from AH/CH/DH/BH, regions only. */
+    int rc = LiftByteSourceRegion(ctx, rde, &src_vreg);
+    if (rc <= 0) return rc;
+    set = CtxEmit(ctx);
+    if (!set) return 0;
+    set->opcode = FBX_IR_OP_REG_SET;
+    set->width = dst_width;
+    set->dst_kind = FBX_IR_KIND_GREG;
+    set->dst = (u32)RexrReg(rde);
+    set->src1_kind = FBX_IR_KIND_VREG;
+    set->src1 = src_vreg;
+    return 1;
   }
   get = CtxEmit(ctx);
   if (!get) return 0;
@@ -1809,6 +1921,8 @@ static int LiftOneOp(struct LiftCtx *ctx, const struct FbxTcEntry *e,
      * i64.load{8,16}_u is unsigned, matching MOVZX semantics. */
     case 0x1B6: return LiftMovzx(ctx, rde, e->disp, 1);
     case 0x1B7: return LiftMovzx(ctx, rde, e->disp, 2);
+    case 0x063: case 0x098: case 0x1BE: case 0x1BF: /* firebox#T3R3 */
+      return LiftSextRegion(ctx, rde, e->disp, mop);
     /* ALU group r/m, imm — 0x80 (byte imm), 0x81 (imm32), 0x83 (imm8 sx). */
     case 0x080: return LiftAlui(ctx, rde, e->disp, e->uimm0, 1);
     case 0x081:

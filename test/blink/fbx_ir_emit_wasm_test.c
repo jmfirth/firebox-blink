@@ -3560,6 +3560,78 @@ TEST(FbxRegionExec, ShiftsMatchBlinkAtWidthsFourAndEight) {
   }
 }
 
+TEST(FbxRegionExec, SignExtensionsAndHighByteSources) {
+  /* firebox#T3R3: MOVSXD, MOVSX r/m8 and r/m16 (register, high-byte and
+   * memory sources), CDQE/CWDE and MOVZX from AH/CH/DH/BH, against values
+   * worked by hand.  Flags must not move. */
+  static const struct {
+    u8 len, bytes[8];
+    unsigned dst;
+    u64 want;
+  } k[] = {
+      {3, {0x49, 0x63, 0xd3}, 2, 0xfffffffff00dbeefull},   /* movsxd rdx, r11d */
+      {3, {0x48, 0x63, 0xf9}, 7, 0x000000007eadc0deull},   /* movsxd rdi, ecx */
+      {4, {0x48, 0x0f, 0xbe, 0xc3}, 0, 0xffffffffffffff85ull}, /* movsx rax, bl */
+      {3, {0x0f, 0xbe, 0xc7}, 0, 0x00000000ffffffa4ull},   /* movsx eax, bh */
+      {3, {0x0f, 0xbe, 0xec}, 5, 0x000000000000000aull},   /* movsx ebp, ah */
+      {4, {0x40, 0x0f, 0xbe, 0xc6}, 0, 0x00000000ffffff96ull}, /* movsx eax, sil */
+      {3, {0x0f, 0xbf, 0xc1}, 0, 0x00000000ffffc0deull},   /* movsx eax, cx */
+      {4, {0x48, 0x0f, 0xbf, 0xd3}, 2, 0xffffffffffffa485ull}, /* movsx rdx, bx */
+      {2, {0x48, 0x98}, 0, 0xffffffff80000a7aull},         /* cdqe */
+      {1, {0x98}, 0, 0x0000000000000a7aull},               /* cwde */
+      {3, {0x0f, 0xb6, 0xcc}, 1, 0x000000000000000aull},   /* movzx ecx, ah */
+      {3, {0x0f, 0xb6, 0xf7}, 6, 0x00000000000000a4ull},   /* movzx esi, bh */
+      {4, {0x48, 0x0f, 0xb6, 0xf7}, 6, 0x0000000000000000ull}, /* movzx rsi, dil */
+      {3, {0x0f, 0xb6, 0xc4}, 0, 0x000000000000000aull},   /* movzx eax, ah */
+      /* the rest run after `mov [rdi], ebx` (0xf00da485 over "regi"): */
+      {3, {0x48, 0x63, 0x07}, 0, 0xfffffffff00da485ull},   /* movsxd rax,[rdi] */
+      {4, {0x48, 0x63, 0x47, 0x04}, 0, 0x00000000642d6e6full}, /* [rdi+4] "on-d" */
+      {5, {0x48, 0x0f, 0xbe, 0x47, 0x01}, 0, 0xffffffffffffffa4ull}, /* byte [rdi+1] */
+      {4, {0x0f, 0xbf, 0x47, 0x02}, 0, 0x00000000fffff00dull}, /* word [rdi+2] */
+  };
+  unsigned i, j;
+  for (i = 0; i < sizeof k / sizeof k[0]; ++i) {
+    struct RgInsn b[3];
+    const struct RgInsn *blocks[1] = {b};
+    unsigned pre = i >= sizeof k / sizeof k[0] - 4, lens[1] = {2 + pre};
+    u64 ip = RX_CODE;
+    struct Machine m0;
+    struct RxRun r;
+    memset(b, 0, sizeof b);
+    if (pre) {
+      b[0].ip = ip;
+      b[0].len = 2;
+      b[0].bytes[0] = 0x89; /* mov [rdi], ebx */
+      b[0].bytes[1] = 0x1f;
+      ip += 2;
+    }
+    b[pre].ip = ip;
+    b[pre].len = k[i].len;
+    memcpy(b[pre].bytes, k[i].bytes, k[i].len);
+    ip += k[i].len;
+    b[pre + 1].ip = ip;
+    b[pre + 1].len = 2;
+    b[pre + 1].bytes[0] = 0xeb;
+    b[pre + 1].bytes[1] = 0xfe;
+    RxMachine(&m0);
+    m0.flags = 0x202 | 0x8d5 | (0x33u << 24);
+    RxSetG(&m0, 0, 0x1234567880000a7aull);  /* ah 0x0a, al 0x7a */
+    RxSetG(&m0, 1, 0x111111117eadc0deull);
+    RxSetG(&m0, 3, 0x22222222f00da485ull);  /* bh 0xa4, bl 0x85 */
+    RxSetG(&m0, 6, 0x3333333333333396ull);  /* sil 0x96 */
+    RxSetG(&m0, 7, RX_DATA_VA);
+    RxSetG(&m0, 11, 0x44444444f00dbeefull);
+    RxExec(blocks, lens, 1, &m0, 0, &r);
+    ASSERT_EQ(0, r.err);
+    EXPECT_EQ(k[i].want, RxG(&r.m, k[i].dst));
+    EXPECT_EQ(m0.flags, r.m.flags);
+    EXPECT_EQ(ip, r.m.ip);
+    for (j = 0; j < 16; ++j) {
+      if (j != k[i].dst && j != 4) EXPECT_EQ(RxG(&m0, j), RxG(&r.m, j));
+    }
+  }
+}
+
 TEST(FbxRegionExec, SegmentBasesAndBaselessAddresses) {
   /* firebox#T3R3: mov %fs:0x28,%rax; mov 0x601010,%rcx (no base, no index);
    * lea 0x8(,%rdi,4),%rdx (no base); mov %rbx,%gs:0x8(%rdi); mov
