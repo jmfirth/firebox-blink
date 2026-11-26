@@ -271,7 +271,7 @@ u32 fbx_ir_region_successors(const struct FbxIrBlock *ir,
  * `count_insns` is a set of FBX_REGION_EMIT_* bits (verification only):
  * COUNT makes the module store the number of guest instructions it completed
  * in ctx->consts[0]; LOG (firebox#T3R2) makes every store first append
- * {host offset, width, overwritten bytes} to the log described by
+ * {host offset, window bytes, the window's old bytes} to the log described by
  * ctx->consts[1..3] (base, used, capacity), leaving the region before a
  * store that finds it full.  Returns 1 on success, 0 if any member is
  * refused. */

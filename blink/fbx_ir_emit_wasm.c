@@ -4592,8 +4592,10 @@ static void RegionTranslate(struct RegionEmit *r, u32 i, u64 cur_pc,
 /* Store-log slots in the region's FbxT2BlockCtx, used only by a counting
  * (verifying) region: consts[1] = log base, [2] = entries used, [3] =
  * capacity.  Each entry is FBX_REGION_LOG_ENTRY bytes: u32 host offset, u32
- * width, u64 the bytes the store overwrote.  fbx_t2_glue.c's verifier undoes
- * the stores with it and compares the bytes Tier 1 writes. */
+ * window size w, u64 the w bytes there before the store (w is 8, or the
+ * store's width where 8 would leave the page: RegionLogStore).
+ * fbx_t2_glue.c's verifier undoes the stores with it and compares the
+ * windows Tier 1 leaves. */
 #define FBX_REGION_LOG_BASE 1u
 #define FBX_REGION_LOG_USED 2u
 #define FBX_REGION_LOG_CAP 3u
@@ -4639,7 +4641,30 @@ static void RegionStoreOp(struct FbxWasmBuffer *b, u8 width) {
   fbx_wasm_buffer_uleb(b, 0);
 }
 
-/* Counting regions only: append {l_off, width, old bytes} to the store log,
+#define WASM_OP_ELSE 0x05u
+#define WASM_OP_I32_GT_U 0x4Bu
+
+/* The log entry at l_logp: {width w, the w bytes at l_off}. */
+static void RegionLogWindow(struct RegionEmit *r, u8 w) {
+  struct FbxWasmBuffer *b = r->body;
+  fbx_wasm_buffer_u8(b, WASM_OP_LOCAL_GET);
+  fbx_wasm_buffer_uleb(b, r->l_logp);
+  fbx_wasm_buffer_u8(b, WASM_OP_I32_CONST);
+  fbx_wasm_buffer_sleb(b, w);
+  fbx_wasm_buffer_u8(b, WASM_OP_I32_STORE);
+  fbx_wasm_buffer_uleb(b, 2);
+  fbx_wasm_buffer_uleb(b, 4);
+  fbx_wasm_buffer_u8(b, WASM_OP_LOCAL_GET);
+  fbx_wasm_buffer_uleb(b, r->l_logp);
+  fbx_wasm_buffer_u8(b, WASM_OP_LOCAL_GET);
+  fbx_wasm_buffer_uleb(b, r->l_off);
+  RegionLoadOp(b, w);
+  fbx_wasm_buffer_u8(b, WASM_OP_I64_STORE);
+  fbx_wasm_buffer_uleb(b, 3);
+  fbx_wasm_buffer_uleb(b, 8);
+}
+
+/* Logging regions only: append {l_off, width, old bytes} to the store log,
  * or, when it is full, leave with the store not executed. */
 static void RegionLogStore(struct RegionEmit *r, u32 i, u64 cur_pc,
                            u8 width) {
@@ -4666,21 +4691,23 @@ static void RegionLogStore(struct RegionEmit *r, u32 i, u64 cur_pc,
   fbx_wasm_buffer_u8(b, WASM_OP_I32_STORE);
   fbx_wasm_buffer_uleb(b, 2);
   fbx_wasm_buffer_uleb(b, 0);
-  fbx_wasm_buffer_u8(b, WASM_OP_LOCAL_GET);
-  fbx_wasm_buffer_uleb(b, r->l_logp);
-  fbx_wasm_buffer_u8(b, WASM_OP_I32_CONST);
-  fbx_wasm_buffer_sleb(b, width);
-  fbx_wasm_buffer_u8(b, WASM_OP_I32_STORE);
-  fbx_wasm_buffer_uleb(b, 2);
-  fbx_wasm_buffer_uleb(b, 4);
-  fbx_wasm_buffer_u8(b, WASM_OP_LOCAL_GET);
-  fbx_wasm_buffer_uleb(b, r->l_logp);
+  /* The logged window is 8 bytes from the store's first byte, whatever its
+   * width (so a store wider than its instruction is seen), cut to the store's
+   * own width where 8 would leave the guest page. */
   fbx_wasm_buffer_u8(b, WASM_OP_LOCAL_GET);
   fbx_wasm_buffer_uleb(b, r->l_off);
-  RegionLoadOp(b, width);
-  fbx_wasm_buffer_u8(b, WASM_OP_I64_STORE);
-  fbx_wasm_buffer_uleb(b, 3);
-  fbx_wasm_buffer_uleb(b, 8);
+  fbx_wasm_buffer_u8(b, WASM_OP_I32_CONST);
+  fbx_wasm_buffer_sleb(b, 4095);
+  fbx_wasm_buffer_u8(b, WASM_OP_I32_AND);
+  fbx_wasm_buffer_u8(b, WASM_OP_I32_CONST);
+  fbx_wasm_buffer_sleb(b, 4096 - 8);
+  fbx_wasm_buffer_u8(b, WASM_OP_I32_GT_U);
+  fbx_wasm_buffer_u8(b, WASM_OP_IF);
+  fbx_wasm_buffer_u8(b, WASM_BLOCKTYPE_EMPTY);
+  RegionLogWindow(r, width);
+  fbx_wasm_buffer_u8(b, WASM_OP_ELSE);
+  RegionLogWindow(r, 8);
+  fbx_wasm_buffer_u8(b, WASM_OP_END);
   fbx_wasm_buffer_u8(b, WASM_OP_LOCAL_GET);
   fbx_wasm_buffer_uleb(b, EMIT_LOCAL_BLOCK_CTX);
   RegionCtxConst(r, FBX_REGION_LOG_USED);

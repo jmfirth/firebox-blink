@@ -3294,6 +3294,7 @@ struct RxRun {
   char why[96];
   u64 log_used;
   u8 frames[3][4096]; /* data, read-only, stack pages after the run */
+  u8 log[4][16];      /* the first store-log entries */
 };
 
 /* Lift the blocks as region members, emit, and run from `m0`. */
@@ -3352,6 +3353,7 @@ static void RxExec(const struct RgInsn *const *blocks, const unsigned *lens,
   memcpy(&out->m, x.mem + RX_M, sizeof out->m);
   memcpy(&ctx, x.mem + RX_CTX, sizeof ctx);
   out->log_used = ctx.consts[2];
+  memcpy(out->log, x.mem + RX_CTX + sizeof ctx, sizeof out->log);
   memcpy(out->frames, x.mem + RX_FRAME, sizeof out->frames);
   free(x.mem);
 done:
@@ -3438,7 +3440,13 @@ TEST(FbxRegionExec, ArithmeticStoresStackCallAndReturn) {
     memcpy(&ret_slot, &r.frames[2][4096 - 8], 8);
     EXPECT_EQ(RX_CODE + 21, ret_slot);
     if (mode) {
+      u32 off, win;
       EXPECT_EQ(3u, r.log_used); /* the byte store, the push, the call */
+      memcpy(&off, r.log[0], 4);
+      memcpy(&win, r.log[0] + 4, 4);
+      EXPECT_EQ(RX_FRAME + 0x10u, off);
+      EXPECT_EQ(8u, win); /* a byte store logs an 8-byte window */
+      EXPECT_EQ(0, memcmp(r.log[0] + 8, "456789ab", 8));
     }
   }
 }
