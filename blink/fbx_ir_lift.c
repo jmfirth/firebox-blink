@@ -844,8 +844,9 @@ static int LiftStoreRegion(struct LiftCtx *ctx, u64 rde, i64 disp, u8 width,
  *
  * firebox#JJJ: the load accepts the SIB-index form `[base + index*scale +
  * disp]` as well as `[base + disp]`.  The addressing classification is
- * ClassifyLeaMem's — the one the indexed LEA already uses — so the same forms
- * are refused (RIP-relative, no-base SIB) and Tier 1 runs them.  The index
+ * ClassifyLeaMem's — the one the indexed LEA already uses — so the per-block
+ * lift refuses RIP-relative and no-base SIB, which a region lift takes
+ * (LiftClassifyAddr, firebox#T3R2/T3R3).  The index
  * rides in src2 (GREG) with the SIB scale; src2_kind stays NONE for the
  * base-only form, which the emitter reads as "no index term".
  *
@@ -1232,10 +1233,6 @@ static int LiftAluTail(struct LiftCtx *ctx, u8 width, u8 op, u32 lhs, u32 rhs,
   return 1;
 }
 
-/* firebox#T3R2 — the memory-operand ALU forms a region lowers, all of which
- * READ memory only: `op r, [m]` (r is the destination), `cmp/test [m], r`,
- * and `cmp [m], imm`.  The read-modify-write forms (`op [m], r`, `op [m],
- * imm` for every op but CMP/TEST) are refused: Tier 1 runs them. */
 /* firebox#T3R3 — read-modify-write `op [m], src`, regions only: LOAD, the
  * ALU op, a STORE to the same address, then the flags.  The STORE comes
  * before the flags so a STORE that misses (no write permission, a page not
@@ -1291,6 +1288,10 @@ static int LiftRmwRegion(struct LiftCtx *ctx, u64 rde, i64 disp, u8 width,
   return 1;
 }
 
+/* firebox#T3R2 — the memory-operand ALU forms a region lowers: `op r, [m]`
+ * (r is the destination), `cmp/test [m], r`, `cmp/test [m], imm`, and
+ * (firebox#T3R3) the read-modify-write `op [m], r` and `op [m], imm` through
+ * LiftRmwRegion. */
 static int LiftAluMemRegion(struct LiftCtx *ctx, u64 rde, i64 disp, u8 width,
                             u8 op, int mem_is_lhs, int imm_rhs, u64 uimm0) {
   u32 m, o;
@@ -1319,7 +1320,9 @@ static int LiftAluMemRegion(struct LiftCtx *ctx, u64 rde, i64 disp, u8 width,
 /* firebox#T3R2 — group 3 (F6/F7) /0 TEST r, imm; /2 NOT; /3 NEG; group 4/5
  * (FE/FF) /0 INC, /1 DEC — register forms; FF /2 CALL and /4 JMP, register
  * or memory.  Region lifts only.  Flags are blink/alu.c's: NOT writes none;
- * INC/DEC keep CF; NEG's AF is (x != 0). */
+ * INC/DEC keep CF; NEG's AF is the borrow out of bit 3, (x & 15) != 0
+ * (firebox#NHB).  The memory forms of NOT/NEG/INC/DEC (firebox#T3R3) are
+ * read-modify-write (LiftRmwRegion). */
 static int LiftUnaryRegion(struct LiftCtx *ctx, u64 rde, i64 disp, u64 uimm0,
                            u64 mop) {
   int byte_op = mop == 0x0F6 || mop == 0x0FE;

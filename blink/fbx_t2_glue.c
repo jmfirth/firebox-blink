@@ -501,7 +501,7 @@ static int Fbxt2TryRegion(struct Machine *m, struct FbxTcBlock *b,
                           struct FbxT2BlockState *st) {
   /* firebox#T3R2: members are lifted for a region (fbx_ir_lift_region), the
    * entry included; the per-block lift the caller holds is not a member's. */
-  struct FbxIrBlock *entry_ir = fbx_ir_lift_region(b);
+  struct FbxIrBlock *entry_ir = NULL;
   const struct FbxIrBlock *irs[FBX_REGION_MAX_MEMBERS];
   const struct FbxTcBlock *tcs[FBX_REGION_MAX_MEMBERS];
   struct FbxIrBlock *owned[FBX_REGION_MAX_MEMBERS];
@@ -521,7 +521,6 @@ static int Fbxt2TryRegion(struct Machine *m, struct FbxTcBlock *b,
      * bytes again: re-forming the region would offer a different module
      * whenever a member's hotness moved, queueing one more compile on the
      * host's single worker each time and never landing the first. */
-    fbx_ir_free(entry_ir);
     buf.data = st->region_wasm;
     buf.len = st->region_wasm_len;
     buf.cap = st->region_wasm_len;
@@ -530,6 +529,7 @@ static int Fbxt2TryRegion(struct Machine *m, struct FbxTcBlock *b,
     nm = st->region_members;
     goto offer;
   }
+  entry_ir = fbx_ir_lift_region(b); /* (after the pending check: review) */
   if (!entry_ir) return 0;
   if (!fbx_ir_region_member_ok(entry_ir, b, &why, &why_op)) {
     T2TraceLine(g_t2_trace_verbose,
