@@ -79,9 +79,11 @@
 /* order (its memset writes the head and tail first), so si_addr and the      */
 /* bytes already written can differ from musl's within what the function      */
 /* leaves unspecified; the signal and its code cannot. A read-only thunk      */
-/* writes nothing and faults at the first byte it reads on a bad page, and    */
-/* reads no page past the last byte its answer needs (strstr stops at its     */
-/* first match).                                                              */
+/* writes nothing and faults at the first byte it reads on a bad page. It     */
+/* reads what musl reads: strstr runs musl's algorithm over guest memory, so */
+/* it reads the needle only as far as the haystack lasts and the haystack up */
+/* to 63 bytes past the window it is searching, as musl's two-way search     */
+/* does.                                                                      */
 /* ────────────────────────────────────────────────────────────────────────── */
 
 static u8 *ThunkRead(struct Machine *m, i64 v) {
@@ -772,69 +774,299 @@ static void ThunkStrncasecmp(struct Machine *m) {
   ThunkRet(m);
 }
 
-/* GuestStrstr — the first occurrence of guest C-string `needle` in guest
- * C-string `haystack`: its guest address, `haystack` for an empty needle, or
- * 0 for none.
- *
- * The haystack is read a page at a time and searched as it is read, so the
- * search stops at the first match, as musl's does, and reads no page past
- * it: a match before an unmapped page is found, not faulted on.  There is no
- * length cap and no heap: a needle of up to 4 KiB is staged on the stack and
- * searched with the host's memmem over a window of (the last nlen-1 bytes
- * already read) + (the next page's bytes up to the NUL), so a match that
- * straddles a page is still seen.  A longer needle is compared in guest
- * memory at each candidate position (quadratic in the worst case; such
- * needles are rare). */
-#define FBX_STRSTR_STAGE 4096u
-static i64 GuestStrstr(struct Machine *m, i64 haystack, i64 needle) {
-  u8 nst[FBX_STRSTR_STAGE];
-  u8 win[2 * FBX_STRSTR_STAGE];
-  u64 nlen = (u64)GuestStrlen(m, needle);
-  u64 wlen = 0;
-  i64 base = haystack; /* guest address of win[0] */
-  i64 cur = haystack;
-  u8 first;
-  if (nlen == 0) return haystack;
-  if (nlen > FBX_STRSTR_STAGE) {
-    ThunkCopyIn(m, &first, needle, 1);
-    for (;;) {
-      u64 chunk = 4096 - ((u64)cur & 4095);
-      u8 *h = ThunkRead(m, cur);
-      u8 *nul = (u8 *)memchr(h, 0, (size_t)chunk);
-      u64 take = nul ? (u64)(nul - h) : chunk;
-      u64 j;
-      for (j = 0; j < take; ++j) {
-        /* The haystack's NUL differs from every needle byte, so the compare
-         * stops there and reads nothing of the haystack past it. */
-        if (h[j] == first &&
-            !GuestMemcmp(m, cur + (i64)j, needle, nlen)) {
-          return cur + (i64)j;
-        }
-      }
-      if (nul) return 0;
-      cur += (i64)take;
+/* GuestStrstr — musl's strstr (src/string/strstr.c, 1.2.x), line for line,
+ * over guest memory.  The guest libc is musl, and its answer AND the bytes it
+ * reads to get there are what a program observes: which byte faults, if any,
+ * when a string is unterminated or runs into an unreadable page.  So this
+ * reads exactly the bytes musl reads, in musl's order: the needle only as far
+ * as the haystack lasts (twoway's `n[l] && h[l]`), and the haystack up to 63
+ * bytes past the current window (twoway's `memchr(z, 0, l | 63)`).  A byte
+ * read is resolved at its own address, so a fault's si_addr is the byte musl
+ * would have faulted on.  musl's word-at-a-time strchr and memchr read
+ * aligned words, which never cross a page, so reading their bytes one at a
+ * time touches the same pages in the same order.  No cap, no heap. */
+struct ThunkPage {
+  u64 base; /* guest page cached in `host`; ~0 when none */
+  u8 *host;
+};
+
+static inline u8 ThunkByte(struct Machine *m, struct ThunkPage *c, u64 a) {
+  if ((a & ~(u64)4095) != c->base) {
+    c->host = ThunkRead(m, (i64)a) - (a & 4095);
+    c->base = a & ~(u64)4095;
+  }
+  return c->host[a & 4095];
+}
+
+#define FBX_SS_MAX(a, b) ((a) > (b) ? (a) : (b))
+#define FBX_SS_BITOP(a, b, op) \
+  ((a)[(size_t)(b) / (8 * sizeof *(a))] op(size_t) 1 \
+   << ((size_t)(b) % (8 * sizeof *(a))))
+
+static u64 GuestTwowayStrstr(struct Machine *m, struct ThunkPage *hc,
+                             struct ThunkPage *nc, u64 h, u64 n) {
+#define H(i) ThunkByte(m, hc, h + (u64)(i))
+#define N(i) ThunkByte(m, nc, n + (u64)(i))
+  u64 z;
+  size_t l, ip, jp, k, p, ms, p0, mem, mem0;
+  size_t byteset[32 / sizeof(size_t)] = {0};
+  size_t shift[256];
+
+  /* Computing length of needle and fill shift table */
+  for (l = 0; N(l) && H(l); l++)
+    FBX_SS_BITOP(byteset, N(l), |=), shift[N(l)] = l + 1;
+  if (N(l)) return 0; /* hit the end of h */
+
+  /* Compute maximal suffix */
+  ip = -1;
+  jp = 0;
+  k = p = 1;
+  while (jp + k < l) {
+    if (N(ip + k) == N(jp + k)) {
+      if (k == p) {
+        jp += p;
+        k = 1;
+      } else
+        k++;
+    } else if (N(ip + k) > N(jp + k)) {
+      jp += k;
+      k = 1;
+      p = jp - ip;
+    } else {
+      ip = jp++;
+      k = p = 1;
     }
   }
-  ThunkCopyIn(m, nst, needle, nlen);
+  ms = ip;
+  p0 = p;
+
+  /* And with the opposite comparison */
+  ip = -1;
+  jp = 0;
+  k = p = 1;
+  while (jp + k < l) {
+    if (N(ip + k) == N(jp + k)) {
+      if (k == p) {
+        jp += p;
+        k = 1;
+      } else
+        k++;
+    } else if (N(ip + k) < N(jp + k)) {
+      jp += k;
+      k = 1;
+      p = jp - ip;
+    } else {
+      ip = jp++;
+      k = p = 1;
+    }
+  }
+  if (ip + 1 > ms + 1)
+    ms = ip;
+  else
+    p = p0;
+
+  /* Periodic needle?  (musl: memcmp(n, n+p, ms+1), bytewise, in order) */
+  {
+    size_t i;
+    int differ = 0;
+    for (i = 0; i < ms + 1; i++) {
+      if (N(i) != N(p + i)) {
+        differ = 1;
+        break;
+      }
+    }
+    if (differ) {
+      mem0 = 0;
+      p = FBX_SS_MAX(ms, l - ms - 1) + 1;
+    } else
+      mem0 = l - p;
+  }
+  mem = 0;
+
+  /* Initialize incremental end-of-haystack pointer */
+  z = h;
+
+  /* Search loop */
   for (;;) {
-    u64 chunk = 4096 - ((u64)cur & 4095);
-    u8 *h = ThunkRead(m, cur);
-    u8 *nul = (u8 *)memchr(h, 0, (size_t)chunk);
-    u64 take = nul ? (u64)(nul - h) : chunk;
-    u8 *hit;
+    /* Update incremental end-of-haystack pointer */
+    if (z - h < l) {
+      /* Fast estimate for MAX(l,63) */
+      size_t grow = l | 63;
+      u64 z2 = (u64)GuestMemchr(m, (i64)z, 0, grow);
+      if (z2) {
+        z = z2;
+        if (z - h < l) return 0;
+      } else
+        z += grow;
+    }
+
+    /* Check last byte first; advance by shift on mismatch */
+    if (FBX_SS_BITOP(byteset, H(l - 1), &)) {
+      k = l - shift[H(l - 1)];
+      if (k) {
+        if (k < mem) k = mem;
+        h += k;
+        mem = 0;
+        continue;
+      }
+    } else {
+      h += l;
+      mem = 0;
+      continue;
+    }
+
+    /* Compare right half */
+    for (k = FBX_SS_MAX(ms + 1, mem); N(k) && N(k) == H(k); k++) {
+    }
+    if (N(k)) {
+      h += k - ms;
+      mem = 0;
+      continue;
+    }
+    /* Compare left half */
+    for (k = ms + 1; k > mem && N(k - 1) == H(k - 1); k--) {
+    }
+    if (k <= mem) return h;
+    h += p;
+    mem = mem0;
+  }
+#undef H
+#undef N
+}
+
+static i64 GuestStrstrMusl(struct Machine *m, i64 haystack, i64 needle) {
+  struct ThunkPage hc = {~(u64)0, NULL}, nc = {~(u64)0, NULL};
+  u64 h = (u64)haystack, n = (u64)needle;
+  u8 n0 = ThunkByte(m, &nc, n);
+  /* Return immediately on empty needle */
+  if (!n0) return haystack;
+  /* Use faster algorithms for short needles */
+  h = (u64)GuestStrchr(m, (i64)h, n0);
+  if (!h || !ThunkByte(m, &nc, n + 1)) return (i64)h;
+  if (!ThunkByte(m, &hc, h + 1)) return 0;
+  if (!ThunkByte(m, &nc, n + 2)) { /* twobyte_strstr */
+    u16 nw = (u16)(n0 << 8 | ThunkByte(m, &nc, n + 1));
+    u16 hw = (u16)(ThunkByte(m, &hc, h) << 8 | ThunkByte(m, &hc, h + 1));
+    for (h++; ThunkByte(m, &hc, h) && hw != nw;
+         hw = (u16)(hw << 8 | ThunkByte(m, &hc, ++h))) {
+    }
+    return ThunkByte(m, &hc, h) ? (i64)(h - 1) : 0;
+  }
+  if (!ThunkByte(m, &hc, h + 2)) return 0;
+  if (!ThunkByte(m, &nc, n + 3)) { /* threebyte_strstr */
+    u32 nw = (u32)n0 << 24 | (u32)ThunkByte(m, &nc, n + 1) << 16 |
+             (u32)ThunkByte(m, &nc, n + 2) << 8;
+    u32 hw = (u32)ThunkByte(m, &hc, h) << 24 |
+             (u32)ThunkByte(m, &hc, h + 1) << 16 |
+             (u32)ThunkByte(m, &hc, h + 2) << 8;
+    for (h += 2; ThunkByte(m, &hc, h) && hw != nw;
+         hw = (hw | ThunkByte(m, &hc, ++h)) << 8) {
+    }
+    return ThunkByte(m, &hc, h) ? (i64)(h - 2) : 0;
+  }
+  if (!ThunkByte(m, &hc, h + 3)) return 0;
+  if (!ThunkByte(m, &nc, n + 4)) { /* fourbyte_strstr */
+    u32 nw = (u32)n0 << 24 | (u32)ThunkByte(m, &nc, n + 1) << 16 |
+             (u32)ThunkByte(m, &nc, n + 2) << 8 | ThunkByte(m, &nc, n + 3);
+    u32 hw = (u32)ThunkByte(m, &hc, h) << 24 |
+             (u32)ThunkByte(m, &hc, h + 1) << 16 |
+             (u32)ThunkByte(m, &hc, h + 2) << 8 | ThunkByte(m, &hc, h + 3);
+    for (h += 3; ThunkByte(m, &hc, h) && hw != nw;
+         hw = hw << 8 | ThunkByte(m, &hc, ++h)) {
+    }
+    return ThunkByte(m, &hc, h) ? (i64)(h - 3) : 0;
+  }
+  return (i64)GuestTwowayStrstr(m, &hc, &nc, h, n);
+}
+#undef FBX_SS_MAX
+#undef FBX_SS_BITOP
+
+/* The same answer at memmem speed, when nothing musl would read can fault.
+ * GuestStrstrMusl's reads are what a program observes only when one of them
+ * faults; otherwise its answer is strstr's, which any correct search gives.
+ * So this searches with the host's memmem over a page window (the last
+ * nlen-1 bytes read + the next page up to its NUL), probing each page with
+ * GetAddress, which is ResolveAddress without the throw, and gives up (false)
+ * on the first unreadable page it would touch.  It reads a superset of the
+ * pages musl reads: the needle up to its NUL (musl: at most that), the
+ * haystack to its NUL when there is no match (musl: the same), and on a match
+ * at p, every page up to p + l + (l | 63) or the NUL (musl reads below that:
+ * two-way's look-ahead `memchr(z, 0, l | 63)` runs only while z < h + l, and
+ * h <= p; the 2/3/4-byte loops read nothing past p + l).  If all of them are
+ * readable, musl faults on none and returns this answer.  A needle over 4 KiB
+ * goes to the port. */
+#define FBX_STRSTR_STAGE 4096u
+static bool GuestStrstrFast(struct Machine *m, i64 haystack, i64 needle,
+                            i64 *out) {
+  u8 nst[FBX_STRSTR_STAGE + 1];
+  u8 win[2 * FBX_STRSTR_STAGE];
+  u64 nlen = 0, wlen = 0;
+  u64 cur = (u64)needle;
+  u64 base = (u64)haystack; /* guest address of win[0] */
+  for (;;) {
+    u64 chunk = 4096 - (cur & 4095);
+    u8 *p = GetAddress(m, (i64)cur);
+    u8 *nul;
+    if (!p) return false;
+    if (chunk > FBX_STRSTR_STAGE + 1 - nlen) chunk = FBX_STRSTR_STAGE + 1 - nlen;
+    nul = (u8 *)memchr(p, 0, (size_t)chunk);
+    memcpy(nst + nlen, p, (size_t)(nul ? (u64)(nul - p) : chunk));
+    if (nul) {
+      nlen += (u64)(nul - p);
+      break;
+    }
+    nlen += chunk;
+    cur += chunk;
+    if (nlen > FBX_STRSTR_STAGE) return false;
+  }
+  if (nlen == 0) {
+    *out = haystack;
+    return true;
+  }
+  cur = (u64)haystack;
+  for (;;) {
+    u64 chunk = 4096 - (cur & 4095);
+    u8 *h = GetAddress(m, (i64)cur);
+    u8 *nul, *hit;
+    u64 take;
+    if (!h) return false;
+    nul = (u8 *)memchr(h, 0, (size_t)chunk);
+    take = nul ? (u64)(nul - h) : chunk;
     memcpy(win + wlen, h, (size_t)take);
     wlen += take;
     hit = (u8 *)memmem(win, (size_t)wlen, nst, (size_t)nlen);
-    if (hit) return base + (i64)(hit - win);
-    if (nul) return 0;
-    cur += (i64)take;
+    if (hit) {
+      u64 at = base + (u64)(hit - win);
+      u64 end = at + nlen + (nlen >= 5 ? (nlen | 63) : 0);
+      u64 q = cur + take; /* first byte not yet probed */
+      while (!nul && q < end) {
+        u64 c2 = 4096 - (q & 4095);
+        u8 *g = GetAddress(m, (i64)q);
+        if (!g) return false;
+        if (memchr(g, 0, (size_t)c2)) break;
+        q += c2;
+      }
+      *out = (i64)at;
+      return true;
+    }
+    if (nul) {
+      *out = 0;
+      return true;
+    }
+    cur += take;
     if (wlen > nlen - 1) {
       u64 keep = nlen - 1;
       memmove(win, win + (wlen - keep), (size_t)keep);
-      base += (i64)(wlen - keep);
+      base += wlen - keep;
       wlen = keep;
     }
   }
+}
+
+static i64 GuestStrstr(struct Machine *m, i64 haystack, i64 needle) {
+  i64 r;
+  if (GuestStrstrFast(m, haystack, needle, &r)) return r;
+  return GuestStrstrMusl(m, haystack, needle);
 }
 
 static void ThunkStrstr(struct Machine *m) {
